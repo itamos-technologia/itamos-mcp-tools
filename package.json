@@ -1,0 +1,14 @@
+{
+  "name": "itamos-mcp-sandbox",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Itamos public MCP sandbox server",
+  "main": "server-sandbox.js",
+  "scripts": {
+    "start": "node server-sandbox.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "*",
+    "express": "*"
+  }
+}

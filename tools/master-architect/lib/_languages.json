@@ -1,0 +1,346 @@
+{
+  "_comment": "Extension \u2192 language registry. Three categories: supported (parser file present), coming_soon (no parser yet, will analyse later), opaque (no analysis possible \u2014 binaries, assets). All three appear in project skeleton: supported gets numeric addresses, coming_soon and opaque get letter addresses. unrecognized files are skipped entirely.",
+  ".js": {
+    "language": "javascript",
+    "parser": "javascript.js"
+  },
+  ".mjs": {
+    "language": "javascript",
+    "parser": "javascript.js"
+  },
+  ".cjs": {
+    "language": "javascript",
+    "parser": "javascript.js"
+  },
+  ".jsx": {
+    "language": "javascript",
+    "parser": "javascript.js"
+  },
+  ".py": {
+    "language": "python",
+    "parser": "python.js"
+  },
+  ".pyw": {
+    "language": "python",
+    "parser": "python.js"
+  },
+  ".ts": {
+    "language": "typescript",
+    "parser": "typescript.js"
+  },
+  ".tsx": {
+    "language": "typescript",
+    "parser": "typescript.js"
+  },
+  ".go": {
+    "language": "go",
+    "parser": "go.js"
+  },
+  ".rs": {
+    "language": "rust",
+    "parser": "rust.js"
+  },
+  ".java": {
+    "language": "java",
+    "parser": "java.js"
+  },
+  ".kt": {
+    "language": "kotlin",
+    "parser": "kotlin.js"
+  },
+  ".kts": {
+    "language": "kotlin",
+    "parser": "kotlin.js"
+  },
+  ".swift": {
+    "language": "swift",
+    "parser": "swift.js"
+  },
+  ".rb": {
+    "language": "ruby",
+    "parser": "ruby.js"
+  },
+  ".php": {
+    "language": "php",
+    "parser": "php.js"
+  },
+  ".c": {
+    "language": "c",
+    "parser": "c.js"
+  },
+  ".h": {
+    "language": "c",
+    "parser": "c.js"
+  },
+  ".cpp": {
+    "language": "cpp",
+    "parser": "cpp.js"
+  },
+  ".hpp": {
+    "language": "cpp",
+    "parser": "cpp.js"
+  },
+  ".cs": {
+    "language": "csharp",
+    "parser": "csharp.js"
+  },
+  ".lua": {
+    "language": "lua",
+    "parser": null,
+    "comingSoon": true
+  },
+  ".sh": {
+    "language": "shell",
+    "parser": "shell.js"
+  },
+  ".sql": {
+    "language": "sql",
+    "parser": "sql.js"
+  },
+  ".proto": {
+    "language": "protobuf",
+    "parser": null,
+    "comingSoon": true
+  },
+  ".so": {
+    "language": "shared_library",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".dll": {
+    "language": "shared_library",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".dylib": {
+    "language": "shared_library",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".wasm": {
+    "language": "webassembly",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".o": {
+    "language": "object_file",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".a": {
+    "language": "static_library",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".jar": {
+    "language": "java_archive",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".class": {
+    "language": "java_bytecode",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".pyc": {
+    "language": "python_bytecode",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".pyd": {
+    "language": "python_extension",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".png": {
+    "language": "image",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".jpg": {
+    "language": "image",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".jpeg": {
+    "language": "image",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".gif": {
+    "language": "image",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".webp": {
+    "language": "image",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".svg": {
+    "language": "image",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".pdf": {
+    "language": "document",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".sqlite": {
+    "language": "sqlite_db",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".sqlite3": {
+    "language": "sqlite_db",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".db": {
+    "language": "sqlite_db",
+    "parser": null,
+    "opaque": true,
+    "binary": true
+  },
+  ".md": {
+    "language": "markdown",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".rst": {
+    "language": "restructuredtext",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".txt": {
+    "language": "text",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".json": {
+    "language": "json",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".yaml": {
+    "language": "yaml",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".yml": {
+    "language": "yaml",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".toml": {
+    "language": "toml",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".xml": {
+    "language": "xml",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".html": {
+    "language": "html",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  ".css": {
+    "language": "css",
+    "parser": null,
+    "opaque": true,
+    "binary": false
+  },
+  "_ignored_dirs": [
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    "dist",
+    "build",
+    "out",
+    "target",
+    ".next",
+    ".nuxt",
+    ".cache",
+    "venv",
+    ".venv",
+    "env",
+    ".env",
+    "virtualenv",
+    ".idea",
+    ".vscode",
+    ".vs",
+    "coverage",
+    ".nyc_output",
+    ".tox",
+    "vendor",
+    "bower_components",
+    ".gradle",
+    ".mvn",
+    "site-packages",
+    ".eggs",
+    "*.egg-info"
+  ],
+  "_ignored_files": [
+    ".DS_Store",
+    "Thumbs.db",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "Cargo.lock",
+    "Gemfile.lock",
+    "poetry.lock",
+    "Pipfile.lock"
+  ],
+  "_ignored_dir_patterns": [
+    "^\\.venv.*$",
+    "^venv[-_].*$",
+    "^\\.env-.*$",
+    "^env[-_].*$",
+    ".*\\.egg-info$"
+  ],
+  "_ignored_dir_markers": [
+    "pyvenv.cfg"
+  ],
+  ".conf": {
+    "language": "nginx",
+    "parser": "nginx.js"
+  },
+  ".nginx": {
+    "language": "nginx",
+    "parser": "nginx.js"
+  }
+}

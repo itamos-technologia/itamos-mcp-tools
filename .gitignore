@@ -1,0 +1,17 @@
+node_modules/
+tools/master-architect/node_modules/
+tools/master-architect/master-architect.db
+tools/master-architect/master-architect.db-shm
+tools/master-architect/master-architect.db-wal
+tools/master-architect/*.bak*
+tools/master-architect/*.GOODBACKUP*
+tools/node_modules/
+mcp_tools/node_modules/
+*.db
+*.db-shm
+*.db-wal
+.env
+.oauth_tokens.json
+server-sandbox.js.bak
+make_cv*.js
+/tmp/
