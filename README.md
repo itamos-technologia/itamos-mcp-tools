@@ -1,104 +1,73 @@
 # Itamos MCP Tools
 
-**Model Context Protocol tools for AI-assisted development.**  
-Built by [Itamos Technologia](https://itamos-technologia.com)
+> **Built in Greece, for the world.**
+> Free for individuals and open-source projects. Commercial licensing for organisations.
 
 ---
 
-## 🚀 Try it instantly — no setup required
+## The problem
 
-Get a live sandbox in one request:
+Every LLM coding assistant faces the same wall: codebases are too large to fit in context. The standard response is to dump files — grep for something promising, cat it, hope for the best. At 50k files this breaks. At 240k files it never worked.
 
-```bash
-curl https://mcp.itamos.eu/session/create
-```
-
-Returns:
-```json
-{
-  "ok": true,
-  "mcp_url": "https://mcp.itamos.eu/mcp",
-  "sandbox": "/fast/sandboxes/slot_042",
-  "expires": "5 minutes of inactivity"
-}
-```
-
-Paste the `mcp_url` into Claude, Cursor, or any MCP-compatible client and start using the tools immediately.
-
-**No signup. No API key. No installation.**  
-Your sandbox is isolated, quota-limited (2GB), and auto-wiped after 5 minutes of inactivity.
+We built five tools that give an LLM structured perception of a codebase instead of raw file access. The result is a model that navigates code the way a senior engineer does — starting from the architecture, narrowing to the module, reading only the segment it needs.
 
 ---
 
-## 🛠 Tools
+## Tools
 
-### `master_architect`
-Navigate codebases of any size. Scans project structure into a segment-addressed DB, then lets you drill from topology → file bones → exact code segments. Navigated a 240,000-file C++ codebase and fixed a low-level bug in 10 seconds.
-
-**Actions:** `scan`, `list`, `topology`, `bones`, `navigate`, `estimate`
-
-### `read_file`
-Segment-addressed file reading with project awareness. Reads exactly the code you need — not the whole file.
-
-### `write_file`
-Write new files or make targeted segment edits. Integrates with the architect's addressing system.
-
-### `web_skeleton`
-97% token reduction vs raw HTML. Turns any web page into a structured, navigable skeleton with interactive elements identified and extracted.
-
-**Actions:** `skeleton`, `read`, `click`
-
-### `git`
-Clone any public repository into your sandbox, check status, commit changes.
-
-**Actions:** `clone`, `status`, `commit`
+| Tool | What it does |
+|------|-------------|
+| master_architect | Project-aware code navigation. Builds a graph of your codebase, exposes topology, per-file bone structure, and segment-level addressing. The entry point for any codebase task. |
+| read_file | Segment-addressed file editor. Returns a skeleton by default. Read segment N to get the code. Edit with verify then commit. Project-aware. |
+| write_file | Create new files with automatic project placement. Refuses overwrites — edits go through read_file. |
+| git | Sandboxed git operations: clone (depth=1), status, commit. Path-jailed to the session workspace. |
+| web_skeleton | LLM-first web perception. 97% token reduction vs raw HTML. Actions: search, skeleton, read, click. |
 
 ---
 
-## 🔧 Self-hosting
+## How it works
 
-### Requirements
-- Node.js 20+
-- ZFS filesystem (for sandbox isolation and quotas)
-- Chromium (for web_skeleton)
+### Session model
 
-### Setup
-```bash
-git clone https://github.com/Itamos-technologia/itamos-mcp-tools.git
-cd itamos-mcp-tools
-npm install
-cd tools/master-architect && npm install && cd ../..
+Every client gets an isolated workspace. No shared state, no cross-session leakage. Workspaces are wiped after 5 minutes of inactivity.
 
-# Pre-create ZFS sandbox slots (adjust count as needed)
-sudo zfs create fast/sandboxes
-for i in $(seq 1 50); do
-  sudo zfs create -o quota=2G fast/sandboxes/slot_$(printf "%03d" $i)
-  sudo chown $USER:$USER /fast/sandboxes/slot_$(printf "%03d" $i)
-done
+### master_architect navigation flow
 
-# Start
-SANDBOX_PORT=4200 node server-sandbox.js
-```
+The model is guided through four phases: scan to index the repo, topology to see the data-flow graph, bones to inspect a file, navigate or read_file to read the specific segment. The model never reads a file it has not first located in the graph.
 
-### Connect
-```
-http://localhost:4200/mcp
-```
+### read_file segment addressing
+
+Files are parsed into named segments. A 5000-line file might have 40 segments. The model reads the skeleton, picks the segment it needs, reads that segment. Total context used is roughly 120 lines instead of 5000.
+
+### web_skeleton token reduction
+
+Raw HTML of a modern web page runs 50,000 to 200,000 tokens. web_skeleton output is 500 to 3,000 tokens. The model reads the skeleton, picks the section id it needs, reads that section only.
 
 ---
 
-## 📐 Architecture
+## Benchmarks
 
-- **IP-based sessions** — your IP is your identity, no auth needed
-- **ZFS isolation** — each session gets its own dataset with hard quota
-- **Jail layer** — all file operations confined to your sandbox
-- **Auto-cleanup** — 5 minutes idle → sandbox wiped, slot returned to pool
-- **500 concurrent sessions** on the hosted instance
+Results are being collected across 16 models (4B to 35B) on three standard suites. Full results will be published here as runs complete. See BENCHMARKS.md for methodology and live results.
 
 ---
 
-## 📄 License
+## Connecting
 
-Dual licensed — AGPL v3 for open source use, commercial license available.  
-See [LICENSE](LICENSE) for details.  
-Commercial inquiries: info@itamos-technologia.com
+The sandbox server speaks standard MCP over HTTP POST with SSE support.
+
+Compatible with any MCP client. Tested with Claude.ai, claude-code, and direct API integration.
+
+Hosted sandbox: coming soon at mcp.itamos.eu
+
+---
+
+## License
+
+Free for personal use and open-source projects. Commercial use requires a licence — contact tcnbinas@gmail.com.
+
+---
+
+## About
+
+Built by Itamos Technologia — a one-person company in Trikala, Greece.
+Part of a suite of AI-native developer tools built on AMD hardware with open-source inference stacks.
