@@ -947,6 +947,272 @@ export function getMissing(projectId) {
   };
 }
 
+// ─── getBones ────────────────────────────────────────────────────────────────
+//
+// Architect-level bone view of a file. Returns imports, exports and module list
+// (functions, classes) with their addresses — no editor metadata, no segment
+// details, no byte sizes. Compact enough for a model to scan and pick a target
+// before calling read_file to get the actual code.
+//
+// Accepts either a file address (e.g. "13") or an absolute path.
+export function getBones(projectId, address, absPath) {
+  const db = getDb();
+
+  // resolve file row by address or abs_path
+  let fileRow;
+  if (address) {
+    fileRow = db.prepare(
+      'SELECT id, address, name, rel_path, language, line_count FROM files WHERE project_id = ? AND address = ?'
+    ).get(projectId, address);
+  } else if (absPath) {
+    fileRow = db.prepare(
+      'SELECT id, address, name, rel_path, language, line_count FROM files WHERE abs_path = ?'
+    ).get(absPath);
+  }
+  if (!fileRow) return { ok: false, error: `no file found at ${address || absPath}` };
+
+  // imports — internal + external, deduplicated by path
+  const imports = db.prepare(`
+    SELECT i.import_path, i.is_external, MIN(i.line) AS line,
+           f2.address AS resolved_address, f2.name AS resolved_name
+    FROM imports i
+    LEFT JOIN files f2 ON i.resolved_file_id = f2.id
+    WHERE i.file_id = ?
+    GROUP BY i.import_path
+    ORDER BY MIN(i.line)
+  `).all(fileRow.id);
+
+  // external refs (servers, models, services, binaries)
+  const externalRefs = db.prepare(`
+    SELECT er.kind, er.name, er.locator, fer.line
+    FROM file_external_refs fer
+    JOIN external_refs er ON fer.external_ref_id = er.id
+    WHERE fer.file_id = ?
+    ORDER BY er.kind, fer.line
+  `).all(fileRow.id);
+
+  // db connections
+  const dbRefs = db.prepare(`
+    SELECT d.name, d.type, d.path_or_uri, dc.line
+    FROM db_connections dc
+    JOIN databases d ON dc.database_id = d.id
+    WHERE dc.file_id = ?
+    ORDER BY dc.line
+  `).all(fileRow.id);
+
+  // modules (functions, classes, exports) with their methods
+  const modules = db.prepare(`
+    SELECT address, name, kind, line_start, line_end
+    FROM modules WHERE file_id = ? ORDER BY address
+  `).all(fileRow.id);
+
+  // attach methods to each module
+  const modulesWithMethods = modules.map(mod => {
+    const methods = db.prepare(`
+      SELECT address, name, kind, line_start, line_end
+      FROM methods WHERE module_id = (
+        SELECT id FROM modules WHERE file_id = ? AND address = ?
+      ) ORDER BY address
+    `).all(fileRow.id, mod.address);
+    return methods.length ? { ...mod, methods } : mod;
+  });
+
+  return {
+    ok: true,
+    address: fileRow.address,
+    name: fileRow.name,
+    rel_path: fileRow.rel_path,
+    language: fileRow.language,
+    lines: fileRow.line_count,
+    imports: imports.map(i => ({
+      path: i.import_path,
+      external: !!i.is_external,
+      resolved: i.resolved_name || null,
+      resolved_address: i.resolved_address || null,
+      line: i.line,
+    })),
+    external_refs: externalRefs,
+    db_refs: dbRefs,
+    modules: modulesWithMethods,
+    hint: 'Use read_file with this address to read segments, or navigate(address) to drill into a module.',
+  };
+}
+
+// ─── getTopology ──────────────────────────────────────────────────────────
+//
+// Returns the project's data-flow graph as a compact node+edge list.
+// Level 1 (default): entry-point files, external endpoints, databases — all
+// connected by actual data flow direction (who calls whom, who reads what).
+// The model uses this as the navigation root: pick a node, drill into it
+// with navigate() or getPing() to go deeper.
+//
+// Node kinds: file | directory | database | external (server/model/binary/service)
+// Edge kinds: imports | db_connection | external_ref
+// Direction:  source -> target (data flows from source to target)
+export function getTopology(projectId) {
+  const db = getDb();
+
+  // ── 1. Entry points: files with no incoming internal imports ──────────
+  const entryFiles = db.prepare(`
+    SELECT f.id, f.address, f.name, f.rel_path, f.language, f.category
+    FROM files f
+    WHERE f.project_id = ?
+      AND f.is_readable_text = 1
+      AND NOT EXISTS (
+        SELECT 1 FROM imports i
+        WHERE i.resolved_file_id = f.id
+      )
+    ORDER BY f.address
+  `).all(projectId);
+
+  // ── 2. All internal import edges (file → file) ────────────────────────
+  const importEdges = db.prepare(`
+    SELECT
+      f1.address AS from_addr, f1.name AS from_name,
+      f2.address AS to_addr,   f2.name AS to_name
+    FROM imports i
+    JOIN files f1 ON i.file_id          = f1.id
+    JOIN files f2 ON i.resolved_file_id = f2.id
+    WHERE f1.project_id = ?
+      AND i.is_external = 0
+      AND i.resolved_file_id IS NOT NULL
+    ORDER BY f1.address, f2.address
+  `).all(projectId);
+
+  // ── 3. External ref nodes + edges (file → external endpoint) ─────────
+  const externalEdges = db.prepare(`
+    SELECT
+      f.address AS from_addr, f.name AS from_name,
+      er.kind, er.name AS ext_name, er.locator, er.extra,
+      fer.line
+    FROM file_external_refs fer
+    JOIN files         f  ON fer.file_id         = f.id
+    JOIN external_refs er ON fer.external_ref_id = er.id
+    WHERE f.project_id = ?
+    ORDER BY f.address, er.kind, er.locator
+  `).all(projectId);
+
+  // ── 4. Database nodes + edges (file → database) ───────────────────────
+  const dbEdges = db.prepare(`
+    SELECT
+      f.address  AS from_addr, f.name AS from_name,
+      d.address  AS db_addr,   d.name AS db_name, d.type, d.path_or_uri
+    FROM db_connections dc
+    JOIN files     f ON dc.file_id     = f.id
+    JOIN databases d ON dc.database_id = d.id
+    WHERE f.project_id = ?
+    ORDER BY f.address, d.address
+  `).all(projectId);
+
+  // ── 5. All database nodes ─────────────────────────────────────────────
+  const databases = db.prepare(`
+    SELECT address, name, type, path_or_uri
+    FROM databases
+    WHERE project_id = ?
+    ORDER BY address
+  `).all(projectId);
+
+  // ── 6. All external ref nodes for this project ────────────────────────
+  const externals = db.prepare(`
+    SELECT er.kind, er.name, er.locator, er.version, er.extra
+    FROM external_refs er
+    JOIN external_ref_projects erp ON er.id = erp.external_ref_id
+    WHERE erp.project_id = ?
+    ORDER BY er.kind, er.name
+  `).all(projectId);
+
+  // ── 7. Deduplicate external nodes by locator ──────────────────────────
+  const extNodeMap = new Map();
+  for (const e of externals) {
+    const key = `${e.kind}:${e.locator}`;
+    if (!extNodeMap.has(key)) {
+      extNodeMap.set(key, {
+        id: key,
+        kind: 'external',
+        subkind: e.kind,
+        name: e.name,
+        locator: e.locator,
+        version: e.version || null,
+        extra: e.extra ? (() => { try { return JSON.parse(e.extra); } catch { return e.extra; } })() : null,
+      });
+    }
+  }
+
+  // ── 8. Build node list ────────────────────────────────────────────────
+  const nodes = [
+    ...entryFiles.map(f => ({
+      id: f.address,
+      kind: 'file',
+      name: f.name,
+      rel_path: f.rel_path,
+      language: f.language,
+      category: f.category,
+      entry_point: true,
+    })),
+    ...databases.map(d => ({
+      id: d.address || `db:${d.name}`,
+      kind: 'database',
+      name: d.name,
+      db_type: d.type,
+      path_or_uri: d.path_or_uri,
+    })),
+    ...Array.from(extNodeMap.values()),
+  ];
+
+  // ── 9. Build edge list ────────────────────────────────────────────────
+  const edgeSet = new Set();
+  const edges = [];
+
+  const addEdge = (from, to, kind, meta) => {
+    const key = `${from}→${to}:${kind}`;
+    if (edgeSet.has(key)) return;
+    edgeSet.add(key);
+    edges.push({ from, to, kind, ...meta });
+  };
+
+  for (const e of importEdges) {
+    addEdge(e.from_addr, e.to_addr, 'imports', { from_name: e.from_name, to_name: e.to_name });
+  }
+  for (const e of externalEdges) {
+    const extKey = `${e.kind}:${e.locator}`;
+    addEdge(e.from_addr, extKey, 'external_ref', {
+      from_name: e.from_name,
+      to_name: e.ext_name,
+      subkind: e.kind,
+      locator: e.locator,
+      line: e.line,
+    });
+  }
+  for (const e of dbEdges) {
+    const dbId = e.db_addr || `db:${e.db_name}`;
+    addEdge(e.from_addr, dbId, 'db_connection', {
+      from_name: e.from_name,
+      to_name: e.db_name,
+      db_type: e.type,
+    });
+  }
+
+  // ── 10. Summary stats ─────────────────────────────────────────────────
+  const allFiles = db.prepare('SELECT COUNT(*) AS n FROM files WHERE project_id = ?').get(projectId);
+  const allDirs  = db.prepare('SELECT COUNT(*) AS n FROM directories WHERE project_id = ?').get(projectId);
+
+  return {
+    ok: true,
+    project_id: projectId,
+    summary: {
+      total_files: allFiles.n,
+      total_dirs: allDirs.n,
+      entry_points: entryFiles.length,
+      databases: databases.length,
+      external_nodes: extNodeMap.size,
+      edges: edges.length,
+    },
+    nodes,
+    edges,
+    hint: 'Navigate deeper with navigate(address) on any node id, or getPing(address) to trace data flow from a file.',
+  };
+}
+
 
 // ─── Verification status updates ─────────────────────────────────────────
 //
