@@ -319,11 +319,62 @@ export function getDb(dbPath) {
   // a directory (readdirSync + dynamic import). Lets the graph show modular
   // servers connected to the tools they load by directory convention.
   ensureColumn(_conn, 'imports', 'edge_kind', "TEXT DEFAULT 'import'");
+  // Used by scan / read_file / architect-link. Previously only present in hand-upgraded DBs,
+  // so a fresh install failed on its first scan. Additive and idempotent.
+  ensureColumn(_conn, 'files', 'present_on_disk', 'INTEGER NOT NULL DEFAULT 1');
+  _conn.exec(CONTENT_STORE_SCHEMA);
   return _conn;
 }
 
 // Add `col <type>` to `table` if not already present. No-op when the column
 // exists. Additive, backward-compatible schema evolution for live DBs.
+const CONTENT_STORE_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS file_content (
+    file_id          INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    hash             TEXT NOT NULL,
+    size             INTEGER NOT NULL,
+    is_binary        INTEGER NOT NULL DEFAULT 0,
+    language         TEXT,
+    content          BLOB,
+    segments         TEXT,
+    has_parse_errors INTEGER NOT NULL DEFAULT 0,
+    updated_at       TEXT DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS file_versions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id           INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    version_number    INTEGER NOT NULL,
+    hash              TEXT NOT NULL,
+    size              INTEGER NOT NULL,
+    content           BLOB,
+    segments          TEXT,
+    change_type       TEXT,
+    change_summary    TEXT,
+    verified_at_level INTEGER,
+    created_at        TEXT DEFAULT (datetime('now')),
+    UNIQUE(file_id, version_number)
+  );
+  CREATE INDEX IF NOT EXISTS idx_file_versions_file ON file_versions(file_id, version_number);
+  CREATE TABLE IF NOT EXISTS verified_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_file_id INTEGER NOT NULL,
+    source_module_id INTEGER,
+    import_id INTEGER,
+    connector TEXT NOT NULL,
+    target_file_id INTEGER,
+    target_module_id INTEGER,
+    verified_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY(source_file_id) REFERENCES files(id),
+    FOREIGN KEY(source_module_id) REFERENCES modules(id),
+    FOREIGN KEY(target_file_id) REFERENCES files(id),
+    FOREIGN KEY(target_module_id) REFERENCES modules(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_vlinks_source ON verified_links(source_file_id, source_module_id);
+  CREATE INDEX IF NOT EXISTS idx_vlinks_target ON verified_links(target_file_id);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_vlinks_unique ON verified_links(source_file_id, connector, import_id);
+`;
+
 function ensureColumn(conn, table, col, type) {
   try {
     const cols = conn.prepare(`PRAGMA table_info(${table})`).all();

@@ -98,24 +98,39 @@ function validateUrl(url) {
   try { parsed = new URL(url); } catch { throw new Error(`Invalid URL: ${url}`); }
 
   const scheme = parsed.protocol;
-  if (scheme === 'https:') return; // always OK
+  if (scheme === 'https:') {
+    if (process.env.WEB_SKELETON_PUBLIC_ONLY === '1' && isPrivateHost(parsed.hostname)) {
+      throw new Error(`Blocked: ${parsed.hostname} is a local/private address, not reachable from this sandbox.`);
+    }
+    return;
+  }
 
   if (scheme === 'http:') {
     const host = parsed.hostname;
-    // localhost variants
-    if (host === 'localhost' || host === '127.0.0.1'
-        || host === '[::1]' || host === '::1' || host === '0.0.0.0') return;
-    // Private RFC1918 ranges
-    if (host.startsWith('10.')) return;
-    if (host.startsWith('192.168.')) return;
-    if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return;
-    // Link-local
-    if (host.startsWith('169.254.')) return;
-
+    if (process.env.WEB_SKELETON_PUBLIC_ONLY === '1') {
+      // Multi-tenant sandbox: http:// must still resolve to a public address, same as https.
+      if (isPrivateHost(host)) {
+        throw new Error(`Blocked: ${host} is a local/private address, not reachable from this sandbox.`);
+      }
+      return;
+    }
+    // Single-user / dev mode: http:// is also allowed for local/private addresses (dev servers).
+    if (isPrivateHost(host)) return;
     throw new Error(`HTTP only allowed for local/private addresses. Got: ${host}. Use HTTPS for public sites.`);
   }
 
   throw new Error(`Blocked URL scheme: ${scheme} — only https:// and http:// (local only) are allowed.`);
+}
+
+// RFC1918 + loopback + link-local — used to gate local/private access in validateUrl().
+function isPrivateHost(host) {
+  if (host === 'localhost' || host === '127.0.0.1'
+      || host === '[::1]' || host === '::1' || host === '0.0.0.0') return true;
+  if (host.startsWith('10.')) return true;
+  if (host.startsWith('192.168.')) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
+  if (host.startsWith('169.254.')) return true;
+  return false;
 }
 
 
