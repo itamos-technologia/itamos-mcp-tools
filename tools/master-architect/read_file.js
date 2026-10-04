@@ -114,6 +114,7 @@ import { execFile as _execFileCb } from 'child_process';
 import * as _fsCF from 'fs';
 import * as _pathCF from 'path';
 import { promisify as _promisifyCF } from 'util';
+import { detectConfigFlavor, checkConfigSyntax } from './lib/config_segmenter.js';
 const _execFileCF = _promisifyCF(_execFileCb);
 // =============================================================================
 // CONSTANTS
@@ -924,6 +925,10 @@ async function checkCFamilyInContext(filePath, tmp, content, language) {
 }
 
 async function verifyL1(filePath, content, language) {
+  // Config files: real syntax / structure checks (JSON, YAML, TOML parsers;
+  // brace, tag and INI structure) instead of "plain text, no check".
+  const cfgFlavor = detectConfigFlavor(filePath, content, language);
+  if (cfgFlavor) return { level: 1, ...(await checkConfigSyntax(content, cfgFlavor, filePath)) };
   const PLAINTEXT_LANGS = ['plaintext', 'markdown', 'json', 'yaml', 'toml', 'ini', 'env'];
   if (PLAINTEXT_LANGS.includes(language)) {
     // No syntax checking for plain text formats

@@ -33,6 +33,7 @@ import Ruby from 'tree-sitter-ruby';
 import Bash from 'tree-sitter-bash';
 import Swift from 'tree-sitter-swift';
 import Kotlin from 'tree-sitter-kotlin';
+import { detectConfigFlavor, segmentConfig } from './config_segmenter.js';
 
 const TypeScript = TypeScriptModule.typescript;
 const CSharp = CSharpModule;
@@ -952,6 +953,13 @@ function getCharOffset(content, lineIndex) {
 // MAIN ENTRY. Identical contract to read_file's original segmentFile, plus an
 // optional aiTitle hook forwarded to the plaintext path.
 async function segmentFile(filePath, content, language, aiTitle) {
+  // Config files (nginx, systemd, YAML, JSON, sshd_config, fstab, ...) get
+  // structure-aware segments instead of the blank-line paragraph splitter.
+  const cfgFlavor = detectConfigFlavor(filePath, content, language);
+  if (cfgFlavor) {
+    const r = segmentConfig(content, cfgFlavor, freshId);
+    return { segments: r.segments, hasParseErrors: r.hasParseErrors, structureErrors: r.structureErrors, configFlavor: cfgFlavor };
+  }
   // Plain text languages bypass tree-sitter
   if (['plaintext', 'markdown', 'json', 'yaml', 'toml', 'ini', 'env'].includes(language)) {
     return await segmentPlainText(content, language, aiTitle);
