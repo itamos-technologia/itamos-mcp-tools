@@ -20,7 +20,7 @@ We built five tools that give an LLM structured perception of a codebase instead
 | master_architect | Project-aware code navigation. Builds a graph of your codebase, exposes topology, per-file bone structure, and segment-level addressing. The entry point for any codebase task. |
 | read_file | Segment-addressed file editor. Returns a skeleton by default. Read segment N to get the code. Edit with verify then commit. Project-aware. |
 | write_file | Create new files with automatic project placement. Refuses overwrites — edits go through read_file. |
-| git | Sandboxed git operations: clone (depth=1), status, commit. Path-jailed to the session workspace. |
+| git | The original Itamos git tool, sandboxed for security: clone (remote URLs only, depth=1), status, commit. Everything stays inside the session workspace; push is not available. |
 | web_skeleton | LLM-first web perception. 97% token reduction vs raw HTML. Actions: search, skeleton, read, click. |
 
 ---
@@ -47,7 +47,9 @@ Raw HTML of a modern web page runs 50,000 to 200,000 tokens. web_skeleton output
 
 ## Benchmarks
 
-Results are being collected across 16 models (4B to 35B) on three standard suites. Full results will be published here as runs complete. See BENCHMARKS.md for methodology and live results.
+Verified in live use with **Claude Opus 5.5** and **Claude Sonnet**. Other frontier models, including OpenAI's, are expected to work; Claude Haiku and OpenAI benchmarks are pending.
+
+A recorded, unedited bug-fix session on a real open GitHub issue is coming to BENCHMARKS.md, with the time and tokens it took.
 
 ---
 
@@ -55,7 +57,7 @@ Results are being collected across 16 models (4B to 35B) on three standard suite
 
 The sandbox server speaks standard MCP over HTTP POST with SSE support.
 
-Compatible with any MCP client. Tested with Claude.ai, claude-code, and direct API integration.
+Compatible with any MCP client. Used in practice through Claude.ai and through direct API integration (our benchmark harness).
 
 Hosted sandbox: coming soon at mcp.itamos.eu
 

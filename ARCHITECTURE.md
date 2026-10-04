@@ -74,7 +74,7 @@ Silent overwrites are the most common source of data loss in agentic coding loop
 
 ### What it does
 
-Provides three operations inside the session sandbox: clone, status, commit. All operations are path-jailed to the session workspace. The model cannot clone into or commit from outside its slot.
+This is the original Itamos git tool, sandboxed for security. It provides three operations inside the session: clone, status, commit. Clone only accepts remote git / https / ssh URLs, never a path on the host, and every operation is confined to the session workspace: the model cannot clone into or commit from outside its slot. With no `dir` argument, clone uses the workspace root, which is also where status and commit look by default.
 
 ### Why shallow clone only
 

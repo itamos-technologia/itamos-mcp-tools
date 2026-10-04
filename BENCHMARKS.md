@@ -4,6 +4,23 @@ This document describes the benchmark methodology and results comparing MCP-tool
 
 ---
 
+> **Status (October 2026):** the standard-suite comparison described further down is on hold. Small local models (4B to 31B) could not complete real tool-driven bug fixes reliably, so the current focus is recorded bug-fixing sessions on real, open GitHub issues.
+
+## Model compatibility
+
+| Model | Status |
+|---|---|
+| Claude Opus 5.5 | Verified in live use |
+| Claude Sonnet | Verified in live use |
+| Claude Haiku | Not yet tested |
+| OpenAI frontier models | Expected to work, benchmark pending |
+
+## Live bug-fix session
+
+A real, currently open issue in a large open-source codebase, fixed using only these tools. The session is published exactly as it appeared in the chat, together with the wall-clock time and the token counts reported by the tools.
+
+*Coming soon.*
+
 ## Motivation
 
 The central claim of these tools is that structured codebase navigation produces better results with fewer tokens than raw file access. This document measures that claim against standard benchmarks using publicly available models run on local hardware.
