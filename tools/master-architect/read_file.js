@@ -2251,12 +2251,24 @@ async function opCommit(buffer) {
       }
     } catch (e) { console.error(`[read_file] spec-gather error: ${e.message}`); }
   }
-  const dir = path.dirname(buffer.path);
-  const tmpPath = path.join(dir, `.${path.basename(buffer.path)}.tmp.${process.pid}`);
   buffer.verifyToken = { level: verifiedLevel, buffer_state_hash: bufferStateHash(buffer), timestamp: new Date().toISOString() };
   const finalText = buffer.assembleText();
-  await fs.writeFile(tmpPath, finalText, 'utf8');
-  await fs.rename(tmpPath, buffer.path);
+  // Write to the REAL file: renaming over a symlink (sites-enabled/x ->
+  // sites-available/x) would replace the link with a plain file. Keep the
+  // original file mode too (a fresh temp file would drop e.g. +x on scripts).
+  const writeTarget = await fs.realpath(buffer.path).catch(() => buffer.path);
+  const dir = path.dirname(writeTarget);
+  const tmpPath = path.join(dir, `.${path.basename(writeTarget)}.tmp.${process.pid}`);
+  let privilegedWrite = null;
+  try {
+    const origMode = await fs.stat(writeTarget).then((s) => s.mode & 0o7777).catch(() => null);
+    await fs.writeFile(tmpPath, finalText, 'utf8');
+    if (origMode !== null) await fs.chmod(tmpPath, origMode);
+    await fs.rename(tmpPath, writeTarget);
+  } catch (e) {
+    await fs.unlink(tmpPath).catch(() => {});
+    throw e;
+  }
   const editsApplied = buffer.editStack.length;
   // verifiedLevel computed by the cascade above.
 
