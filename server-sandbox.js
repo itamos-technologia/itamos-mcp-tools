@@ -240,6 +240,20 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Sessions live only in memory, so after a restart no slot belongs to anyone.
+// Wipe every non-empty slot at startup; otherwise the next user handed a slot
+// would inherit the previous occupant's files and index. (The wipe uses sync
+// fs calls, so it completes before the first request is served.)
+(async () => {
+  let wiped = 0;
+  for (let i = 1; i <= TOTAL_SLOTS; i++) {
+    try {
+      if (fs.readdirSync(slotPath(i)).length) { await wipeSlot(i); wiped += 1; }
+    } catch {}
+  }
+  if (wiped) console.log(`[Pool] Startup: wiped ${wiped} slot(s) left over from before the restart`);
+})();
+
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
