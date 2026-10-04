@@ -110,6 +110,11 @@ const Kotlin = KotlinModule.default || KotlinModule;
 // trace: read_file fronts the architect's signal-flow query — the model never
 // calls the engine directly. Path in, connections out.
 import { getProjectForFile, getConnections } from './lib/query.js';
+import { execFile as _execFileCb } from 'child_process';
+import * as _fsCF from 'fs';
+import * as _pathCF from 'path';
+import { promisify as _promisifyCF } from 'util';
+const _execFileCF = _promisifyCF(_execFileCb);
 // =============================================================================
 // CONSTANTS
 // =============================================================================
@@ -775,6 +780,149 @@ async function writeBufferToTemp(filePath, content) {
   return tmpPath;
 }
 
+// ── C / C++ syntax check in project context ───────────────────────────────
+// Checking the edited text alone (g++ -fsyntax-only /tmp/copy) fails on almost
+// every real project file: the copy sits in a temp folder, so #include "x.h"
+// can't be found, and the project's include paths and defines are missing.
+//   1. Reuse the file's real flags from compile_commands.json when the project
+//      has one (CMake: -DCMAKE_EXPORT_COMPILE_COMMANDS=ON). Headers borrow a
+//      sibling source file's flags.
+//   2. Otherwise use the file's own folder plus the project's include/ folders.
+//   3. A header that still can't be found means "not fully checked", unless the
+//      #include for it is new in this edit; then it's a real error.
+// In the public sandbox the compiler runs inside bubblewrap and can only see
+// the user's slot, system/ROCm headers and the temp copy: compiler errors quote
+// lines from included files, so host files must not be reachable at all.
+
+function _cfSandboxSlot() {
+  return globalThis.__sandboxCtx?.getStore?.()?.slotDir || null;
+}
+
+function _cfMayClimb(d) {
+  const slot = _cfSandboxSlot();
+  return !slot || (d !== slot && d.startsWith(slot + '/'));
+}
+
+function _cfProjectRoot(fileDir) {
+  let d = fileDir;
+  for (let i = 0; i < 16; i++) {
+    if (_fsCF.existsSync(_pathCF.join(d, '.git'))) return d;
+    const up = _pathCF.dirname(d);
+    if (up === d || !_cfMayClimb(d)) break;
+    d = up;
+  }
+  return fileDir;
+}
+
+function _cfFindCompileCommands(fileDir) {
+  let d = fileDir;
+  for (let i = 0; i < 16; i++) {
+    for (const c of [d, _pathCF.join(d, 'build'), _pathCF.join(d, 'build-release'), _pathCF.join(d, 'out')]) {
+      const f = _pathCF.join(c, 'compile_commands.json');
+      if (_fsCF.existsSync(f)) return f;
+    }
+    if (_fsCF.existsSync(_pathCF.join(d, '.git'))) break;
+    const up = _pathCF.dirname(d);
+    if (up === d || !_cfMayClimb(d)) break;
+    d = up;
+  }
+  return null;
+}
+
+function _cfSplitCmd(cmd) {
+  return (String(cmd).match(/"[^"]*"|'[^']*'|\S+/g) || []).map((t) => t.replace(/^["']|["']$/g, ''));
+}
+
+function _cfFlagsFromDb(ccPath, filePath) {
+  let db;
+  try { db = JSON.parse(_fsCF.readFileSync(ccPath, 'utf8')); } catch { return null; }
+  if (!Array.isArray(db) || !db.length) return null;
+  const abs = (e) => _pathCF.resolve(e.directory || '', e.file || '');
+  const entry = db.find((e) => abs(e) === filePath)
+    || db.find((e) => _pathCF.dirname(abs(e)) === _pathCF.dirname(filePath))
+    || db[0];
+  const args = entry.arguments || _cfSplitCmd(entry.command);
+  const dir = entry.directory || _pathCF.dirname(filePath);
+  const pathFlags = ['-I', '-isystem', '-iquote', '-include'];
+  const out = [];
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if ([...pathFlags, '-D', '-U'].includes(a)) {
+      const v = args[++i];
+      if (v === undefined) break;
+      out.push(a, pathFlags.includes(a) && !_pathCF.isAbsolute(v) ? _pathCF.resolve(dir, v) : v);
+      continue;
+    }
+    const m = a.match(/^(-I|-isystem|-iquote)(.+)$/);
+    if (m) { out.push(m[1], _pathCF.isAbsolute(m[2]) ? m[2] : _pathCF.resolve(dir, m[2])); continue; }
+    if (/^-[DU]./.test(a) || /^-std=/.test(a)) out.push(a);
+  }
+  return out;
+}
+
+function _cfGuessIncludes(root) {
+  const found = [];
+  const walk = (dir, depth) => {
+    if (depth > 3 || found.length >= 24) return;
+    let ents;
+    try { ents = _fsCF.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      if (!e.isDirectory() || e.name.startsWith('.') || ['node_modules', 'build', 'out'].includes(e.name)) continue;
+      const p = _pathCF.join(dir, e.name);
+      if (e.name === 'include') found.push(p);
+      walk(p, depth + 1);
+    }
+  };
+  walk(root, 0);
+  return found;
+}
+
+async function checkCFamilyInContext(filePath, tmp, content, language) {
+  const fileDir = _pathCF.dirname(filePath);
+  const compiler = language === 'c' ? 'gcc' : 'g++';
+  let flags, how;
+  const cc = _cfFindCompileCommands(fileDir);
+  const dbFlags = cc ? _cfFlagsFromDb(cc, filePath) : null;
+  if (dbFlags && dbFlags.length) {
+    flags = dbFlags; how = 'flags from compile_commands.json';
+  } else {
+    const root = _cfProjectRoot(fileDir);
+    const incs = _cfGuessIncludes(root);
+    flags = ['-I', root, ...incs.flatMap((d) => ['-I', d])];
+    how = `no compile_commands.json; ${incs.length} include folder(s) found`;
+  }
+  const ccArgs = ['-fsyntax-only', '-x', language === 'c' ? 'c' : 'c++', '-iquote', fileDir, ...flags, tmp];
+  const slot = _cfSandboxSlot();
+  const [bin, args] = slot
+    ? ['bwrap', ['--unshare-all', '--die-with-parent', '--new-session',
+        '--ro-bind', '/usr', '/usr', '--ro-bind-try', '/lib', '/lib', '--ro-bind-try', '/lib64', '/lib64',
+        '--ro-bind-try', '/bin', '/bin', '--ro-bind-try', '/etc/alternatives', '/etc/alternatives',
+        '--ro-bind-try', '/etc/ld.so.cache', '/etc/ld.so.cache', '--ro-bind-try', '/opt/rocm', '/opt/rocm',
+        '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+        '--ro-bind', slot, slot, '--ro-bind', tmp, tmp, compiler, ...ccArgs]]
+    : [compiler, ccArgs];
+  try {
+    await _execFileCF(bin, args, { timeout: 60000, maxBuffer: 8 * 1024 * 1024 });
+    return { ok: true, messages: ['L1 tree-sitter: OK', `L1 ${compiler} -fsyntax-only: OK (${how})`] };
+  } catch (e) {
+    const raw = `${e.stderr || ''}${e.stdout || ''}` || String(e.message || e);
+    const text = raw.split(tmp).join(filePath).trim();
+    const missing = text.match(/fatal error: ([^:\n]+): No such file or directory/);
+    if (missing) {
+      const hdr = missing[1].trim();
+      let original = '';
+      try { original = _fsCF.readFileSync(filePath, 'utf8'); } catch {}
+      const incLines = (s) => s.split('\n').filter((l) => /^\s*#\s*include\b/.test(l) && l.includes(hdr));
+      const addedByEdit = incLines(content).length > 0 && incLines(original).length === 0;
+      if (!addedByEdit) {
+        return { ok: true, partial: true, messages: ['L1 tree-sitter: OK',
+          `L1 ${compiler}: not fully checked, header "${hdr}" not found (${how}). For a full check, generate compile_commands.json (CMake: -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).`] };
+      }
+    }
+    return { ok: false, messages: ['L1 tree-sitter: OK', `L1 ${compiler}: ${text.slice(0, 800)}`] };
+  }
+}
+
 async function verifyL1(filePath, content, language) {
   const PLAINTEXT_LANGS = ['plaintext', 'markdown', 'json', 'yaml', 'toml', 'ini', 'env'];
   if (PLAINTEXT_LANGS.includes(language)) {
@@ -839,22 +987,9 @@ async function verifyL1(filePath, content, language) {
         const out = (e.stderr || e.message).toString().trim();
         return { level: 1, ok: false, messages: ['L1 tree-sitter: OK', `L1 gofmt: ${out.slice(0, 500)}`] };
       }
-    } else if (language === 'c') {
-      try {
-        await execAsync(`gcc -fsyntax-only -x c "${tmp}" 2>&1`, { timeout: 10000 });
-        return { level: 1, ok: true, messages: ['L1 tree-sitter: OK', 'L1 gcc -fsyntax-only: OK'] };
-      } catch (e) {
-        const out = (e.stderr || e.stdout || e.message).toString().trim();
-        return { level: 1, ok: false, messages: ['L1 tree-sitter: OK', `L1 gcc: ${out.slice(0, 500)}`] };
-      }
-    } else if (language === 'cpp') {
-      try {
-        await execAsync(`g++ -fsyntax-only -x c++ "${tmp}" 2>&1`, { timeout: 10000 });
-        return { level: 1, ok: true, messages: ['L1 tree-sitter: OK', 'L1 g++ -fsyntax-only: OK'] };
-      } catch (e) {
-        const out = (e.stderr || e.stdout || e.message).toString().trim();
-        return { level: 1, ok: false, messages: ['L1 tree-sitter: OK', `L1 g++: ${out.slice(0, 500)}`] };
-      }
+    } else if (language === 'c' || language === 'cpp') {
+      // Checked in the context of its project (include paths, defines), not alone.
+      return { level: 1, ...(await checkCFamilyInContext(filePath, tmp, content, language)) };
     } else if (language === 'php') {
       try {
         await execAsync(`php -l "${tmp}" 2>&1`, { timeout: 10000 });
