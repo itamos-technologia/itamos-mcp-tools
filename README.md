@@ -11,6 +11,9 @@ Every LLM coding assistant faces the same wall: codebases are too large to fit i
 
 We built five tools that give an LLM structured perception of a codebase instead of raw file access. The result is a model that navigates code the way a senior engineer does — starting from the architecture, narrowing to the module, reading only the segment it needs.
 
+
+**Read the full paper:** [docs/PAPER.md](docs/PAPER.md): how each tool works, why it was designed that way, and how the hosted sandbox runs, with diagrams.
+
 ---
 
 ## Tools
@@ -59,7 +62,7 @@ The sandbox server speaks standard MCP over HTTP POST with SSE support.
 
 Compatible with any MCP client. Used in practice through Claude.ai and through direct API integration (our benchmark harness).
 
-Hosted sandbox: coming soon at mcp.itamos.eu
+Hosted sandbox (free live alpha): add `https://mcp.itamos-technologia.com/mcp` as a connector in any MCP client. A page opens where you create your sandbox with one click, no account needed. Sandboxes are deleted after 10 minutes of inactivity, so don't use them for sensitive data.
 
 ---
 
