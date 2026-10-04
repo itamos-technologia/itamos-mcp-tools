@@ -105,6 +105,7 @@ export async function check(absPath, db) {
 
     let connection;
     try {
+      if (globalThis.__sandboxCtx) throw new Error('network database checks are disabled in the sandbox');
       connection = await mysql.createConnection(connCfg);
     } catch (err) {
       // Connection failures aren't recordable as bug pairs — environmental.

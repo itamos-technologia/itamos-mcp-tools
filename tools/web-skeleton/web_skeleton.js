@@ -26,6 +26,8 @@
 import { z } from 'zod';
 import { execFile, spawn } from 'node:child_process';
 import http from 'node:http';
+import net from 'node:net';
+import dns from 'node:dns';
 import { readFileSync, existsSync, appendFileSync } from 'node:fs';
 import { logCost } from '../../mcp_tools/lib/cost_log.js';
 import { join, dirname } from 'node:path';
@@ -165,6 +167,131 @@ function findChrome() {
   throw new Error('No Chrome/Chromium binary found. Install portable Chromium in tools/web-skeleton/chromium/');
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SANDBOX EGRESS GUARD
+// ═══════════════════════════════════════════════════════════════════════════
+// In the public sandbox (WEB_SKELETON_PUBLIC_ONLY=1) Chrome sends ALL traffic
+// through this in-process proxy: page loads, redirects, iframes, background
+// scripts, websockets. The proxy resolves each host itself, refuses private /
+// loopback / link-local / metadata addresses, and connects to the exact address
+// it checked, so DNS tricks (public name -> 127.0.0.1) and redirects can't
+// reach services on this machine or its network.
+
+let _egressProxyPort = null;
+
+function _isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b, c] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+      (a === 192 && b === 0 && (c === 0 || c === 2)) ||           // 192.0.0.0/24, TEST-NET-1 (not 192.0.32.0/20 etc.)
+      (a === 198 && (b === 18 || b === 19)) ||                     // benchmarking 198.18.0.0/15
+      (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113);  // TEST-NET-2/3
+  }
+  const x = String(ip).toLowerCase();
+  if (x.startsWith('::ffff:')) return _isPrivateIp(x.slice(7));
+  return x === '::' || x === '::1' || /^f[cd]/.test(x) || /^fe[89ab]/.test(x) || x.startsWith('ff');
+}
+
+async function _resolvePublic(host) {
+  const h = String(host).replace(/^\[|\]$/g, '');
+  const addrs = net.isIP(h) ? [{ address: h }] : await dns.promises.lookup(h, { all: true });
+  if (!addrs.length || addrs.some((a) => _isPrivateIp(a.address))) return null;
+  // Prefer IPv4 (this host may not route IPv6), keeping the rest as fallbacks.
+  return [...addrs.filter((a) => net.isIPv4(a.address)), ...addrs.filter((a) => !net.isIPv4(a.address))].map((a) => a.address);
+}
+
+// Connect to the first reachable address from a vetted list.
+function _connectFirst(ips, port, onConnect, onFail) {
+  const [ip, ...rest] = ips;
+  const sock = net.connect(port, ip, () => onConnect(sock));
+  sock.once('error', () => { sock.destroy(); rest.length ? _connectFirst(rest, port, onConnect, onFail) : onFail(); });
+}
+
+function startEgressProxy() {
+  if (_egressProxyPort) return Promise.resolve(_egressProxyPort);
+  return new Promise((resolve, reject) => {
+    const deny = (sock) => { try { sock.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); } catch {} };
+    const srv = http.createServer(async (req, res) => {
+      let u;
+      try { u = new URL(req.url); } catch { res.writeHead(400); return res.end(); }
+      if (u.protocol !== 'http:') { res.writeHead(403); return res.end(); }
+      const ips = await _resolvePublic(u.hostname).catch(() => null);
+      if (!ips) { res.writeHead(403); return res.end('blocked: private address'); }
+      const ip = ips[0];
+      const headers = { ...req.headers };
+      delete headers['proxy-connection']; delete headers['proxy-authorization'];
+      const up = http.request({ host: ip, port: u.port || 80, method: req.method, path: u.pathname + u.search, headers },
+        (r) => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+      up.on('error', () => { try { res.writeHead(502); res.end(); } catch {} });
+      req.pipe(up);
+    });
+    srv.on('connect', async (req, client, head) => {
+      const m = String(req.url).match(/^(.*):(\d+)$/);
+      const ips = m ? await _resolvePublic(m[1]).catch(() => null) : null;
+      if (!ips) return deny(client);
+      _connectFirst(ips, Number(m[2]), (up) => {
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head && head.length) up.write(head);
+        up.pipe(client); client.pipe(up);
+        up.on('error', () => client.destroy());
+        client.on('error', () => up.destroy());
+      }, () => deny(client));
+    });
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => { _egressProxyPort = srv.address().port; resolve(_egressProxyPort); });
+  });
+}
+
+// One isolated browser context (own tab, cookies, storage) per sandbox slot.
+// Outside the sandbox the original single-tab behaviour is kept.
+const _slotTargets = new Map();   // slotDir -> { targetId, contextId }
+
+async function _browserSession() {
+  const ver = await cdpRequest('/json/version');
+  const b = new CDPSession(ver.webSocketDebuggerUrl);
+  await b.connect();
+  return b;
+}
+
+async function getPageTarget(create) {
+  const slot = globalThis.__sandboxCtx?.getStore?.()?.slotDir;
+  const targets = await cdpRequest('/json/list');
+  if (!slot) {
+    let t = targets.find((x) => x.type === 'page');
+    if (!t && create) t = await cdpRequest('/json/new?about:blank');
+    return t || null;
+  }
+  const known = _slotTargets.get(slot);
+  if (known) {
+    const t = targets.find((x) => x.id === known.targetId);
+    if (t) return t;
+    _slotTargets.delete(slot);
+  }
+  if (!create) return null;
+  const b = await _browserSession();
+  try {
+    const { browserContextId } = await b.send('Target.createBrowserContext');
+    const { targetId } = await b.send('Target.createTarget', { url: 'about:blank', browserContextId });
+    _slotTargets.set(slot, { targetId, contextId: browserContextId });
+  } finally {
+    await b.close();
+  }
+  const fresh = await cdpRequest('/json/list');
+  return fresh.find((x) => x.id === _slotTargets.get(slot).targetId) || null;
+}
+
+(globalThis.__sandboxForgetHooks ||= []).push((slotDir) => {
+  const t = _slotTargets.get(slotDir);
+  for (const k of [..._pageCache.keys()]) if (k.startsWith(slotDir + '|')) _pageCache.delete(k);
+  if (!t) return;
+  _slotTargets.delete(slotDir);
+  _browserSession()
+    .then(async (b) => { try { await b.send('Target.disposeBrowserContext', { browserContextId: t.contextId }); } catch {} await b.close(); })
+    .catch(() => {});
+});
+
 async function ensureChrome() {
   if (_chromeProcess && !_chromeProcess.killed) {
     // Verify it's still responding
@@ -178,6 +305,10 @@ async function ensureChrome() {
     }
   }
 
+  const proxyArgs = process.env.WEB_SKELETON_PUBLIC_ONLY === '1'
+    ? [`--proxy-server=http://127.0.0.1:${await startEgressProxy()}`, '--proxy-bypass-list=<-loopback>',
+       '--force-webrtc-ip-handling-policy', '--webrtc-ip-handling-policy=disable_non_proxied_udp']
+    : [];
   const bin = findChrome();
   _chromeProcess = spawn(bin, [
     '--headless=new',
@@ -194,6 +325,7 @@ async function ensureChrome() {
     '--disable-component-extensions-with-background-pages',
     '--disable-popup-blocking',
     '--disable-background-timer-throttling',
+    ...proxyArgs,
     `--user-data-dir=/tmp/web-skeleton-profile-${_cdpPort}`,
     `--remote-debugging-port=${_cdpPort}`,
     '--window-size=1920,1080',
@@ -330,7 +462,10 @@ const _pageCache = new Map();  // url → { skeleton, sections, timestamp }
 const MAX_CACHE = 10;
 const CACHE_TTL = 300000; // 5 minutes
 
+function _slotKey(url) { return (globalThis.__sandboxCtx?.getStore?.()?.slotDir || '') + '|' + url; }
+
 function cacheSet(url, data) {
+  url = _slotKey(url);
   if (_pageCache.size >= MAX_CACHE) {
     // Evict oldest
     let oldest = null, oldestTime = Infinity;
@@ -343,6 +478,7 @@ function cacheSet(url, data) {
 }
 
 function cacheGet(url) {
+  url = _slotKey(url);
   const entry = _pageCache.get(url);
   if (!entry) return null;
   if (Date.now() - entry.timestamp > CACHE_TTL) {
@@ -795,12 +931,8 @@ async function actionSkeleton(url, viewport = { width: 1920, height: 1080 }, con
   // No cache — need to fetch the page
   await ensureChrome();
 
-  const targets = await cdpRequest('/json/list');
-  let target = targets.find((t) => t.type === 'page');
-
-  if (!target) {
-    target = await cdpRequest('/json/new?about:blank');
-  }
+  const target = await getPageTarget(true);
+  if (!target) throw new Error('could not open a browser tab');
 
   const session = new CDPSession(target.webSocketDebuggerUrl);
   await session.connect();
@@ -894,8 +1026,7 @@ async function actionRead(url, sectionId) {
 async function actionClick(url, elementId, viewport = { width: 1920, height: 1080 }) {
   await ensureChrome();
 
-  const targets = await cdpRequest('/json/list');
-  let target = targets.find((t) => t.type === 'page');
+  const target = await getPageTarget(false);
   if (!target) throw new Error('No browser tab open. Run skeleton first.');
 
   const session = new CDPSession(target.webSocketDebuggerUrl);
@@ -909,6 +1040,23 @@ async function actionClick(url, elementId, viewport = { width: 1920, height: 108
       deviceScaleFactor: 1,
       mobile: viewport.width < 768,
     });
+
+    // The tab may have moved on since the skeleton was taken (an earlier
+    // click, or a skeleton answered from cache without reloading). Element ids
+    // are only valid for the page they came from, so make sure the tab shows
+    // that page before resolving the id.
+    if (url) {
+      const norm = (u) => String(u || '').replace(/#.*$/, '').replace(/\/+$/, '');
+      const here = await session.send('Runtime.evaluate', { expression: 'location.href', returnByValue: true });
+      if (norm(here?.result?.value) !== norm(url)) {
+        validateUrl(url);
+        await session.send('Page.enable');
+        const loaded = new Promise((resolve) => { session.on('Page.loadEventFired', resolve); setTimeout(resolve, 15000); });
+        await session.send('Page.navigate', { url });
+        await loaded;
+        await sleep(1500);
+      }
+    }
 
     // Find the element by re-walking the DOM with the same id counter,
     // then scroll into view and click
@@ -1019,9 +1167,8 @@ async function actionSearch(query) {
 
   const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
-  const targets = await cdpRequest('/json/list');
-  let target = targets.find((t) => t.type === 'page');
-  if (!target) target = await cdpRequest('/json/new?about:blank');
+  const target = await getPageTarget(true);
+  if (!target) throw new Error('could not open a browser tab');
 
   const session = new CDPSession(target.webSocketDebuggerUrl);
   await session.connect();

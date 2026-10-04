@@ -1,14 +1,17 @@
 /**
- * MCP shim for web_skeleton.
+ * MCP shim for web_skeleton (sandbox).
  *
- * Web page skeletonizer — gives LLMs structured perception of web pages.
- * 97% token reduction vs raw HTML. Uses headless Chromium via CDP.
- * Zero npm dependencies.
- *
- * Implementation lives in /tank/projects/mcp-servers/tools/web-skeleton/
- * — this file just re-exports the tool definition so server-modular.js's
- * mcp_tools/ loader picks it up.
+ * Re-exports the tool and flags its error results (blocked URLs, unreachable
+ * pages) as MCP errors, so models treat them as failures instead of content.
  */
 
 import tool from '../tools/web-skeleton/web_skeleton.js';
-export default tool;
+
+export default {
+  ...tool,
+  async handler(args, ctx) {
+    const r = await tool.handler.call(tool, args, ctx);
+    const text = r?.content?.[0]?.text || '';
+    return /^\[WebSkeleton Error\]/.test(text) ? { ...r, isError: true } : r;
+  },
+};

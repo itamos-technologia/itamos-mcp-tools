@@ -15,3 +15,9 @@ mcp_tools/node_modules/
 server-sandbox.js.bak
 make_cv*.js
 /tmp/
+
+# local backups from edits
+*.bak-*
+*.bak
+# sandbox runtime data (cost stats etc.)
+data/

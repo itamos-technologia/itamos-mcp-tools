@@ -451,15 +451,50 @@ export default {
 
     if (!projectRoot) return null;
 
-    // Absolute-ish import: try treating it as project-rooted
+    // Absolute import: try every plausible import root, nearest first: the
+    // importing file's own folder (flat/script layout), its parents up to the
+    // project root, then the project root itself and a src/ layout.
     const asPath = importPath.replace(/\./g, '/');
-    const tries = [
-      path.join(projectRoot, asPath + '.py'),
-      path.join(projectRoot, asPath, '__init__.py'),
-    ];
-    for (const t of tries) {
-      try { if (fs.statSync(t).isFile()) return t; } catch {}
+    for (const base of pyImportRoots(fromDir, path, projectRoot)) {
+      for (const t of [path.join(base, asPath + '.py'), path.join(base, asPath, '__init__.py')]) {
+        try { if (fs.statSync(t).isFile()) return t; } catch {}
+      }
     }
     return null;
   },
+
+  // True when an absolute import is rooted in THIS project: its top-level
+  // module/package exists under one of the import roots, even if the full
+  // dotted path doesn't resolve. Such an import is a broken internal import
+  // (e.g. `from pkg.nothere import x` while pkg/ exists), not an external lib.
+  isLocalModule(importPath, fromAbsFile, fs, path, projectRoot) {
+    if (importPath.startsWith('.')) return true;
+    if (!projectRoot) return false;
+    const top = importPath.split('.')[0];
+    if (!top) return false;
+    for (const base of pyImportRoots(path.dirname(fromAbsFile), path, projectRoot)) {
+      try { if (fs.statSync(path.join(base, top + '.py')).isFile()) return true; } catch {}
+      try {
+        const dir = path.join(base, top);
+        if (fs.statSync(dir).isDirectory() &&
+            fs.readdirSync(dir).some(f => f === '__init__.py' || f.endsWith('.py'))) return true;
+      } catch {}
+    }
+    return false;
+  },
 };
+
+// Module-level (not methods): scan.js calls resolveImport detached from the
+// parser object, so these must not rely on `this`.
+function pyImportRoots(fromDir, path, projectRoot) {
+  const root = path.resolve(projectRoot);
+  const roots = [];
+  let d = path.resolve(fromDir);
+  while (d === root || d.startsWith(root + path.sep)) {
+    roots.push(d);
+    if (d === root) break;
+    d = path.dirname(d);
+  }
+  roots.push(root, path.join(root, 'src'));
+  return [...new Set(roots)];
+}

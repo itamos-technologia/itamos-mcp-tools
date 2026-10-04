@@ -100,6 +100,9 @@ function getDb() {
  * pair). The ship is fire-and-forget and never affects the local path.
  */
 export function recordPair(pair) {
+  // Sandbox: users' failing queries are their data; don't collect them into a
+  // shared file. Can be re-enabled later behind explicit user consent.
+  if (globalThis.__sandboxCtx) return false;
   try {
     const db = getDb();
     if (!db) return false;

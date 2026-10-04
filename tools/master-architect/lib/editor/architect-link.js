@@ -54,14 +54,16 @@ const DEFAULT_ARCHITECT_DB = path.join(_THIS_DIR, '..', '..', 'master-architect.
 
 const ROOTS_REFRESH_MS = 60 * 1000;   // refresh project-roots cache every 60s
 
-let _db = null;
-let _dbPathUsed = null;
-let _rootsCache = null;
-let _rootsCachedAtMs = 0;
-const _loadedProjectsThisSession = new Set();   // project_ids whose skeleton has been shipped this session
+const _dbs = new Map();          // db path -> read-only handle (one per slot DB in the sandbox)
+const _rootsCaches = new Map();  // db path -> { rows, at }
+const _loadedProjectsThisSession = new Set();   // "<dbPath>#<project_id>" whose skeleton has been shipped this session
 
 function resolveDbPath() {
-  // Read env var on every call so tests can override after module load.
+  // Sandbox: the per-request slot DB. Otherwise read the env var on every call
+  // so tests can override after module load.
+  const store = globalThis.__sandboxCtx?.getStore?.();
+  if (store?.architectDb) return store.architectDb;
+  if (globalThis.__sandboxCtx && !store?.architectDb) throw new Error('sandbox: no request context; refusing to open a shared architect DB');
   return process.env.MASTER_ARCHITECT_DB || DEFAULT_ARCHITECT_DB;
 }
 
@@ -74,29 +76,20 @@ function resolveDbPath() {
  */
 function getDb() {
   const targetPath = resolveDbPath();
-  if (_db && _dbPathUsed === targetPath) return _db;
-  if (_db) {
-    try { _db.close(); } catch {}
-    _db = null;
-    _rootsCache = null;
-  }
-  if (!existsSync(targetPath)) {
-    _dbPathUsed = targetPath;
-    return null;
-  }
+  const cached = _dbs.get(targetPath);
+  if (cached && cached.open) return cached;
+  if (!existsSync(targetPath)) return null;
   try {
-    _db = new Database(targetPath, { readonly: true, fileMustExist: true });
-    _dbPathUsed = targetPath;
-    return _db;
+    const handle = new Database(targetPath, { readonly: true, fileMustExist: true });
+    _dbs.set(targetPath, handle);
+    return handle;
   } catch (err) {
     console.error(`[architect-link] cannot open ${targetPath}: ${err.message}`);
-    _dbPathUsed = targetPath;
     return null;
   }
 }
 
-let _wdb = null;
-let _wdbPathUsed = null;
+const _wdbs = new Map();   // db path -> write handle
 
 /**
  * Write-capable DB connection, used only for the verify-status update path.
@@ -105,24 +98,17 @@ let _wdbPathUsed = null;
  */
 function getWriteDb() {
   const targetPath = resolveDbPath();
-  if (_wdb && _wdbPathUsed === targetPath) return _wdb;
-  if (_wdb) {
-    try { _wdb.close(); } catch {}
-    _wdb = null;
-  }
-  if (!existsSync(targetPath)) {
-    _wdbPathUsed = targetPath;
-    return null;
-  }
+  const cached = _wdbs.get(targetPath);
+  if (cached && cached.open) return cached;
+  if (!existsSync(targetPath)) return null;
   try {
-    _wdb = new Database(targetPath, { fileMustExist: true });
-    _wdb.pragma('journal_mode = WAL');
-    _wdb.pragma('foreign_keys = ON');
-    _wdbPathUsed = targetPath;
-    return _wdb;
+    const handle = new Database(targetPath, { fileMustExist: true });
+    handle.pragma('journal_mode = WAL');
+    handle.pragma('foreign_keys = ON');
+    _wdbs.set(targetPath, handle);
+    return handle;
   } catch (err) {
     console.error(`[architect-link] cannot open write handle ${targetPath}: ${err.message}`);
-    _wdbPathUsed = targetPath;
     return null;
   }
 }
@@ -135,27 +121,23 @@ function getWriteDb() {
  */
 function getProjectRoots() {
   const now = Date.now();
-  if (_rootsCache && (now - _rootsCachedAtMs) < ROOTS_REFRESH_MS) {
-    return _rootsCache;
-  }
+  const key = resolveDbPath();
+  const c = _rootsCaches.get(key);
+  if (c && (now - c.at) < ROOTS_REFRESH_MS) return c.rows;
+  let rows = [];
   const db = getDb();
-  if (!db) {
-    _rootsCache = [];
-    _rootsCachedAtMs = now;
-    return _rootsCache;
+  if (db) {
+    try {
+      rows = db.prepare('SELECT id, name, root_path FROM projects').all();
+      // Sort by root path length DESC so longest (most specific) match wins
+      rows.sort((a, b) => b.root_path.length - a.root_path.length);
+    } catch (err) {
+      console.error(`[architect-link] failed to load project roots: ${err.message}`);
+      rows = [];
+    }
   }
-  try {
-    const rows = db.prepare('SELECT id, name, root_path FROM projects').all();
-    // Sort by root path length DESC so longest (most specific) match wins
-    rows.sort((a, b) => b.root_path.length - a.root_path.length);
-    _rootsCache = rows;
-    _rootsCachedAtMs = now;
-  } catch (err) {
-    console.error(`[architect-link] failed to load project roots: ${err.message}`);
-    _rootsCache = [];
-    _rootsCachedAtMs = now;
-  }
-  return _rootsCache;
+  _rootsCaches.set(key, { rows, at: now });
+  return rows;
 }
 
 /**
@@ -296,7 +278,7 @@ export function getProjectInfoForFile(absPath) {
 
     if (fileRow) {
       // INDEXED FILE — we know its address.
-      const alreadyLoaded = _loadedProjectsThisSession.has(fileRow.project_id);
+      const alreadyLoaded = _loadedProjectsThisSession.has(`${resolveDbPath()}#${fileRow.project_id}`);
       if (alreadyLoaded) {
         return {
           status: 'already_loaded',
@@ -320,7 +302,7 @@ export function getProjectInfoForFile(absPath) {
       if (!skeleton) {
         return null;
       }
-      _loadedProjectsThisSession.add(fileRow.project_id);
+      _loadedProjectsThisSession.add(`${resolveDbPath()}#${fileRow.project_id}`);
       const baseHint = `Project '${fileRow.project_name}' loaded. Numeric addresses (1.2.3) navigate code; letter addresses (1.a) are non-parseable files. Use master_architect navigate/connections from here.`;
       const integrityHint = integrity.demoted > 0
         ? ` Integrity check demoted ${integrity.demoted} file(s) to unverified — see integrity_warnings for details. Re-verify before trusting them.`
@@ -372,8 +354,7 @@ export function getProjectInfoForFile(absPath) {
  */
 export function _resetSession() {
   _loadedProjectsThisSession.clear();
-  _rootsCache = null;
-  _rootsCachedAtMs = 0;
+  _rootsCaches.clear();
 }
 
 /**
@@ -1263,7 +1244,9 @@ export async function checkSqlQueries(absPath) {
       }
       continue;
     }
-    if (!existsSync(group.db_path)) {
+    // Sandbox: a database outside the caller's slot is treated as nonexistent,
+    // so user code can neither read nor probe host files.
+    if ((globalThis.__sandboxCtx && !(globalThis.__sandboxCtx.getStore()?.slotDir && path.resolve(group.db_path).startsWith(globalThis.__sandboxCtx.getStore().slotDir + '/'))) || !existsSync(group.db_path)) {
       for (const q of group.queries) {
         checked += 1;
         failures.push({
@@ -1279,6 +1262,12 @@ export async function checkSqlQueries(absPath) {
 
     let liveDb;
     try {
+      // Sandbox: only open databases inside the caller's own slot, never a
+      // host file that user code happens to reference.
+      const _st = globalThis.__sandboxCtx?.getStore?.();
+      if (globalThis.__sandboxCtx && !(_st?.slotDir && path.resolve(group.db_path).startsWith(_st.slotDir + '/'))) {
+        throw new Error(`database ${group.db_path} is outside the sandbox`);
+      }
       liveDb = new Database(group.db_path, { readonly: true, fileMustExist: true });
     } catch (err) {
       for (const q of group.queries) {
@@ -1775,3 +1764,11 @@ export function updateExternalSpecs(absPath, refs) {
   try { tx(refs); } catch (e) { console.error(`[architect-link] updateExternalSpecs error: ${e.message}`); return null; }
   return { updated, file_id: fileRow.id };
 }
+
+// Sandbox: close handles and drop caches for a wiped slot.
+(globalThis.__sandboxForgetHooks ||= []).push((slotDir) => {
+  const under = (p) => p === slotDir || p.startsWith(slotDir + '/');
+  for (const m of [_dbs, _wdbs]) for (const [p, h] of m) if (under(p)) { try { h.close(); } catch {} m.delete(p); }
+  for (const p of [..._rootsCaches.keys()]) if (under(p)) _rootsCaches.delete(p);
+  for (const k of [..._loadedProjectsThisSession]) if (under(k.split('#')[0])) _loadedProjectsThisSession.delete(k);
+});

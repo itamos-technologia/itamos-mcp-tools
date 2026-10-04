@@ -61,7 +61,12 @@ const SHARED_PARSERS = {
 const _activeScans = new Map();   // userId → { startedAt, startedAtMs, expectedMs }
 const STALE_LOCK_MS = 10 * 60 * 1000;
 
-function lockKey(userId) { return userId || 'default'; }
+function lockKey(userId) {
+  // Sandbox: every user is "default", so scope the lock to the caller's slot,
+  // or one user's scan would block everyone else's.
+  const slot = globalThis.__sandboxCtx?.getStore?.()?.slotDir;
+  return slot ? `${slot}|${userId || 'default'}` : (userId || 'default');
+}
 
 function tryAcquireScanLock(userId, expectedMs) {
   const key = lockKey(userId);
@@ -97,7 +102,9 @@ function releaseScanLock(userId) {
 export function listActiveScans(userId) {
   const out = [];
   for (const [uid, info] of _activeScans.entries()) {
-    if (userId && uid !== userId) continue;
+    if (userId && uid !== lockKey(userId)) continue;
+    const _slot = globalThis.__sandboxCtx?.getStore?.()?.slotDir;
+    if (_slot && !uid.startsWith(_slot + '|')) continue;
     out.push({
       user_id: uid,
       started_at: info.startedAt,
@@ -189,6 +196,21 @@ function walk(rootAbs) {
 
 import { detectExternalRefs } from './external_detect.js';
 
+// Project names are UNIQUE in the DB. Return `desired` if free (or already
+// owned by excludeId), otherwise the first free "desired-N".
+function uniqueProjectName(db, desired, excludeId = null) {
+  const taken = (n) => {
+    const row = db.prepare('SELECT id FROM projects WHERE name = ?').get(n);
+    return !!row && row.id !== excludeId;
+  };
+  if (!taken(desired)) return desired;
+  for (let i = 2; ; i++) {
+    const candidate = `${desired}-${i}`;
+    if (!taken(candidate)) return candidate;
+  }
+}
+
+
 export async function scanProject(rootPath, projectName, opts = {}) {
   const startMs = Date.now();
   const db = getDb();
@@ -198,6 +220,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
   if (!fs.existsSync(rootPath) || !fs.statSync(rootPath).isDirectory()) {
     throw new Error(`Not a directory: ${rootPath}`);
   }
+  const nameGiven = !!projectName;
   projectName = projectName || path.basename(rootPath);
 
   // Per-user scan lock
@@ -219,42 +242,54 @@ export async function scanProject(rootPath, projectName, opts = {}) {
     };
   }
 
-  // Project upsert + RECONCILE prior data (never wipe files)
-  const existing = db.prepare('SELECT id FROM projects WHERE root_path = ?').get(rootPath);
-  let projectId;
-  if (existing) {
-    projectId = existing.id;
-    db.prepare("UPDATE projects SET name = ?, updated_at = datetime('now') WHERE id = ?")
-      .run(projectName, projectId);
-    // RECONCILE, never wipe files. files rows are the stable identity that
-    // file_content / file_versions hang off (ON DELETE CASCADE) — deleting
-    // them would destroy the content store + version history.
-    //
-    // CRITICAL — DB-derived data (databases, db_connections, sql_queries,
-    // lmdb_subdb_refs) is NO LONGER wiped project-wide here. The skip-gate
-    // below leaves unchanged files un-reparsed, so a project-wide wipe would
-    // permanently delete the DB picture of every skipped file (it is only
-    // repopulated in the per-file parse path, which skips never reach). So:
-    //   - directories: safe to wipe (re-addressed fresh each scan, nothing
-    //     hangs off them).
-    //   - databases / db_connections / sql_queries / lmdb_subdb_refs: cleared
-    //     PER FILE inside the parse path (so a re-parsed file refreshes its own
-    //     rows and a skipped file keeps them), with an end-of-scan GC removing
-    //     databases that no longer have any connection. Mirrors how modules are
-    //     handled.
-    //   - files: mark ALL present_on_disk=0 now; the walk below flips back to
-    //     1 (via upsert) for every file found. Anything still 0 at the end
-    //     genuinely vanished from disk — kept, not deleted.
-    db.prepare('DELETE FROM directories WHERE project_id = ?').run(projectId);
-    db.prepare('UPDATE files SET present_on_disk = 0 WHERE project_id = ?').run(projectId);
-  } else {
-    const r = db.prepare('INSERT INTO projects (name, root_path) VALUES (?, ?)')
-      .run(projectName, rootPath);
-    projectId = r.lastInsertRowid;
+  // Project upsert + RECONCILE prior data (never wipe files).
+  // This runs BEFORE the try/finally below, so on any error release the
+  // scan lock here, otherwise it stays held until STALE_LOCK_MS.
+  let projectId, scanId, nameNote = null;
+  try {
+    const existing = db.prepare('SELECT id, name FROM projects WHERE root_path = ?').get(rootPath);
+    // Rescan with no explicit name: keep the project's current name.
+    if (existing && !nameGiven) projectName = existing.name;
+    const freeName = uniqueProjectName(db, projectName, existing ? existing.id : null);
+    if (freeName !== projectName) {
+      nameNote = `Another project already uses the name '${projectName}', so this one was registered as '${freeName}'.`;
+      projectName = freeName;
+    }
+    if (existing) {
+      projectId = existing.id;
+      db.prepare("UPDATE projects SET name = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(projectName, projectId);
+      // RECONCILE, never wipe files. files rows are the stable identity that
+      // file_content / file_versions hang off (ON DELETE CASCADE) — deleting
+      // them would destroy the content store + version history.
+      //
+      // CRITICAL — DB-derived data (databases, db_connections, sql_queries,
+      // lmdb_subdb_refs) is NO LONGER wiped project-wide here. The skip-gate
+      // below leaves unchanged files un-reparsed, so a project-wide wipe would
+      // permanently delete the DB picture of every skipped file (it is only
+      // repopulated in the per-file parse path, which skips never reach). So:
+      //   - directories: safe to wipe (re-addressed fresh each scan, nothing
+      //     hangs off them).
+      //   - databases / db_connections / sql_queries / lmdb_subdb_refs: cleared
+      //     PER FILE inside the parse path (so a re-parsed file refreshes its own
+      //     rows and a skipped file keeps them), with an end-of-scan GC removing
+      //     databases that no longer have any connection. Mirrors how modules are
+      //     handled.
+      //   - files: mark ALL present_on_disk=0 now; the walk below flips back to
+      //     1 (via upsert) for every file found. Anything still 0 at the end
+      //     genuinely vanished from disk — kept, not deleted.
+      db.prepare('DELETE FROM directories WHERE project_id = ?').run(projectId);
+      db.prepare('UPDATE files SET present_on_disk = 0 WHERE project_id = ?').run(projectId);
+    } else {
+      const r = db.prepare('INSERT INTO projects (name, root_path) VALUES (?, ?)')
+        .run(projectName, rootPath);
+      projectId = r.lastInsertRowid;
+    }
+    scanId = db.prepare('INSERT INTO scans (project_id) VALUES (?)').run(projectId).lastInsertRowid;
+  } catch (e) {
+    releaseScanLock(userId);
+    throw e;
   }
-
-  const scanRow = db.prepare('INSERT INTO scans (project_id) VALUES (?)').run(projectId);
-  const scanId = scanRow.lastInsertRowid;
 
   const summary = {
     files_total: 0, files_parsed: 0, files_pending_lang: 0,
@@ -355,6 +390,10 @@ export async function scanProject(rootPath, projectName, opts = {}) {
     // Record both the content hash and the parser version that produced this
     // parse, so the next scan's gate can compare against the current version.
     const setContentHash = db.prepare('UPDATE files SET content_hash = ?, parser_version = ? WHERE id = ?');
+    // Unchanged (skipped) files that still have unresolved imports: re-linked
+    // after the second pass, since a file added in this scan may satisfy them.
+    const hasUnresolved = db.prepare('SELECT 1 FROM imports WHERE file_id = ? AND resolved_file_id IS NULL LIMIT 1');
+    const relinkLater = [];
     const insertModule = db.prepare(
       'INSERT INTO modules (file_id, address, name, kind, line_start, line_end) VALUES (?, ?, ?, ?, ?, ?)'
     );
@@ -433,6 +472,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
           summary.files_unchanged += 1;
           summary.files_parsed += 1;  // count it as 'covered' for totals parity
           content = null;  // drop reference for GC
+          if (hasUnresolved.get(fileId)) relinkLater.push({ fileId, absPath: f.absPath, detection: f.detection });
           continue;        // keep existing modules/imports/db rows intact
         }
         // changed, never-hashed, or parser-version-stale → record the new hash
@@ -553,6 +593,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
               lmdb_subdbs: analysis.lmdb_subdbs || [],
               dynamic_loads: analysis.dynamic_loads || [],
               parserResolveImport: parser.resolveImport,
+              parserIsLocalModule: parser.isLocalModule,
               fromAbsFile: f.absPath,
             });
           }
@@ -662,18 +703,14 @@ export async function scanProject(rootPath, projectName, opts = {}) {
       }
       // Imports — resolve against project files.
       //
-      // is_external is determined by the IMPORT PATH'S SYNTAX, not by whether
-      // resolution succeeds:
-      //   - starts with '.' or '/' → local (could be project file or sibling)
-      //   - anything else → external package (npm, pip, stdlib)
-      //
-      // resolved_file_id is independent: it's set IF the import resolves to
-      // a file in this project. A local import that doesn't resolve has
-      // is_external=0 AND resolved_file_id=null — that's exactly what L3
-      // import-check looks for to flag broken imports.
+      // is_external = 0 when the import is local by syntax ('.' or '/'),
+      // resolves to a project file, or is rooted in a project package
+      // (parser.isLocalModule). Only the rest are external packages.
+      // resolved_file_id is set when the import resolves. is_external=0 with
+      // resolved_file_id=null is a BROKEN internal import: that's what the
+      // missing-import check and L3 verification look for.
       for (const imp of pr.imports) {
         const looksLocal = imp.import_path.startsWith('.') || imp.import_path.startsWith('/');
-        const isExternal = looksLocal ? 0 : 1;
         let resolvedId = null;
         if (pr.parserResolveImport) {
           const resolvedPath = pr.parserResolveImport(imp.import_path, pr.fromAbsFile, fs, path, rootPath);
@@ -689,6 +726,8 @@ export async function scanProject(rootPath, projectName, opts = {}) {
             }
           }
         }
+        const isExternal = (looksLocal || resolvedId ||
+          (pr.parserIsLocalModule && pr.parserIsLocalModule(imp.import_path, pr.fromAbsFile, fs, path, rootPath))) ? 0 : 1;
         insertImport.run(fileId, imp.import_path, resolvedId, isExternal, imp.line ?? null, 'import');
       }
 
@@ -774,6 +813,33 @@ export async function scanProject(rootPath, projectName, opts = {}) {
       }
     }
 
+    // ── Re-link unchanged files ──
+    // Files skipped as unchanged keep their import rows, but a file added or
+    // renamed in THIS scan can now satisfy an import that was unresolved
+    // before. Re-resolve those (same rules as the second pass) so the graph
+    // doesn't depend on which files happened to change.
+    if (relinkLater.length) {
+      const getUnresolved = db.prepare('SELECT id, import_path FROM imports WHERE file_id = ? AND resolved_file_id IS NULL');
+      const setResolution = db.prepare('UPDATE imports SET resolved_file_id = ?, is_external = ? WHERE id = ?');
+      for (const r of relinkLater) {
+        let parser;
+        try { parser = await getParser(r.detection.language, r.detection.parserFile); } catch { continue; }
+        if (!parser || !parser.resolveImport) continue;
+        for (const imp of getUnresolved.all(r.fileId)) {
+          const looksLocal = imp.import_path.startsWith('.') || imp.import_path.startsWith('/');
+          let resolvedId = null;
+          try {
+            const resolvedPath = parser.resolveImport(imp.import_path, r.absPath, fs, path, rootPath);
+            if (resolvedPath) resolvedId = fileIdByAbsPath.get(resolvedPath) || globalFileByAbsPath.get(resolvedPath)?.id || null;
+          } catch {}
+          const isExternal = (looksLocal || resolvedId ||
+            (parser.isLocalModule && parser.isLocalModule(imp.import_path, r.absPath, fs, path, rootPath))) ? 0 : 1;
+          setResolution.run(resolvedId, isExternal, imp.id);
+        }
+      }
+      summary.files_relinked = relinkLater.length;
+    }
+
     // ── GC: remove databases that no longer have any connection ──
     // Because we stopped wiping databases project-wide, a database whose last
     // referencing file was deleted (or stopped opening it) would otherwise
@@ -807,6 +873,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
       ok: true,
       project_id: projectId,
       project_name: projectName,
+      ...(nameNote ? { name_note: nameNote } : {}),
       root_path: rootPath,
       duration_ms: durationMs,
       ...summary,

@@ -162,6 +162,11 @@ export async function check(absPath, db) {
 
 // Spawn the Python probe to list named sub-DBs in an LMDB env
 async function probeLmdbEnv(envPath) {
+  // Sandbox: only probe LMDB envs inside the caller's slot; treat anything else
+  // as nonexistent so user code can't read or probe host paths.
+  if ((globalThis.__sandboxCtx && !(globalThis.__sandboxCtx.getStore()?.slotDir && path.resolve(envPath).startsWith(globalThis.__sandboxCtx.getStore().slotDir + '/')))) {
+    return { ok: true, exists: false, env_path: envPath };
+  }
   if (!existsSync(envPath)) {
     return { ok: true, exists: false, env_path: envPath };
   }

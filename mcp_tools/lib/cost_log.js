@@ -3,6 +3,8 @@
 // wiped: "today" is a display filter (day = current date), all-time total is the
 // SUM across all rows. One row per (day, tool), upserted per call.
 import Database from 'better-sqlite3';
+import { mkdirSync } from 'fs';
+import path from 'path';
 
 const COSTS_DB = process.env.ITAMOS_COSTS_DB || '/tank/db/itamos_costs.db';
 let _db = null;
@@ -10,6 +12,7 @@ let _stmt = null;
 
 function db() {
   if (!_db) {
+    try { mkdirSync(path.dirname(COSTS_DB), { recursive: true }); } catch {}
     _db = new Database(COSTS_DB);
     _db.pragma('journal_mode = WAL');
     _db.exec(`CREATE TABLE IF NOT EXISTS daily_costs (

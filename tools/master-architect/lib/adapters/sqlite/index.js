@@ -80,7 +80,9 @@ export async function check(absPath, db) {
       }
       continue;
     }
-    if (!existsSync(group.db_path)) {
+    // Sandbox: a database outside the caller's slot is treated as nonexistent,
+    // so user code can neither read nor probe host files.
+    if ((globalThis.__sandboxCtx && !(globalThis.__sandboxCtx.getStore()?.slotDir && path.resolve(group.db_path).startsWith(globalThis.__sandboxCtx.getStore().slotDir + '/'))) || !existsSync(group.db_path)) {
       for (const q of group.queries) {
         checked += 1;
         failures.push({

@@ -291,39 +291,44 @@ const SCHEMA = `
 //          v12 = nginx listen IPv6 fix: `listen [::]:443` now parses to
 //                port=443 (bracket-host regex) instead of port=null; `*:port`
 //                normalized to 0.0.0.0.
-export const PARSER_VERSION = '12';
+export const PARSER_VERSION = '13';  // 13: import classification + re-link pass
 
 
-let _conn = null;
+const _conns = new Map();   // db path -> open connection (one per slot DB in the sandbox)
 let _path = null;
 
 export function getDb(dbPath) {
-  // In sandbox mode each request has its own DB — never cache across slots
-  const requestedPath = dbPath || process.env.MASTER_ARCHITECT_DB;
-  if (_conn && _path === requestedPath) return _conn;
-  if (_conn && _path !== requestedPath) { try { _conn.close(); } catch {} _conn = null; }
-  _path = requestedPath
+  const store = globalThis.__sandboxCtx?.getStore?.();
+  if (!dbPath && globalThis.__sandboxCtx && !store?.architectDb) {
+    // Sandbox: never fall back to a shared default index outside a request.
+    throw new Error('sandbox: no request context; refusing to open a shared architect DB');
+  }
+  const requestedPath = dbPath || store?.architectDb || process.env.MASTER_ARCHITECT_DB
     || path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'master-architect.db');
-  try { mkdirSync(path.dirname(_path), { recursive: true }); } catch {}
-  _conn = new Database(_path);
-  _conn.pragma('journal_mode = WAL');
-  _conn.pragma('foreign_keys = ON');
-  _conn.exec(SCHEMA);
+  _path = requestedPath;
+  const cached = _conns.get(requestedPath);
+  if (cached && cached.open) return cached;
+  try { mkdirSync(path.dirname(requestedPath), { recursive: true }); } catch {}
+  const conn = new Database(requestedPath);
+  conn.pragma('journal_mode = WAL');
+  conn.pragma('foreign_keys = ON');
+  conn.exec(SCHEMA);
   // Idempotent column adds for DBs created before a column existed. SQLite has
   // no ADD COLUMN IF NOT EXISTS, so guard each via PRAGMA table_info. CREATE
   // TABLE IF NOT EXISTS in SCHEMA never alters an existing table, so this is the
   // only path by which a pre-existing DB gains new columns.
-  ensureColumn(_conn, 'files', 'parser_version', 'TEXT');
+  ensureColumn(conn, 'files', 'parser_version', 'TEXT');
   // edge_kind distinguishes a normal static import ('import') from a synthetic
   // plugin-load edge ('load') emitted when a file dynamically loads every JS in
   // a directory (readdirSync + dynamic import). Lets the graph show modular
   // servers connected to the tools they load by directory convention.
-  ensureColumn(_conn, 'imports', 'edge_kind', "TEXT DEFAULT 'import'");
+  ensureColumn(conn, 'imports', 'edge_kind', "TEXT DEFAULT 'import'");
   // Used by scan / read_file / architect-link. Previously only present in hand-upgraded DBs,
   // so a fresh install failed on its first scan. Additive and idempotent.
-  ensureColumn(_conn, 'files', 'present_on_disk', 'INTEGER NOT NULL DEFAULT 1');
-  _conn.exec(CONTENT_STORE_SCHEMA);
-  return _conn;
+  ensureColumn(conn, 'files', 'present_on_disk', 'INTEGER NOT NULL DEFAULT 1');
+  conn.exec(CONTENT_STORE_SCHEMA);
+  _conns.set(requestedPath, conn);
+  return conn;
 }
 
 // Add `col <type>` to `table` if not already present. No-op when the column
@@ -387,8 +392,16 @@ function ensureColumn(conn, table, col, type) {
 }
 
 export function closeDb() {
-  if (_conn) { _conn.close(); _conn = null; _path = null; }
+  for (const c of _conns.values()) { try { c.close(); } catch {} }
+  _conns.clear(); _path = null;
 }
+
+// Sandbox: close and forget every connection under a wiped slot directory.
+(globalThis.__sandboxForgetHooks ||= []).push((slotDir) => {
+  for (const [p, c] of _conns) {
+    if (p === slotDir || p.startsWith(slotDir + '/')) { try { c.close(); } catch {} _conns.delete(p); }
+  }
+});
 
 export function dbPath() { return _path; }
 

@@ -97,6 +97,7 @@ export async function check(absPath, db) {
     const client = new pg.Client(clientCfg);
     let connected = false;
     try {
+      if (globalThis.__sandboxCtx) throw new Error('network database checks are disabled in the sandbox');
       await client.connect();
       connected = true;
     } catch (err) {

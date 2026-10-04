@@ -195,10 +195,9 @@ export async function associateFile(filePath, projectId) {
             ).run(mr.lastInsertRowid, `${modAddr}.${mIdx + 1}`, m.name, m.kind, m.line_start, m.line_end);
           });
         });
-        // Imports — is_external by path syntax, resolved_file_id independent
+        // Imports — internal if local by syntax, resolved, or rooted in a project package
         for (const imp of analysis.imports) {
           const looksLocal = imp.import_path.startsWith('.') || imp.import_path.startsWith('/');
-          const isExternal = looksLocal ? 0 : 1;
           let resolvedId = null;
           if (parser.resolveImport) {
             const resolved = parser.resolveImport(imp.import_path, absPath, fs, path, project.root_path);
@@ -209,6 +208,8 @@ export async function associateFile(filePath, projectId) {
               if (f) { resolvedId = f.id; }
             }
           }
+          const isExternal = (looksLocal || resolvedId ||
+            (parser.isLocalModule && parser.isLocalModule(imp.import_path, absPath, fs, path, project.root_path))) ? 0 : 1;
           db.prepare(
             'INSERT INTO imports (file_id, import_path, resolved_file_id, is_external, line) VALUES (?, ?, ?, ?, ?)'
           ).run(fileId, imp.import_path, resolvedId, isExternal, imp.line ?? null);
@@ -400,6 +401,13 @@ export async function registerDiscoveredProject(seedPath, projectName, opts = {}
     'SELECT id, root_path FROM projects WHERE name = ?'
   ).get(projectName);
   if (existingByName) {
+    const seedAbs0 = path.resolve(seedPath);
+    if (seedAbs0 === existingByName.root_path || seedAbs0.startsWith(existingByName.root_path + path.sep)) {
+      // Same name and the seed already lives in that project: registering
+      // again is a no-op, not an error.
+      return { ok: true, already_registered: true, project_id: existingByName.id,
+               project_name: projectName, root_path: existingByName.root_path };
+    }
     return {
       ok: false,
       error: `project named '${projectName}' already exists at ${existingByName.root_path}`,
@@ -968,8 +976,27 @@ export function getBones(projectId, address, absPath) {
     fileRow = db.prepare(
       'SELECT id, address, name, rel_path, language, line_count FROM files WHERE abs_path = ?'
     ).get(absPath);
+    if (!fileRow && projectId) {
+      // A relative path gets resolved against the caller's working directory
+      // before it reaches us, but models usually mean "relative to the
+      // project root" (e.g. 'pkg/b.py'). Fall back to matching the project's
+      // rel_paths as a suffix of the given path; the longest match wins.
+      const norm = String(absPath).replace(/\\/g, '/');
+      const hits = db.prepare(
+        'SELECT id, address, name, rel_path, language, line_count FROM files WHERE project_id = ?'
+      ).all(projectId).filter(r => norm === r.rel_path || norm.endsWith('/' + r.rel_path));
+      if (hits.length) {
+        hits.sort((a, b) => b.rel_path.length - a.rel_path.length);
+        if (hits.length > 1 && hits[0].rel_path.length === hits[1].rel_path.length) {
+          return { ok: false, error: `ambiguous path ${absPath}: matches ${hits.map(h => h.rel_path).join(', ')}. Pass the file address from topology instead.` };
+        }
+        fileRow = hits[0];
+      }
+    }
   }
-  if (!fileRow) return { ok: false, error: `no file found at ${address || absPath}` };
+  if (!fileRow) {
+    return { ok: false, error: `no file found at ${address || absPath}. Pass a file address from topology, an absolute path, or a path relative to the project root.` };
+  }
 
   // imports — internal + external, deduplicated by path
   const imports = db.prepare(`

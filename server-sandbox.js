@@ -21,6 +21,15 @@ import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+// Per-request sandbox context. Every per-user resource in the tools (architect
+// DB, edit history, edit/read buffers, scan lock, caches) is selected from this
+// store, so concurrent users in different slots can never touch each other's.
+globalThis.__sandboxCtx = new AsyncLocalStorage();
+// Tools register cleanup hooks here; wipeSlot() runs them so a reused slot never
+// inherits open DB handles, buffers or read marks from its previous user.
+globalThis.__sandboxForgetHooks = globalThis.__sandboxForgetHooks || [];
 
 const execFileAsync = promisify(execFile);
 const __filename    = fileURLToPath(import.meta.url);
@@ -76,6 +85,7 @@ function touchSession(ip) {
 
 async function wipeSlot(n) {
   const p = slotPath(n);
+  for (const forget of globalThis.__sandboxForgetHooks) { try { forget(p); } catch {} }
   try {
     const entries = fs.readdirSync(p);
     for (const e of entries) {
@@ -129,15 +139,17 @@ async function loadTools(server, sandboxDir, ip) {
         tool.schema || {},
         async (args) => {
           touchSession(ip);
-          // Point master_architect to this slot's isolated DB
-          process.env.MASTER_ARCHITECT_DB = path.join(sandboxDir, '.architect.db');
           // Resolve relative paths to absolute sandbox paths for original tools
           const resolvedArgs = { ...args };
           if (resolvedArgs.path !== undefined) {
             resolvedArgs.path = jailPath(sandboxDir, resolvedArgs.path);
           }
           const ctx = { sandboxDir, jailPath: (p) => jailPath(sandboxDir, p), execFileAsync };
-          return tool.handler(resolvedArgs, ctx);
+          return globalThis.__sandboxCtx.run({
+            slotDir: sandboxDir,
+            architectDb: path.join(sandboxDir, '.architect.db'),
+            stateDir: path.join(sandboxDir, '.read_file_state'),
+          }, () => tool.handler(resolvedArgs, ctx));
         },
       );
     } catch (e) {
@@ -160,8 +172,19 @@ app.use((req, res, next) => {
   next();
 });
 
+// Sessions are keyed by client IP, so the IP must not be spoofable. Only trust
+// X-Forwarded-For when the request comes from our own reverse proxy on this
+// host (loopback), and then take the LAST entry, the one the proxy appended.
+// Port 4200 is firewalled, so outside clients can only arrive via the proxy.
 function clientIp(req) {
-  return (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+  const peer = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  const fromProxy = peer === '127.0.0.1' || peer === '::1';
+  const xff = req.headers['x-forwarded-for'];
+  if (fromProxy && xff) {
+    const parts = String(xff).split(',').map(s => s.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return peer;
 }
 
 // ── Session create ──────────────────────────────────────────────────────────

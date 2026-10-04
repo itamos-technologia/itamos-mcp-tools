@@ -81,7 +81,9 @@ import { fileURLToPath as _fileURLToPath } from 'url';
 const _READ_FILE_DIR = path.dirname(_fileURLToPath(import.meta.url));
 const _DEFAULT_ARCHITECT_DB = path.join(_READ_FILE_DIR, 'master-architect.db');
 function _openArchitectDbReadOnly() {
-  const dbPath = process.env.MASTER_ARCHITECT_DB || _DEFAULT_ARCHITECT_DB;
+  const store = globalThis.__sandboxCtx?.getStore?.();
+  if (globalThis.__sandboxCtx && !store?.architectDb) throw new Error('sandbox: no request context; refusing to open a shared architect DB');
+  const dbPath = store?.architectDb || process.env.MASTER_ARCHITECT_DB || _DEFAULT_ARCHITECT_DB;
   return new Database(dbPath, { readonly: true, fileMustExist: false });
 }
 
@@ -242,12 +244,16 @@ const STRUCTURAL_OPS = new Set(['delete', 'insert', 'move']);
 //   2. Auditability for debugging
 //   3. Future-proofs for multi-process scenarios
 
-let _db = null;
+const _editDbs = new Map();   // state dir -> edit-history db (one per slot in the sandbox)
 
 function getDb() {
-  if (_db) return _db;
-  try { mkdirSync(DB_DIR, { recursive: true }); } catch {}
-  _db = new Database(DB_PATH);
+  const store = globalThis.__sandboxCtx?.getStore?.();
+  if (globalThis.__sandboxCtx && !store?.stateDir) throw new Error('sandbox: no request context; refusing to open a shared edit history');
+  const dir = store?.stateDir || DB_DIR;
+  const cached = _editDbs.get(dir);
+  if (cached && cached.open) return cached;
+  try { mkdirSync(dir, { recursive: true }); } catch {}
+  const _db = new Database(path.join(dir, 'edits.db'));
   _db.pragma('journal_mode = WAL');
   _db.exec(`
     CREATE TABLE IF NOT EXISTS edits (
@@ -261,6 +267,7 @@ function getDb() {
     CREATE INDEX IF NOT EXISTS idx_edits_path ON edits(file_path, id);
     CREATE INDEX IF NOT EXISTS idx_edits_path_segid ON edits(file_path, seg_id, id);
   `);
+  _editDbs.set(dir, _db);
   return _db;
 }
 
@@ -616,6 +623,7 @@ class Buffer {
         prevPosition: entry.prevPosition,
         neighborBeforeId: entry.neighborBeforeId,
         neighborAfterId: entry.neighborAfterId,
+        prevOrder: entry.prevOrder,
       };
     } else {
       payload = entry;
@@ -623,6 +631,33 @@ class Buffer {
     const rowId = dbAppendEdit(this.path, entry.kind, entry.segId, payload);
     stackEntry.rowId = rowId;
   }
+}
+
+// Move `seg` to insertion index `destIdx` (as computed by opMove against the
+// CURRENT array) while keeping whitespace gaps fixed in place: only the code
+// elements are reordered between the existing gap slots. Segments don't carry
+// their trailing newline (it lives in the following gap), so a plain splice
+// glued the moved element onto its new neighbour ("return 3def first():").
+function reorderBetweenGaps(list, seg, destIdx) {
+  const isGap = (s) => s.kind === 'whitespace' || s.kind === 'gap';
+  const elems = list.filter(s => !isGap(s));
+  const fromE = elems.indexOf(seg);
+  let destE = list.slice(0, destIdx).filter(s => !isGap(s)).length;
+  elems.splice(fromE, 1);
+  if (destE > fromE) destE -= 1;
+  elems.splice(destE, 0, seg);
+  let k = 0;
+  return list.map(s => (isGap(s) ? s : elems[k++]));
+}
+
+// Restore an array's order from a list of ids. Returns false if the set of
+// ids no longer matches, so the caller falls back to position-based restore.
+function restoreOrder(list, ids) {
+  if (ids.length !== list.length) return false;
+  const byId = new Map(list.map(s => [s.id, s]));
+  if (!ids.every(id => byId.has(id))) return false;
+  list.splice(0, list.length, ...ids.map(id => byId.get(id)));
+  return true;
 }
 
 function allSegmentsFlat(segs) {
@@ -666,11 +701,18 @@ function findParentOf(segments, targetSeg) {
 
 // v4 GLOBAL TWO-BUFFER MODEL.
 // Exactly two slots, ever. No Map of per-path buffers (that was how stale
-// content accumulated). readBuffer = opt-in, always-fresh, readonly reference /
-// clipboard. editBuffer = the single writable working buffer; to edit another
+// content accumulated). _pair().read = opt-in, always-fresh, readonly reference /
+// clipboard. _pair().edit = the single writable working buffer; to edit another
 // target it must commit/discard first.
-let readBuffer = null;
-let editBuffer = null;
+// One read/edit buffer pair per sandbox slot (keyed by the request context's
+// slot dir); outside the sandbox there is a single pair, exactly as before.
+const _bufferPairs = new Map();
+function _pair() {
+  const key = globalThis.__sandboxCtx?.getStore?.()?.slotDir || '';
+  let p = _bufferPairs.get(key);
+  if (!p) { p = { read: null, edit: null }; _bufferPairs.set(key, p); }
+  return p;
+}
 
 async function loadFresh(filePath, readonly) {
   const lang = detectLanguage(filePath);
@@ -688,37 +730,37 @@ async function loadFresh(filePath, readonly) {
 // READ buffer: opt-in, always disk-fresh, readonly. Each read replaces the
 // prior read view — there is never a second read buffer to go stale.
 async function getReadBuffer(filePath) {
-  readBuffer = await loadFresh(filePath, true);
-  return readBuffer;
+  _pair().read = await loadFresh(filePath, true);
+  return _pair().read;
 }
 
 // EDIT buffer: the single writable working buffer. Disk-truth on open. If an
 // edit is in flight on a DIFFERENT file, block until it commits/discards. Same
 // file already open for edit -> return it (keep in-flight edits).
 async function getEditBuffer(filePath) {
-  if (editBuffer && editBuffer.path === filePath) return editBuffer;
-  if (editBuffer && editBuffer.isDirty()) {
+  if (_pair().edit && _pair().edit.path === filePath) return _pair().edit;
+  if (_pair().edit && _pair().edit.isDirty()) {
     throw new Error(
-      `Single-active-edit: '${editBuffer.path}' has uncommitted edits. Commit or discard it before editing '${filePath}'. ` +
+      `Single-active-edit: '${_pair().edit.path}' has uncommitted edits. Commit or discard it before editing '${filePath}'. ` +
       `(verify>=2 + commit to save, or discard:true to abandon.)`
     );
   }
   // previous edit buffer (if any) was clean — drop it
-  if (editBuffer) { dbWipePath(editBuffer.path); }
-  editBuffer = await loadFresh(filePath, false);
-  return editBuffer;
+  if (_pair().edit) { dbWipePath(_pair().edit.path); }
+  _pair().edit = await loadFresh(filePath, false);
+  return _pair().edit;
 }
 
 // Compat shim: code paths that used to look up "the buffer for this path" now
 // resolve against the two slots. Returns the edit buffer if it matches, else
 // the read buffer if it matches, else null.
 function bufferForPath(filePath) {
-  if (editBuffer && editBuffer.path === filePath) return editBuffer;
-  if (readBuffer && readBuffer.path === filePath) return readBuffer;
+  if (_pair().edit && _pair().edit.path === filePath) return _pair().edit;
+  if (_pair().read && _pair().read.path === filePath) return _pair().read;
   return null;
 }
 function clearEditBuffer() {
-  if (editBuffer) { dbWipePath(editBuffer.path); editBuffer = null; }
+  if (_pair().edit) { dbWipePath(_pair().edit.path); _pair().edit = null; }
 }
 
 // =============================================================================
@@ -1654,15 +1696,16 @@ function opMove(buffer, segAddress, anchor) {
     // along with an element. We do NOT auto-rebuild or synthesize separators
     // here (that corrupted prefix/suffix); whitespace is whatever the visible
     // gap children say it is. Parent prefix/suffix text is never touched.
-    parent.children.splice(fromChildIdx, 1);
-    const adjusted = destChildIdx > fromChildIdx ? destChildIdx - 1 : destChildIdx;
-    parent.children.splice(adjusted, 0, seg);
+    const prevChildOrder = parent.children.map(c => c.id);
+    parent.children.splice(0, parent.children.length, ...reorderBetweenGaps(parent.children, seg, destChildIdx));
+    const adjusted = parent.children.indexOf(seg);
 
     buffer.pushUndoEntry({
       kind: 'nested_move',
       segId: seg.id,
       parentId: parent.id,
       prevChildIndex: fromChildIdx,
+      prevChildOrder,
     });
     buffer.invalidateVerify('move');
 
@@ -1715,9 +1758,9 @@ function opMove(buffer, segAddress, anchor) {
     return { changed: false, message: 'segment already at requested position' };
   }
 
-  buffer.segments.splice(fromIdx, 1);
-  const adjustedDest = destIdx > fromIdx ? destIdx - 1 : destIdx;
-  buffer.segments.splice(adjustedDest, 0, seg);
+  const prevOrder = buffer.segments.map(s => s.id);
+  buffer.segments.splice(0, buffer.segments.length, ...reorderBetweenGaps(buffer.segments, seg, destIdx));
+  const adjustedDest = buffer.segments.indexOf(seg);
 
   buffer.pushUndoEntry({
     kind: 'move',
@@ -1725,6 +1768,7 @@ function opMove(buffer, segAddress, anchor) {
     prevPosition: fromIdx,
     neighborBeforeId: oldBeforeId,
     neighborAfterId:  oldAfterId,
+    prevOrder,
   });
   buffer.invalidateVerify('move');
 
@@ -1806,6 +1850,7 @@ function applyInverse(buffer, entry) {
     return;
   }
   if (entry.kind === 'move') {
+    if (Array.isArray(entry.prevOrder) && restoreOrder(buffer.segments, entry.prevOrder)) return;
     // Find the seg by id, splice out from its current position, splice it in
     // such that its old neighbors are restored. If the old neighbors are gone
     // (deleted in a later op) this should never happen because LIFO is enforced.
@@ -1855,6 +1900,7 @@ function applyInverse(buffer, entry) {
     // index restore fully reverts. Parent prefix/suffix are never touched.
     const parent = allSegmentsFlat(buffer.segments).find(s => s.id === entry.parentId);
     if (!parent || !parent.children) throw new Error(`undo nested_move: parent ${entry.parentId} not found`);
+    if (Array.isArray(entry.prevChildOrder) && restoreOrder(parent.children, entry.prevChildOrder)) return;
     const curIdx = parent.children.findIndex(c => c.id === entry.segId);
     if (curIdx < 0) throw new Error(`undo nested_move: seg ${entry.segId} not in parent`);
     const [seg] = parent.children.splice(curIdx, 1);
@@ -2024,7 +2070,9 @@ async function opCommit(buffer) {
     if (!l2.ok) {
       return {
         blocked: true, reason: 'verify_level_2_not_reached',
-        message: 'Validation level 2 not reached. Fix the errors and try again.',
+        message: (l2.messages || []).some(m => /^L1\b/.test(m) && !/OK$/.test(m))
+          ? 'Commit blocked: the file does not parse (level 1 failed). Fix the errors and try again.'
+          : 'Commit blocked: validation level 2 not reached. Fix the errors and try again.',
         errors: l2.messages || [],
       };
     }
@@ -2133,13 +2181,13 @@ function opDiscard(buffer) {
   const had = !!buffer;
   if (buffer) dbWipePath(buffer.path);
   // drop whichever slot this buffer occupies
-  if (editBuffer && buffer && editBuffer.path === buffer.path) editBuffer = null;
-  if (readBuffer && buffer && readBuffer.path === buffer.path) readBuffer = null;
+  if (_pair().edit && buffer && _pair().edit.path === buffer.path) _pair().edit = null;
+  if (_pair().read && buffer && _pair().read.path === buffer.path) _pair().read = null;
   return { discarded: had, path: buffer ? buffer.path : null };
 }
 
 function opStatus() {
-  const slots = [readBuffer, editBuffer].filter(Boolean);
+  const slots = [_pair().read, _pair().edit].filter(Boolean);
   const summary = slots.map(b => ({
     path: b.path,
     language: b.language,
@@ -2402,7 +2450,7 @@ export default {
       // re-inference. Requires the read buffer loaded (the source) and names
       // the destination segment in the edit buffer.
       if (args.paste !== undefined) {
-        if (!readBuffer) return wrap({ error: 'paste needs a read buffer — open the source file with read=true first' });
+        if (!_pair().read) return wrap({ error: 'paste needs a read buffer — open the source file with read=true first' });
         const eb = await getEditBuffer(args.path);
         const guarded = txGuard(eb);
         if (guarded) return wrap(guarded);
@@ -2413,12 +2461,12 @@ export default {
         if (rbw) return wrap(rbw);
         let srcText;
         if (srcAddr === undefined || srcAddr === 'all') {
-          srcText = readBuffer.assembleText();
+          srcText = _pair().read.assembleText();
         } else {
-          const ss = readBuffer.findSegment(srcAddr);
+          const ss = _pair().read.findSegment(srcAddr);
           if (!ss) return wrap({ error: `paste source segment not found in read buffer: ${srcAddr}` });
-          srcText = readBuffer.segmentText.get(ss.id);
-          if (srcText === undefined) srcText = readBuffer.originalText.get(ss.id);
+          srcText = _pair().read.segmentText.get(ss.id);
+          if (srcText === undefined) srcText = _pair().read.originalText.get(ss.id);
         }
         clearReadMarks(args.path);
         return wrap(opReplace(eb, dstAddr, srcText));
@@ -2516,3 +2564,11 @@ async function wrapMutate(opResult, _buffer) {
   return wrap(opResult);
 }
 
+
+// Sandbox: forget a wiped slot's buffers, read marks and edit history handle.
+(globalThis.__sandboxForgetHooks ||= []).push((slotDir) => {
+  const under = (p) => p === slotDir || p.startsWith(slotDir + '/');
+  _bufferPairs.delete(slotDir);
+  for (const k of [..._readMarks.keys()]) if (under(k)) _readMarks.delete(k);
+  for (const [d, h] of _editDbs) if (under(d)) { try { h.close(); } catch {} _editDbs.delete(d); }
+});
