@@ -291,7 +291,7 @@ const SCHEMA = `
 //          v12 = nginx listen IPv6 fix: `listen [::]:443` now parses to
 //                port=443 (bracket-host regex) instead of port=null; `*:port`
 //                normalized to 0.0.0.0.
-export const PARSER_VERSION = '13';  // 13: import classification + re-link pass
+export const PARSER_VERSION = '14';  // 14: DuckDB connections recognised (JS + Python); 13: import classification + re-link pass
 
 
 const _conns = new Map();   // db path -> open connection (one per slot DB in the sandbox)

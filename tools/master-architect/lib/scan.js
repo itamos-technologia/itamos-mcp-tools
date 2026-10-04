@@ -681,7 +681,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
       // Databases first. Build, per file, the maps needed to attribute each SQL
       // query to the SPECIFIC handle it runs against:
       //   handleVarToDbId : handle variable name  → database id  (exact match key)
-      //   sqlDbIds        : every SQL-shaped db id for this file (sqlite/postgres/mysql)
+      //   sqlDbIds        : every SQL-shaped db id for this file (sqlite/postgres/mysql/duckdb)
       // These replace the old "first SQL db wins" (LIMIT 1) attribution, which
       // mis-linked every query in any file that opens more than one DB handle.
       const handleVarToDbId = new Map();
@@ -699,7 +699,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
         // handle_var comes off the parsed decl (added by walkDatabases). It is
         // the variable the connection was bound to, e.g. `dbPath` / `DB_PATH`.
         if (dbDecl.handle_var) handleVarToDbId.set(dbDecl.handle_var, dbId);
-        if (['sqlite', 'postgres', 'mysql'].includes(dbDecl.type)) sqlDbIds.push(dbId);
+        if (['sqlite', 'postgres', 'mysql', 'duckdb'].includes(dbDecl.type)) sqlDbIds.push(dbId);
       }
       // Imports — resolve against project files.
       //

@@ -421,12 +421,17 @@ function walkDatabases(rootNode, analysis) {
       // handle_var (the variable the connection is bound to) is recorded on every
       // SQLite DB so the scan can attribute each SQL query to the RIGHT handle
       // instead of "first DB wins".
-      if (/(?:^|\.)Database$/.test(ctorName) && firstArg) {
+      // `new duckdb.Database(...)` also ends in `.Database`: tell it apart by the
+      // `duckdb` prefix so DuckDB files aren't handed to the SQLite adapter.
+      // An in-memory DuckDB (':memory:') has nothing on disk to verify.
+      const dbType = /(?:^|\.)duckdb\.Database$/.test(ctorName) ? 'duckdb' : 'sqlite';
+      const inMemoryDuck = dbType === 'duckdb' && firstArg?.type === 'string' && firstArg.text.slice(1, -1) === ':memory:';
+      if (/(?:^|\.)Database$/.test(ctorName) && firstArg && !inMemoryDuck) {
         if (firstArg.type === 'string') {
           const dbPath = firstArg.text.slice(1, -1);
           analysis.databases.push({
             name: dbPath.split('/').pop() || dbPath,
-            type: 'sqlite',
+            type: dbType,
             path_or_uri: dbPath,
             handle_var: handleVar,
             extra: JSON.stringify({ handle_var: handleVar, readonly }),
@@ -438,7 +443,7 @@ function walkDatabases(rootNode, analysis) {
           const expr = (firstArg.text || '').slice(0, 120);
           analysis.databases.push({
             name: expr || '<dynamic>',
-            type: 'sqlite',
+            type: dbType,
             path_or_uri: `dynamic:${expr}`,
             handle_var: handleVar,
             extra: JSON.stringify({ path_source: expr, path_resolved: false, arg_kind: firstArg.type, handle_var: handleVar, readonly }),

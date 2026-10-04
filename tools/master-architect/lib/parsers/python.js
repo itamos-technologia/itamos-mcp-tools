@@ -197,6 +197,32 @@ function walkDatabases(rootNode, analysis) {
         });
       }
 
+      // DuckDB — duckdb.connect('path') / duckdb.connect(database='path').
+      // duckdb.connect() with no path, or ':memory:', is an in-memory database:
+      // nothing on disk to verify against, so it isn't recorded.
+      if (/(?:^|\.)duckdb\.connect$/.test(fnText)) {
+        let pathNode = firstArg?.type === 'string' ? firstArg : null;
+        for (const a of (pathNode ? [] : argsNode?.namedChildren || [])) {
+          if (a.type === 'keyword_argument' && a.childForFieldName?.('name')?.text === 'database') {
+            const v = a.childForFieldName?.('value');
+            if (v?.type === 'string') pathNode = v;
+          }
+        }
+        if (pathNode) {
+          const raw = pathNode.text;
+          const dbPath = raw.slice(raw.startsWith('"""') || raw.startsWith("'''") ? 3 : 1,
+                                   raw.endsWith('"""')   || raw.endsWith("'''")   ? -3 : -1);
+          if (dbPath && dbPath !== ':memory:') {
+            analysis.databases.push({
+              name: dbPath.split('/').filter(Boolean).pop() || dbPath,
+              type: 'duckdb',
+              path_or_uri: dbPath,
+              line: nodeLine(node),
+            });
+          }
+        }
+      }
+
       // MySQL/MariaDB connection patterns. All are kwarg-based factory
       // calls. We extract literal-value kwargs (host, port, user, password,
       // database) from the argument list for the L3 adapter to use.
@@ -274,6 +300,7 @@ function extractPyKwargConfig(argsNode) {
 
 const PY_SQL_METHOD_NAMES = new Set([
   'execute', 'executemany', 'executescript',
+  'sql',   // DuckDB: con.sql("...") / duckdb.sql("...")
 ]);
 
 function walkSqlQueries(rootNode, analysis) {
