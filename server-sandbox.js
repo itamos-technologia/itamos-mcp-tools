@@ -176,6 +176,19 @@ app.use((req, res, next) => {
 // X-Forwarded-For when the request comes from our own reverse proxy on this
 // host (loopback), and then take the LAST entry, the one the proxy appended.
 // Port 4200 is firewalled, so outside clients can only arrive via the proxy.
+// The MCP URL to hand back to clients. Behind our reverse proxy that is the
+// public origin with the proxy's scheme and no port (:PORT is firewalled from
+// outside); direct local access keeps the http://host:PORT form.
+// PUBLIC_MCP_URL overrides both.
+function publicMcpUrl(req) {
+  if (process.env.PUBLIC_MCP_URL) return process.env.PUBLIC_MCP_URL;
+  const peer = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  const fromProxy = peer === '127.0.0.1' || peer === '::1';
+  const proto = req.headers['x-forwarded-proto'];
+  if (fromProxy && proto) return `${proto === 'https' ? 'https' : 'http'}://${req.hostname}/mcp`;
+  return `http://${req.hostname}:${PORT}/mcp`;
+}
+
 function clientIp(req) {
   const peer = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
   const fromProxy = peer === '127.0.0.1' || peer === '::1';
@@ -200,7 +213,7 @@ app.get('/session/create', (req, res) => {
     ok: true,
     ip,
     sandbox: sandboxDir,
-    mcp_url: `http://${req.hostname}:${PORT}/mcp`,
+    mcp_url: publicMcpUrl(req),
     slots: { used, free, total: TOTAL_SLOTS },
     expires: '5 minutes of inactivity',
   });

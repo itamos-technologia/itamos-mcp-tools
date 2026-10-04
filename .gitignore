@@ -21,3 +21,7 @@ make_cv*.js
 *.bak
 # sandbox runtime data (cost stats etc.)
 data/
+*.bak.*
+# node_modules symlinks to the shared install (git sees symlinks as files)
+mcp_tools/node_modules
+tools/node_modules
