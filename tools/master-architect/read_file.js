@@ -115,6 +115,7 @@ import * as _fsCF from 'fs';
 import * as _pathCF from 'path';
 import { promisify as _promisifyCF } from 'util';
 import { detectConfigFlavor, checkConfigSyntax } from './lib/config_segmenter.js';
+import { validateConfigWithTool } from './lib/config_validators.js';
 const _execFileCF = _promisifyCF(_execFileCb);
 // =============================================================================
 // CONSTANTS
@@ -721,12 +722,20 @@ function _pair() {
 }
 
 async function loadFresh(filePath, readonly) {
-  const lang = detectLanguage(filePath);
+  let lang = detectLanguage(filePath);
+  let content = null;
   if (!lang) {
-    throw new Error(`Unsupported file type: ${path.extname(filePath)}. Supported: ${Object.keys(EXT_TO_LANGUAGE).join(', ')}`);
+    // Config files often have no extension, or one not in the table:
+    // sites-enabled/x, sshd_config, fstab, sudoers, Dockerfile, *.service ...
+    // Accept them when the config segmenter recognises the file.
+    content = await fs.readFile(filePath, 'utf8');
+    if (detectConfigFlavor(filePath, content, 'plaintext')) lang = 'plaintext';
+  }
+  if (!lang) {
+    throw new Error(`Unsupported file type: ${path.extname(filePath)}. Supported: ${Object.keys(EXT_TO_LANGUAGE).join(', ')}, plus recognised config files (nginx, systemd units, sshd_config, fstab, sudoers, Dockerfile, ...)`);
   }
   dbWipePath(filePath);
-  const content = await fs.readFile(filePath, 'utf8');
+  if (content === null) content = await fs.readFile(filePath, 'utf8');
   const { segments, hasParseErrors } = await workerSegmentFile(filePath, content, lang, aiTitleSegments);
   const buf = new Buffer(filePath, lang, segments, content, readonly);
   buf.hasParseErrors = hasParseErrors;
@@ -1021,6 +1030,13 @@ async function verifyL1(filePath, content, language) {
 async function verifyL2(filePath, content, language) {
   const l1 = await verifyL1(filePath, content, language);
   if (!l1.ok) return { ...l1, level: 2 };
+  // Config files: run the service's own checker (nginx -t, sshd -t, visudo -c,
+  // systemd-analyze verify, ...) on the edited text. A failure blocks the commit.
+  const cfgFlavorL2 = detectConfigFlavor(filePath, content, language);
+  if (cfgFlavorL2) {
+    const v = await validateConfigWithTool(filePath, content, cfgFlavorL2);
+    return { level: 2, ok: v.ok, messages: [...l1.messages, ...v.messages] };
+  }
   const tmp = await writeBufferToTemp(filePath, content);
   try {
     if (language === 'python') {
