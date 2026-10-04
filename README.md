@@ -29,7 +29,7 @@ We built five tools that give an LLM structured perception of a codebase instead
 
 ### Session model
 
-Every client gets an isolated workspace. No shared state, no cross-session leakage. Workspaces are wiped after 5 minutes of inactivity.
+Every client gets an isolated workspace. No shared state, no cross-session leakage. Workspaces are wiped after 10 minutes of inactivity.
 
 ### master_architect navigation flow
 
