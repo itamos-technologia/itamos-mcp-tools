@@ -28,7 +28,8 @@ import { execFile, spawn } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
 import dns from 'node:dns';
-import { readFileSync, existsSync, appendFileSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, renameSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { logCost } from '../../mcp_tools/lib/cost_log.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -464,7 +465,47 @@ const CACHE_TTL = 300000; // 5 minutes
 
 function _slotKey(url) { return (globalThis.__sandboxCtx?.getStore?.()?.slotDir || '') + '|' + url; }
 
+// In the sandbox each slot keeps its own small page cache ON DISK, inside the
+// slot (wiped with it): SLOT_CACHE_PAGES pages, no expiry. Outside the sandbox
+// the in-memory cache below is used unchanged.
+const SLOT_CACHE_PAGES = 3;
+function _slot() { return globalThis.__sandboxCtx?.getStore?.()?.slotDir || null; }
+function _slotCacheDir(slot) { return join(slot, '.web_cache'); }
+function _slotCacheFile(slot, url) {
+  return join(_slotCacheDir(slot), createHash('sha1').update(url).digest('hex') + '.json');
+}
+// Cached pages of a slot, oldest first: [{ file, url, timestamp }]
+function _slotCacheList(slot) {
+  const dir = _slotCacheDir(slot);
+  let names = [];
+  try { names = readdirSync(dir).filter((f) => f.endsWith('.json')); } catch { return []; }
+  const out = [];
+  for (const f of names) {
+    try {
+      const d = JSON.parse(readFileSync(join(dir, f), 'utf8'));
+      out.push({ file: join(dir, f), url: d.url, timestamp: d.timestamp || 0 });
+    } catch {}
+  }
+  return out.sort((a, b) => a.timestamp - b.timestamp);
+}
+const _evicted = new Map();   // slot -> url dropped from the cache by the last render
+
 function cacheSet(url, data) {
+  const slot = _slot();
+  if (slot) {
+    mkdirSync(_slotCacheDir(slot), { recursive: true });
+    const file = _slotCacheFile(slot, url);
+    const tmp = file + '.tmp';
+    writeFileSync(tmp, JSON.stringify({ ...data, url, timestamp: Date.now() }));
+    renameSync(tmp, file);
+    const pages = _slotCacheList(slot).filter((e) => e.file !== file);
+    while (pages.length > SLOT_CACHE_PAGES - 1) {
+      const old = pages.shift();
+      try { unlinkSync(old.file); } catch {}
+      _evicted.set(slot, old.url);
+    }
+    return;
+  }
   url = _slotKey(url);
   if (_pageCache.size >= MAX_CACHE) {
     // Evict oldest
@@ -478,6 +519,10 @@ function cacheSet(url, data) {
 }
 
 function cacheGet(url) {
+  const slot = _slot();
+  if (slot) {
+    try { return JSON.parse(readFileSync(_slotCacheFile(slot, url), 'utf8')); } catch { return null; }
+  }
   url = _slotKey(url);
   const entry = _pageCache.get(url);
   if (!entry) return null;
@@ -487,6 +532,86 @@ function cacheGet(url) {
   }
   return entry;
 }
+
+// ═════════════════════════════════════════════════
+// SANDBOX RENDER LIMITS
+// ═════════════════════════════════════════════════
+// Rendering is the only expensive part of this tool (a Chromium renderer per
+// page). In the sandbox: RENDER_LIMIT new renders per window per slot, at most
+// MAX_PARALLEL_RENDERS at once across all slots (the rest wait briefly), and
+// the slot's tab is closed right after each render so its renderer process
+// ends. Reading cached pages costs nothing and is never limited.
+const RENDER_LIMIT = parseInt(process.env.WEB_SKELETON_RENDERS_PER_WINDOW || '3', 10);
+const RENDER_WINDOW_MS = parseInt(process.env.WEB_SKELETON_RENDER_WINDOW_MIN || '5', 10) * 60000;
+const MAX_PARALLEL_RENDERS = parseInt(process.env.WEB_SKELETON_MAX_PARALLEL || '16', 10);
+const RENDER_WAIT_MS = 60000;
+const _renderLog = new Map();   // slot -> timestamps of recent renders
+let _activeRenders = 0;
+const _renderWaiters = [];
+
+function _acquireRender() {
+  if (_activeRenders < MAX_PARALLEL_RENDERS) { _activeRenders += 1; return Promise.resolve(); }
+  return new Promise((resolve, reject) => {
+    const w = {};
+    const timer = setTimeout(() => {
+      const i = _renderWaiters.indexOf(w);
+      if (i >= 0) _renderWaiters.splice(i, 1);
+      reject(new Error('The web renderer is busy right now. Try again in a minute; pages you already loaded can still be read.'));
+    }, RENDER_WAIT_MS);
+    w.resolve = () => { clearTimeout(timer); resolve(); };
+    _renderWaiters.push(w);
+  });
+}
+function _releaseRender() {
+  const w = _renderWaiters.shift();
+  if (w) w.resolve();          // hand the render slot straight to the next waiter
+  else _activeRenders -= 1;
+}
+function _closeSlotTab(slot) {
+  const t = _slotTargets.get(slot);
+  if (!t) return;
+  _slotTargets.delete(slot);
+  _browserSession()
+    .then(async (b) => { try { await b.send('Target.disposeBrowserContext', { browserContextId: t.contextId }); } catch {} await b.close(); })
+    .catch(() => {});
+}
+function _recentRenders(slot) {
+  const now = Date.now();
+  const log = (_renderLog.get(slot) || []).filter((t) => now - t < RENDER_WINDOW_MS);
+  _renderLog.set(slot, log);
+  return log;
+}
+async function withRender(fn) {
+  const slot = _slot();
+  if (!slot) return fn();   // outside the sandbox: unchanged
+  const limitError = () => {
+    const log = _recentRenders(slot);
+    const wait = Math.max(1, Math.ceil((RENDER_WINDOW_MS - (Date.now() - log[0])) / 1000));
+    const cached = _slotCacheList(slot).map((e) => e.url);
+    return new Error(`Render limit reached: ${RENDER_LIMIT} new pages per ${RENDER_WINDOW_MS / 60000} minutes. `
+      + `The next one is available in ${wait}s.`
+      + (cached.length ? ` Pages you can still read without limit (read action): ${cached.join(', ')}` : ''));
+  };
+  if (_recentRenders(slot).length >= RENDER_LIMIT) throw limitError();
+  await _acquireRender();
+  try {
+    const log = _recentRenders(slot);
+    if (log.length >= RENDER_LIMIT) throw limitError();   // a parallel call got there first
+    log.push(Date.now());
+    let out = await fn();
+    const dropped = _evicted.get(slot);
+    _evicted.delete(slot);
+    if (dropped) out += `\n[Cache holds ${SLOT_CACHE_PAGES} pages per sandbox; dropped ${dropped}. Render it again if you need it.]`;
+    return out;
+  } finally {
+    _releaseRender();
+    _closeSlotTab(slot);   // close the tab right after rendering: frees its renderer
+  }
+}
+(globalThis.__sandboxForgetHooks ||= []).push((slotDir) => {
+  _renderLog.delete(slotDir);
+  _evicted.delete(slotDir);
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DOM WALKER (injected into page via Runtime.evaluate)
@@ -1026,7 +1151,9 @@ async function actionRead(url, sectionId) {
 async function actionClick(url, elementId, viewport = { width: 1920, height: 1080 }) {
   await ensureChrome();
 
-  const target = await getPageTarget(false);
+  // In the sandbox tabs are closed after every render, so open a fresh one;
+  // the check below loads the page before the element is resolved.
+  const target = await getPageTarget(!!_slot());
   if (!target) throw new Error('No browser tab open. Run skeleton first.');
 
   const session = new CDPSession(target.webSocketDebuggerUrl);
@@ -1479,26 +1606,30 @@ export default {
         case 'skeleton':
           if (!args.url) throw new Error('url required for skeleton action');
           validateUrl(args.url);
-          result = await actionSkeleton(args.url, undefined, args.context || null, args.layout || null);
+          result = cacheGet(args.url)
+            ? await actionSkeleton(args.url, undefined, args.context || null, args.layout || null)
+            : await withRender(() => actionSkeleton(args.url, undefined, args.context || null, args.layout || null));
           break;
 
         case 'read':
           if (!args.url) throw new Error('url required for read action');
           if (!args.section) throw new Error('section required for read action');
           validateUrl(args.url);
-          result = await actionRead(args.url, args.section);
+          result = cacheGet(args.url)
+            ? await actionRead(args.url, args.section)
+            : await withRender(() => actionRead(args.url, args.section));
           break;
 
         case 'click':
           if (!args.url) throw new Error('url required for click action');
           if (!args.element) throw new Error('element required for click action');
           validateUrl(args.url);
-          result = await actionClick(args.url, args.element);
+          result = await withRender(() => actionClick(args.url, args.element));
           break;
 
         case 'search':
           if (!args.query) throw new Error('query required for search action');
-          result = await actionSearch(args.query, ctx);
+          result = await withRender(() => actionSearch(args.query, ctx));
           break;
 
         default:
