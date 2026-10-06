@@ -4,7 +4,10 @@
 //
 // Pre-allocated ZFS slot pool — no sudo at runtime.
 // 500 slots pre-created at /fast/sandboxes/slot_001 .. slot_500
-// Identity → slot assignment in memory. On expiry: wipe slot contents, free slot.
+// Identity → slot assignment in memory, taken on the first tool call. On
+// expiry: wipe slot contents, free slot. The login stays valid, so the next
+// tool call gets a new, empty sandbox. When every slot is taken, tool calls
+// wait in a queue and a freed slot goes straight to the front of it.
 //
 // Identity: requests from the internet arrive through our reverse proxy and
 // must carry an OAuth access token (anonymous OAuth, see oauth.js); the slot is
@@ -14,7 +17,7 @@
 //
 // Endpoints:
 //   GET  /session/create  → local: assigns a slot by IP; public: how to connect
-//   GET  /health          → pool status
+//   GET  /health          → pool status and queue length
 //   POST /mcp             → MCP handler
 //   OAuth: /.well-known/*, /register, /authorize, /token (oauth.js)
 //
@@ -82,19 +85,76 @@ function label(who) {
   return who.startsWith('key:') ? `key:${who.slice(4, 12)}…` : who;
 }
 
-function assignSlot(who) {
-  // Already has a slot
-  if (sessions.has(who)) {
-    const s = sessions.get(who);
-    s.lastActive = Date.now();
-    return slotPath(s.slot);
-  }
-  const n = findFreeSlot();
-  if (n === null) return null; // pool exhausted
+// ── Waiting queue ─────────────────────────────────────────────────────────
+// Connecting never needs a slot; a slot is taken when a tool is first called.
+// When every slot is taken, that tool call joins the queue instead (in memory
+// only). A freed slot goes straight to the front of the queue: the sandbox is
+// created at once, its queue entry ends, and its normal inactivity clock starts.
+const waitQueue = new Map();   // identity → time it joined (Map keeps arrival order)
+const releases  = [];          // times slots were freed recently (for the wait estimate)
+const notices   = new Map();   // identity → one-time note shown with its next tool result
+const expiredAt = new Map();   // identity → when its last sandbox expired
+const LOGIN_MAX_MS = 30 * 24 * 60 * 60 * 1000;   // refresh tokens last 30 days (oauth.js)
+
+function giveSlot(who, n) {
   sessions.set(who, { slot: n, lastActive: Date.now() });
   slotToIp.set(slotName(n), who);
   console.log(`[Pool] Assigned ${slotName(n)} → ${label(who)}`);
-  return slotPath(n);
+  if (expiredAt.has(who)) {
+    expiredAt.delete(who);
+    notices.set(who, `Note: your previous sandbox was deleted after ${TTL_TEXT}. This is a new, empty sandbox.`);
+  }
+}
+
+// Hand free slots to the front of the queue, in arrival order.
+function drainQueue() {
+  for (const [who, joined] of waitQueue) {
+    const n = findFreeSlot();
+    if (n === null) return;
+    waitQueue.delete(who);
+    giveSlot(who, n);
+    const note = notices.get(who);
+    notices.set(who, `Your sandbox is ready (you waited in the queue).${note ? ` ${note}` : ''}`);
+    console.log(`[Queue] ${label(who)} left the queue after ${Math.round((Date.now() - joined) / 1000)}s`);
+  }
+}
+
+// Estimated wait from how often slots were freed in the last hour.
+function waitEstimate(position) {
+  const now = Date.now();
+  while (releases.length && now - releases[0] > 60 * 60 * 1000) releases.shift();
+  if (releases.length < 3) return 'not known yet';
+  const msPerSlot = (now - releases[0]) / releases.length;
+  const min = Math.max(1, Math.ceil((position * msPerSlot) / 60000));
+  return `about ${min} minute${min === 1 ? '' : 's'}`;
+}
+
+function queueMessage(position) {
+  return `${FULL_MESSAGE} You are in position ${position} in the queue; estimated wait: ${waitEstimate(position)}. `
+    + 'Your sandbox is created automatically when a slot frees up, so you can keep working and try again later.';
+}
+
+// { dir } when `who` has (or just got) a sandbox, else { position } in the queue.
+function requestSlot(who) {
+  const s = sessions.get(who);
+  if (s) { s.lastActive = Date.now(); return { dir: slotPath(s.slot) }; }
+  if (!waitQueue.size) {
+    const n = findFreeSlot();
+    if (n !== null) { giveSlot(who, n); return { dir: slotPath(n) }; }
+  }
+  if (!waitQueue.has(who)) {
+    waitQueue.set(who, Date.now());
+    console.log(`[Queue] ${label(who)} joined at position ${waitQueue.size}`);
+  }
+  drainQueue();
+  const got = sessions.get(who);
+  if (got) return { dir: slotPath(got.slot) };
+  return { position: [...waitQueue.keys()].indexOf(who) + 1 };
+}
+
+// Local /session/create: a directory, or null while queued.
+function assignSlot(who) {
+  return requestSlot(who).dir || null;
 }
 
 function touchSession(who) {
@@ -120,15 +180,17 @@ async function cleanupExpired() {
       sessions.delete(who);
       slotToIp.delete(slotName(slot));
       await wipeSlot(slot);
-      // A login lives only as long as its sandbox: revoke its tokens too.
-      if (who.startsWith('key:') && oauth.revokeSandbox(who.slice(4))) {
-        console.log(`[OAuth] Revoked login of ${label(who)} with its sandbox`);
-      }
+      releases.push(Date.now());
+      notices.delete(who);
+      // The login stays valid: its next tool call gets a new, empty sandbox
+      // (through the queue when every slot is taken).
+      if (who.startsWith('key:')) expiredAt.set(who, now);
     }
   }
-  // Logins that never used a sandbox (or whose sandbox is gone) expire too.
-  const idle = oauth.revokeIdle((key) => sessions.has(`key:${key}`), INACTIVE_TTL);
-  if (idle) console.log(`[OAuth] Revoked ${idle} idle login(s) without a sandbox`);
+  if (releases.length > 1000) releases.splice(0, releases.length - 1000);
+  for (const [who, t] of expiredAt) if (now - t > LOGIN_MAX_MS) expiredAt.delete(who);
+  // Freed slots go to the front of the queue right away.
+  drainQueue();
 }
 
 setInterval(cleanupExpired, 60 * 1000);
@@ -149,7 +211,9 @@ function jailPath(sandboxDir, requestedPath) {
 // TOOL LOADER
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function loadTools(server, sandboxDir, who) {
+// Tools are registered without a slot, so connecting and listing tools always
+// work. The slot is taken (or the queue joined) when a tool is called.
+async function loadTools(server, who) {
   const dir = path.join(__dirname, 'sandbox_tools');
   if (!fs.existsSync(dir)) return;
   const files = fs.readdirSync(dir).filter(f => f.endsWith('.js')).sort();
@@ -163,18 +227,30 @@ async function loadTools(server, sandboxDir, who) {
         tool.description || '',
         tool.schema || {},
         async (args) => {
-          touchSession(who);
+          const slot = requestSlot(who);
+          if (!slot.dir) {
+            return { isError: true, content: [{ type: 'text', text: queueMessage(slot.position) }] };
+          }
+          const sandboxDir = slot.dir;
           // Resolve relative paths to absolute sandbox paths for original tools
           const resolvedArgs = { ...args };
           if (resolvedArgs.path !== undefined) {
             resolvedArgs.path = jailPath(sandboxDir, resolvedArgs.path);
           }
           const ctx = { sandboxDir, jailPath: (p) => jailPath(sandboxDir, p), execFileAsync };
-          return globalThis.__sandboxCtx.run({
+          const result = await globalThis.__sandboxCtx.run({
             slotDir: sandboxDir,
             architectDb: path.join(sandboxDir, '.architect.db'),
             stateDir: path.join(sandboxDir, '.read_file_state'),
           }, () => tool.handler(resolvedArgs, ctx));
+          // One-time note (sandbox ready after the queue, or a new sandbox
+          // after expiry) goes in front of the first result it can join.
+          const note = notices.get(who);
+          if (note && Array.isArray(result?.content)) {
+            notices.delete(who);
+            return { ...result, content: [{ type: 'text', text: note }, ...result.content] };
+          }
+          return result;
         },
       );
     } catch (e) {
@@ -245,9 +321,15 @@ function baseUrl(req) {
 const oauth = mountOAuth(app, {
   storePath: path.join(DATA_DIR || path.join(__dirname, 'data'), 'oauth.json'),
   baseUrl,
-  // No new sandboxes while every slot is taken (existing holders keep theirs).
-  isFull: () => findFreeSlot() === null,
-  fullMessage: FULL_MESSAGE,
+  // Connecting is always allowed; when full, the consent page says so and the
+  // first tool call joins the queue.
+  busyNote: () => (findFreeSlot() === null || waitQueue.size
+    ? 'All sandboxes are in use right now. You can still connect: your sandbox is created automatically when a slot frees up, and your tools will tell you your place in the queue.'
+    : null),
+  // One sandbox per network: a network counts as busy while its identity
+  // holds a sandbox or a queue place (oauth.js adds recent logins).
+  isActive: (key) => sessions.has(`key:${key}`) || waitQueue.has(`key:${key}`),
+  activeWindowMs: INACTIVE_TTL,
   ttlText: TTL_TEXT,
   clientIp,
 });
@@ -289,6 +371,8 @@ app.get('/session/create', (req, res) => {
 });
 
 // ── MCP endpoint ────────────────────────────────────────────────────────────
+// No slot is needed here: connecting and listing tools always work. Each tool
+// call takes the sandbox (or a queue place) itself, see loadTools().
 app.post('/mcp', async (req, res) => {
   let who;
   if (isPublic(req)) {
@@ -298,15 +382,13 @@ app.post('/mcp', async (req, res) => {
   } else {
     who = `ip:${clientIp(req)}`;
   }
-  const sandboxDir = assignSlot(who);
-  if (!sandboxDir) return sendFull(req, res);
   try {
     const server = new McpServer({
       name: 'itamos-sandbox',
       version: '1.1.0',
       capabilities: { tools: { listChanged: false } },
     });
-    await loadTools(server, sandboxDir, who);
+    await loadTools(server, who);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -326,6 +408,7 @@ app.get('/health', (req, res) => {
     status: 'ok',
     version: '1.1.0',
     slots: { used: sessions.size, free: TOTAL_SLOTS - sessions.size, total: TOTAL_SLOTS },
+    queue: waitQueue.size,
   });
 });
 

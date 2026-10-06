@@ -76,14 +76,14 @@ function shell(title, body) {
 
 // The approve button comes first in the markup so that pressing Enter creates
 // the sandbox; row-reverse puts it on the right visually.
-function consentHtml(clientName, requestId, ttlText) {
+function consentHtml(clientName, requestId, ttlText, busyNote) {
   return shell('Itamos MCP Sandbox', `
 <h1>Create your sandbox</h1>
 <p><strong>${esc(clientName)}</strong> wants to connect to an Itamos MCP sandbox.</p>
-<ul>
+${busyNote ? `<p><strong>${esc(busyNote)}</strong></p>\n` : ''}<ul>
   <li>No account or sign-up needed.</li>
   <li>You get a private workspace with code tools: read_file, write_file, master_architect, git and web_skeleton.</li>
-  <li>Your sandbox and its files are deleted after ${esc(ttlText)}. After that, connect again to get a new one.</li>
+  <li>Your sandbox and its files are deleted after ${esc(ttlText)}. You stay connected: your next tool call gets a new, empty sandbox.</li>
   <li><strong>Demonstration service:</strong> don't put anything sensitive or confidential in the sandbox. It is built for trying the tools, not for private data.</li>
 </ul>
 <form method="post" action="/authorize">
@@ -112,12 +112,18 @@ function redirectWith(res, redirectUri, params) {
  * Mount the OAuth endpoints on an express app.
  *   storePath  JSON file for registered clients and hashed tokens
  *   baseUrl    (req) => public origin, e.g. "https://mcp.itamos-technologia.com"
- * Returns { authenticate(req) -> sandboxKey|null, challenge(req, res) }.
+ * Returns { authenticate(req) -> sandboxKey|null, challenge(req, res), revokeSandbox }.
  */
 export function mountOAuth(app, {
   storePath, baseUrl,
-  isFull = () => false,
-  fullMessage = 'At full capacity, try again later.',
+  // Connecting is never refused for lack of slots: the server queues tool
+  // calls instead. busyNote() returns a line for the consent page, or null.
+  busyNote = () => null,
+  // isActive(key): the identity holds a sandbox or a queue place right now.
+  isActive = () => false,
+  // A login issued within this window also counts as active (it has not had
+  // time to make its first tool call yet).
+  activeWindowMs = 10 * 60 * 1000,
   ttlText = '10 minutes of inactivity',
   clientIp = (req) => req.socket.remoteAddress || '',
 }) {
@@ -261,10 +267,6 @@ export function mountOAuth(app, {
     }
     const chk = ipCheck(req);
     if (!chk.ok) return errorPage(res, 429, 'Sandbox already active', onePerIpMessage);
-    if (!chk.replace && isFull()) {
-      res.set('Retry-After', '120');
-      return errorPage(res, 503, 'At full capacity', fullMessage);
-    }
     if (!getCookie(req, 'sbid')) {
       res.cookie('sbid', rand(18), {
         httpOnly: true, sameSite: 'lax', path: '/', maxAge: 24 * 3600 * 1000,
@@ -280,7 +282,7 @@ export function mountOAuth(app, {
     res.set('Content-Security-Policy',
       "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https: http://localhost:* http://127.0.0.1:*; frame-ancestors 'none'");
     res.set('Cache-Control', 'no-store');
-    res.send(consentHtml(client.name, requestId, ttlText));
+    res.send(consentHtml(client.name, requestId, ttlText, busyNote()));
   });
 
   app.post('/authorize', (req, res) => {
@@ -296,13 +298,9 @@ export function mountOAuth(app, {
     }
     const chk = ipCheck(req);
     if (!chk.ok) return errorPage(res, 429, 'Sandbox already active', onePerIpMessage);
-    if (!chk.replace && isFull()) {
-      res.set('Retry-After', '120');
-      return errorPage(res, 503, 'At full capacity', fullMessage);
-    }
     const code = rand();
-    // Same browser reconnecting before its sandbox expired: resume that sandbox
-    // (same key, same slot, files kept) with fresh tokens; the old ones end.
+    // Same browser reconnecting: resume that identity (same key, so the same
+    // sandbox and files if it still exists) with fresh tokens; the old ones end.
     const sandboxKey = chk.replace || `sbk_${rand(24)}`;
     if (chk.replace) revokeSandbox(chk.replace);
     ipOwner.set(chk.ip, { sandboxKey, browserId: getCookie(req, 'sbid') });
@@ -371,7 +369,10 @@ export function mountOAuth(app, {
     return res.status(400).json({ error: 'unsupported_grant_type' });
   });
 
-  // ── revocation: a login lives only as long as its sandbox ────────────────
+  // ── revocation ───────────────────────────────────────────────────────────
+  // A login outlives its sandbox: when the sandbox expires, the next tool call
+  // gets a new one. Tokens end on their own (refresh tokens after 30 days of
+  // no use) or here, when the same browser reconnects and takes over the key.
   function revokeSandbox(sandboxKey) {
     let n = 0;
     for (const [h, t] of Object.entries(store.tokens)) {
@@ -383,10 +384,15 @@ export function mountOAuth(app, {
     return n;
   }
 
-  // An identity is alive while it has a token, or a code not yet exchanged.
+  // For the one-per-network rule an identity is alive while it holds a sandbox
+  // or a queue place, has a code not yet exchanged, or got a token recently.
   function identityAlive(sandboxKey) {
-    for (const t of Object.values(store.tokens)) if (t.sandboxKey === sandboxKey) return true;
-    for (const g of codes.values()) if (g.sandboxKey === sandboxKey && g.expires > Date.now()) return true;
+    if (isActive(sandboxKey)) return true;
+    const now = Date.now();
+    for (const g of codes.values()) if (g.sandboxKey === sandboxKey && g.expires > now) return true;
+    for (const t of Object.values(store.tokens)) {
+      if (t.sandboxKey === sandboxKey && now - (t.issued || 0) < activeWindowMs) return true;
+    }
     return false;
   }
 
@@ -401,25 +407,9 @@ export function mountOAuth(app, {
     return { ok: false, ip };
   }
 
-  // Revoke identities that hold no sandbox (never used one, or theirs was
-  // wiped) and got no new token within ttlMs.
-  function revokeIdle(isActive, ttlMs) {
-    const now = Date.now();
-    const newest = new Map();
-    for (const t of Object.values(store.tokens)) {
-      newest.set(t.sandboxKey, Math.max(newest.get(t.sandboxKey) || 0, t.issued || 0));
-    }
-    let revoked = 0;
-    for (const [key, issued] of newest) {
-      if (!isActive(key) && now - issued > ttlMs) { revokeSandbox(key); revoked += 1; }
-    }
-    return revoked;
-  }
-
   // ── resource-server side ─────────────────────────────────────────────────
   return {
     revokeSandbox,
-    revokeIdle,
     // Returns the sandbox key behind a valid access token, else null.
     authenticate(req) {
       const h = req.headers.authorization || '';
