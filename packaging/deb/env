@@ -14,6 +14,12 @@ MCP_DATA_DIR=/var/lib/itamos-mcp-tools
 MASTER_ARCHITECT_DB=/var/lib/itamos-mcp-tools/master-architect.db
 ITAMOS_COSTS_DB=/var/lib/itamos-mcp-tools/costs.db
 
+# Summarizer for titles of untitled text (read_file, web_skeleton): any
+# OpenAI-compatible chat endpoint. The default is the optional Itamos LLM router
+# (see router.env); a single llama-server or Ollama works too. Empty = no titles.
+ITAMOS_SUMMARIZER_URL=http://127.0.0.1:8090
+#ITAMOS_SUMMARIZER_MODEL=gemma3:4b   # only needed for Ollama
+
 # On a public server, web_skeleton must not reach private or local addresses.
 WEB_SKELETON_PUBLIC_ONLY=1
 

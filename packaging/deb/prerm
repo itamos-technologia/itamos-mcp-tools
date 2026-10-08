@@ -5,11 +5,11 @@ set -e
 if [ -d /run/systemd/system ]; then
   case "$1" in
     remove|upgrade|deconfigure)
-      systemctl stop itamos-mcp-tools.service >/dev/null 2>&1 || true
+      systemctl stop itamos-mcp-tools.service itamos-llm-router.service >/dev/null 2>&1 || true
       ;;
   esac
   if [ "$1" = remove ]; then
-    systemctl disable itamos-mcp-tools.service >/dev/null 2>&1 || true
+    systemctl disable itamos-mcp-tools.service itamos-llm-router.service >/dev/null 2>&1 || true
   fi
 fi
 

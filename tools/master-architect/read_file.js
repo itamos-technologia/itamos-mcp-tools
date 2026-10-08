@@ -184,37 +184,37 @@ const EXT_TO_LANGUAGE = {
   '.bash': 'shell',
 };
 
-// ── Ollama AI titling config ──
-const OLLAMA_URL = 'http://127.0.0.1:11434';
-const AI_TITLE_MODEL = 'gemma3:1b';
+// ── Summarizer: titles for untitled text ──
+// Any OpenAI-compatible chat endpoint: the Itamos LLM router (:8090, which spreads
+// requests over the GPUs by token budget), a single llama-server, or Ollama.
+// Set ITAMOS_SUMMARIZER_URL to an empty string to turn titling off.
+const SUMMARIZER_URL = (process.env.ITAMOS_SUMMARIZER_URL ?? 'http://127.0.0.1:8090').replace(/\/$/, '');
+// Model name to send; llama-server ignores it, Ollama needs one (e.g. gemma3:4b).
+const SUMMARIZER_MODEL = process.env.ITAMOS_SUMMARIZER_MODEL || 'summarizer';
 const AI_TITLE_MIN_CHARS = 80;
 
-async function ollamaGenerate(prompt, maxTokens = 50) {
-  const http = await import('http');
-  const payload = JSON.stringify({
-    model: AI_TITLE_MODEL, prompt, stream: false,
-    options: { num_predict: maxTokens, temperature: 0.1 }
-  });
-  return new Promise((resolve) => {
-    const req = http.default.request(OLLAMA_URL + '/api/generate', {
+// One short answer from the summarizer, or null if it is off, unreachable or slow
+// (the caller then keeps the segment's own first line as its name).
+async function summarize(prompt, maxTokens = 50) {
+  if (!SUMMARIZER_URL) return null;
+  try {
+    const res = await fetch(SUMMARIZER_URL + '/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      timeout: 15000,
-    }, (res) => {
-      let body = '';
-      res.on('data', d => body += d);
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          resolve(data.response?.trim().split('\n')[0]?.trim().replace(/^["*]+|["*]+$/g, '') || null);
-        } catch { resolve(null); }
-      });
+      body: JSON.stringify({
+        model: SUMMARIZER_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: maxTokens, temperature: 0.1,
+      }),
+      signal: AbortSignal.timeout(30000),
     });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.write(payload);
-    req.end();
-  });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content || '';
+    return text.trim().split('\n')[0]?.trim().replace(/^["*]+|["*]+$/g, '') || null;
+  } catch {
+    return null;
+  }
 }
 
 async function aiTitleSegments(segments, content) {
@@ -224,9 +224,11 @@ async function aiTitleSegments(segments, content) {
   );
   if (needsTitle.length === 0) return;
   for (const seg of needsTitle) {
-    const text = content.slice(seg.startByte, seg.endByte).slice(0, 2000);
+    // The whole paragraph, never cut: the summarizer's context fits it. A text
+    // too large for any GPU is refused by the router and keeps its first line.
+    const text = content.slice(seg.startByte, seg.endByte);
     const prompt = PROMPT_TPL.replace('{text}', text);
-    const title = await ollamaGenerate(prompt);
+    const title = await summarize(prompt);
     if (title && title.length > 2 && title.length < 120) {
       seg.name = title.length > 60 ? title.slice(0, 57) + '...' : title;
       seg.aiTitled = true;

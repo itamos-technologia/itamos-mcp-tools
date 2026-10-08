@@ -22,9 +22,11 @@ sed "s/@VERSION@/$VERSION/" packaging/deb/control > "$STAGE/DEBIAN/control"
 for f in postinst prerm postrm; do
   install -m 0755 "packaging/deb/$f" "$STAGE/DEBIAN/$f"
 done
-echo /etc/itamos-mcp-tools/env > "$STAGE/DEBIAN/conffiles"
+printf "/etc/itamos-mcp-tools/env\n/etc/itamos-mcp-tools/router.env\n" > "$STAGE/DEBIAN/conffiles"
 install -m 0644 packaging/deb/env "$STAGE/etc/itamos-mcp-tools/env"
+install -m 0644 packaging/deb/router.env "$STAGE/etc/itamos-mcp-tools/router.env"
 install -m 0644 packaging/deb/itamos-mcp-tools.service "$STAGE/lib/systemd/system/itamos-mcp-tools.service"
+install -m 0644 packaging/deb/itamos-llm-router.service "$STAGE/lib/systemd/system/itamos-llm-router.service"
 install -m 0755 packaging/deb/itamos-mcp-create-slots "$STAGE/usr/sbin/itamos-mcp-create-slots"
 
 SIZE=$(du -sk "$STAGE" | cut -f1)

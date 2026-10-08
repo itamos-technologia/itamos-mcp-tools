@@ -1,0 +1,20 @@
+[Unit]
+Description=Itamos LLM router (token-budget load balancing over llama-server GPUs)
+Documentation=https://github.com/itamos-technologia/itamos-mcp-tools
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=itamos-mcp
+Group=itamos-mcp
+# Set ROUTES in this file first; without it the router exits with 78 and is not restarted.
+EnvironmentFile=/etc/itamos-mcp-tools/router.env
+ExecStart=/usr/bin/node /opt/itamos-mcp-tools/router/llm-router.js
+Restart=on-failure
+RestartSec=2
+RestartPreventExitStatus=78
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

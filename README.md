@@ -108,6 +108,27 @@ From the same machine, add `http://localhost:4200/mcp` as a connector in your MC
 
 **Firewall port 4200** and put an HTTPS reverse proxy (for example nginx) in front of it that sets `X-Forwarded-For` and `X-Forwarded-Proto`. Requests that arrive through the proxy use the anonymous one-click sign-in, so users on shared addresses (such as claude.ai) each get their own sandbox. Direct connections to port 4200 skip the sign-in, which is why the port must not be reachable from outside.
 
+### Text models (optional)
+
+read_file and web_skeleton give untitled paragraphs and page sections a short title (5 to 10 words) from a small summarizer model, so the agent can tell parts apart without reading them. Without a summarizer everything still works; those parts are then named by their first line.
+
+Any OpenAI-compatible chat endpoint works, set with `ITAMOS_SUMMARIZER_URL` (default `http://127.0.0.1:8090`): a single `llama-server`, Ollama, or the included router in front of several GPUs. The whole paragraph is always sent, never cut.
+
+The hosted sandbox runs **Gemma 4 E4B** (Q4_0) as summarizer and **EmbeddingGemma 300M** as embedder on three GPUs (one 16 GB MI50 and two 8 GB V340 dies), each summarizer started like this:
+
+```sh
+llama-server -m gemma-4-E4B-it-Q4_0.gguf -ngl 99 --port 8190 \
+  -np 64 -c 524288 --kv-unified -fa on --cache-type-k q4_0 --cache-type-v q4_0 -rea off
+```
+
+- `--kv-unified`: one shared KV pool, so each request uses only the tokens it needs.
+- `--cache-type-k q4_0 --cache-type-v q4_0` (needs `-fa on`): a 4-bit KV cache, about 4.5 KB per token for this model.
+- `-c` is the pool in tokens: 524,288 on the MI50, 262,144 on each V340 die (with 32 slots).
+
+**The router** (`router/llm-router.js`, service `itamos-llm-router`) listens on 8090 (summarizer) and 8091 (embedder). Before sending a request it counts its tokens with the backend's own tokenizer, sends it to a GPU whose pool has room (preferring faster GPUs by weight), and makes it wait in line when none has. A GPU that fails is skipped for 15 seconds and the request is retried on another. Configure it with `ROUTES` (in the package: `/etc/itamos-mcp-tools/router.env`); `GET /router/status` shows each GPU's pool, reserved tokens and queue.
+
+The embedder on 8091 serves other Itamos services; the five tools don't use embeddings yet.
+
 ### Settings
 
 | Variable | Default | What it does |
@@ -119,6 +140,8 @@ From the same machine, add `http://localhost:4200/mcp` as a connector in your MC
 | `SANDBOX_DATA_DIR` | `./data` | Where sign-in data is kept (hashed) |
 | `PUBLIC_BASE_URL`, `PUBLIC_MCP_URL` | from the proxy headers | Public addresses, if the proxy can't supply them |
 | `WEB_SKELETON_PUBLIC_ONLY` | off | Set to `1` on a public server: web_skeleton then refuses private and local addresses |
+| `ITAMOS_SUMMARIZER_URL` | `http://127.0.0.1:8090` | Summarizer for titles (any OpenAI-compatible chat endpoint). Empty turns titling off |
+| `ITAMOS_SUMMARIZER_MODEL` | `summarizer` | Model name sent with each request; only Ollama needs a real one |
 | `SANDBOX_SMTP_CREDENTIALS` | a path on the Itamos server | JSON file (`email`, `app_password`, `smtp_server`, `smtp_port`) for the optional "your sandbox is ready" email. Without it the email is not sent and the server logs why. |
 | `ITAMOS_COSTS_DB` | a path on the Itamos server | SQLite file for token-savings statistics. If it can't be written, statistics are skipped. |
 

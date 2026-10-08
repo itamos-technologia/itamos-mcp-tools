@@ -37,38 +37,39 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// ── Ollama AI titling for text-heavy sections ──
-const OLLAMA_URL_SKEL = 'http://127.0.0.1:11434';
-const AI_TITLE_MODEL_SKEL = 'gemma3:1b';
+// ── Summarizer: titles for text-heavy sections ──
+// Any OpenAI-compatible chat endpoint: the Itamos LLM router (:8090, which spreads
+// requests over the GPUs by token budget), a single llama-server, or Ollama.
+// Set ITAMOS_SUMMARIZER_URL to an empty string to turn titling off.
+const SUMMARIZER_URL_SKEL = (process.env.ITAMOS_SUMMARIZER_URL ?? 'http://127.0.0.1:8090').replace(/\/$/, '');
+// Model name to send; llama-server ignores it, Ollama needs one (e.g. gemma3:4b).
+const SUMMARIZER_MODEL_SKEL = process.env.ITAMOS_SUMMARIZER_MODEL || 'summarizer';
 const AI_TITLE_MIN_SUMMARY = 80;
 
-async function ollamaTitle(text, maxTokens = 50) {
-  const http = await import('http');
-  const prompt = `Read the following text and generate a short descriptive title (5-10 words maximum). Output ONLY the title, nothing else.\n\nText:\n${text.slice(0, 2000)}\n\nTitle:`;
-  const payload = JSON.stringify({
-    model: AI_TITLE_MODEL_SKEL, prompt, stream: false,
-    options: { num_predict: maxTokens, temperature: 0.1 }
-  });
-  return new Promise((resolve) => {
-    const req = http.default.request(OLLAMA_URL_SKEL + '/api/generate', {
+// A short title for a text-heavy section from the summarizer, or null if it is off,
+// unreachable or slow (the section then keeps its own first line). The whole text
+// is sent, never cut: the summarizer's context fits a full section.
+async function summarizeTitle(text, maxTokens = 50) {
+  if (!SUMMARIZER_URL_SKEL) return null;
+  const prompt = `Read the following text and generate a short descriptive title (5-10 words maximum). Output ONLY the title, nothing else.\n\nText:\n${text}\n\nTitle:`;
+  try {
+    const res = await fetch(SUMMARIZER_URL_SKEL + '/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      timeout: 15000,
-    }, (res) => {
-      let body = '';
-      res.on('data', d => body += d);
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          resolve(data.response?.trim().split('\n')[0]?.trim().replace(/^["*]+|["*]+$/g, '') || null);
-        } catch { resolve(null); }
-      });
+      body: JSON.stringify({
+        model: SUMMARIZER_MODEL_SKEL,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: maxTokens, temperature: 0.1,
+      }),
+      signal: AbortSignal.timeout(30000),
     });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.write(payload);
-    req.end();
-  });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const out = data.choices?.[0]?.message?.content || '';
+    return out.trim().split('\n')[0]?.trim().replace(/^["*]+|["*]+$/g, '') || null;
+  } catch {
+    return null;
+  }
 }
 
 async function aiTitleElements(data) {
@@ -84,7 +85,7 @@ async function aiTitleElements(data) {
   for (const el of toTitle) {
     const text = data.sections?.[el.id] || el.summary || '';
     if (text.length < AI_TITLE_MIN_SUMMARY) continue;
-    const title = await ollamaTitle(text);
+    const title = await summarizeTitle(text);
     if (title && title.length > 2 && title.length < 120) {
       el.label = title;
       el.aiTitled = true;
