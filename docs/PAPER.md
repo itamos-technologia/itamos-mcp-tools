@@ -254,7 +254,7 @@ flowchart LR
   r["<b>master_architect</b><br/>project map tool"]
   d0["<b>scan.js</b><br/>walks and indexes the project"]
   r --> d0
-  d1["<b>parsers</b><br/>14 languages"]
+  d1["<b>parsers</b><br/>16 languages, incl. nginx and SQL"]
   r --> d1
   d2["<b>db.js</b><br/>graph storage"]
   r --> d2

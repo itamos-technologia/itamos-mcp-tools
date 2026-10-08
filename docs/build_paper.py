@@ -129,7 +129,7 @@ DEPS = {
         'caption': 'master_architect components. Dashed: third-party software.',
         'root': ('master_architect', 'project map tool'),
         'items': [('scan.js', 'walks and indexes the project', False),
-                  ('parsers', '14 languages', False),
+                  ('parsers', '16 languages, incl. nginx and SQL', False),
                   ('db.js', 'graph storage', False),
                   ('query.js', 'topology, bones, connections, ping', False),
                   ('registry.js', 'languages and file types', False),
