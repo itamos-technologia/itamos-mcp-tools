@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stop the server before its files are removed or replaced.
+set -e
+
+if [ -d /run/systemd/system ]; then
+  case "$1" in
+    remove|upgrade|deconfigure)
+      systemctl stop itamos-mcp-tools.service >/dev/null 2>&1 || true
+      ;;
+  esac
+  if [ "$1" = remove ]; then
+    systemctl disable itamos-mcp-tools.service >/dev/null 2>&1 || true
+  fi
+fi
+
+exit 0

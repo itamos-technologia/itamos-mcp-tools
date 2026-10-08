@@ -1,0 +1,50 @@
+#!/bin/sh
+# Runs after the package files are in place: service user, data folder, and the
+# pinned Node.js dependencies (npm ci from the lock files). The server is not
+# started here: it needs ZFS slots first.
+set -e
+
+APP=/opt/itamos-mcp-tools
+DATA=/var/lib/itamos-mcp-tools
+CACHE=/var/cache/itamos-mcp-tools
+
+case "$1" in
+  configure)
+    if ! getent passwd itamos-mcp >/dev/null; then
+      adduser --system --group --home "$DATA" --no-create-home itamos-mcp >/dev/null
+    fi
+    mkdir -p "$DATA" "$CACHE"
+    chown itamos-mcp:itamos-mcp "$DATA"
+    chmod 750 "$DATA"
+
+    NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
+    if [ "$NODE_MAJOR" -lt 20 ]; then
+      echo "itamos-mcp-tools needs Node.js 20 or newer; found $(node -v)." >&2
+      echo "Install a newer Node.js (for example from NodeSource) and run: dpkg --configure itamos-mcp-tools" >&2
+      exit 1
+    fi
+
+    echo "Installing the pinned Node.js dependencies (needs internet, may take a few minutes)..."
+    cd "$APP"
+    npm ci --omit=dev --no-audit --no-fund --cache "$CACHE/npm" --loglevel=error
+
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload || true
+    fi
+
+    cat <<'EOF'
+
+Itamos MCP Tools is installed. Two steps before it can run:
+
+  1. Create the ZFS sandbox slots, for example:
+       sudo itamos-mcp-create-slots tank/sandboxes 500 2G
+  2. Set SANDBOX_ROOT in /etc/itamos-mcp-tools/env to the folder it printed, then:
+       sudo systemctl enable --now itamos-mcp-tools
+
+Before opening it to the internet, read "Going public" in
+/opt/itamos-mcp-tools/README.md: firewall port 4200 and put an HTTPS proxy in front.
+EOF
+    ;;
+esac
+
+exit 0

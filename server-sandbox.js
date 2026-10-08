@@ -507,7 +507,9 @@ function verifyZfsSlots() {
   if (problems.length) {
     console.error('[Pool] ZFS check failed: every slot must be a ZFS dataset with a quota and compression.\n  - '
       + problems.join('\n  - ') + '\nCreate the slots with scripts/create-slots.sh, then start again.');
-    process.exit(1);
+    // 78 = configuration error (sysexits EX_CONFIG): the systemd unit does not
+    // restart on it, since retrying cannot fix missing slots.
+    process.exit(78);
   }
   console.log(`[Pool] ZFS check passed: ${TOTAL_SLOTS} slots are datasets with a quota and compression`);
 }

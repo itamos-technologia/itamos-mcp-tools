@@ -1,0 +1,19 @@
+Package: itamos-mcp-tools
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: all
+Depends: nodejs (>= 20), npm, build-essential, python3, git, zfsutils-linux, adduser, ca-certificates
+Recommends: chromium | chromium-browser | google-chrome-stable
+Maintainer: Konstantinos Karamperis <info@itamos-technologia.com>
+Homepage: https://itamos-technologia.com/mcp-hosting.html
+Description: Itamos MCP Tools sandbox server
+ Five MCP tools that let an AI agent see and change code the way an engineer
+ does: master_architect (project map), read_file (segment editor with
+ verification, undo and clipboard), write_file, a sandboxed git and
+ web_skeleton (web perception), served to many users at once, each in a
+ private ZFS sandbox with a hard size limit.
+ .
+ The pinned Node.js dependencies are installed during setup with npm ci, so
+ installing needs internet access. The server needs ZFS slots before it starts:
+ create them with itamos-mcp-create-slots.

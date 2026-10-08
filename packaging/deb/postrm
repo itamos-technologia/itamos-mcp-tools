@@ -1,0 +1,24 @@
+#!/bin/sh
+# node_modules were created by npm in postinst, so dpkg does not know about them:
+# remove them with the package. On purge, also remove the data and npm cache.
+# The ZFS slots are never touched: they hold no package files and may be reused.
+set -e
+
+APP=/opt/itamos-mcp-tools
+
+case "$1" in
+  remove|purge)
+    rm -rf "$APP/node_modules" "$APP/tools/master-architect/node_modules"
+    rmdir "$APP/tools/master-architect" "$APP/tools" "$APP" 2>/dev/null || true
+    ;;
+esac
+
+if [ "$1" = purge ]; then
+  rm -rf /var/lib/itamos-mcp-tools /var/cache/itamos-mcp-tools
+fi
+
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

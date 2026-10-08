@@ -28,3 +28,6 @@ tools/node_modules
 
 # Python bytecode
 __pycache__/
+
+# built packages
+dist/

@@ -1,12 +1,12 @@
 {
   "name": "itamos-mcp-sandbox",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "Itamos public MCP sandbox server",
   "main": "server-sandbox.js",
   "scripts": {
     "start": "node server-sandbox.js",
-    "postinstall": "npm --prefix tools/master-architect install"
+    "postinstall": "npm --prefix tools/master-architect ci"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

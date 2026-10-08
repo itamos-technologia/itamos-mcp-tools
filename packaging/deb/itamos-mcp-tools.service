@@ -1,0 +1,22 @@
+[Unit]
+Description=Itamos MCP Tools sandbox server
+Documentation=https://github.com/itamos-technologia/itamos-mcp-tools
+After=network-online.target zfs-mount.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=itamos-mcp
+Group=itamos-mcp
+EnvironmentFile=/etc/itamos-mcp-tools/env
+WorkingDirectory=/var/lib/itamos-mcp-tools
+ExecStart=/usr/bin/node /opt/itamos-mcp-tools/server-sandbox.js
+Restart=on-failure
+RestartSec=5
+# 78 = configuration error (the ZFS slot check failed): retrying will not help.
+RestartPreventExitStatus=78
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

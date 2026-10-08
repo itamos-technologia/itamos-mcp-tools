@@ -1,0 +1,10 @@
+#!/bin/sh
+# Create the ZFS sandbox slots for the packaged server, owned by its user.
+# Usage: sudo itamos-mcp-create-slots <parent-dataset> [count] [quota]
+# Example: sudo itamos-mcp-create-slots tank/sandboxes 500 2G
+if [ -z "${1:-}" ]; then
+  echo "usage: sudo itamos-mcp-create-slots <parent-dataset> [count] [quota]" >&2
+  echo "example: sudo itamos-mcp-create-slots tank/sandboxes 500 2G" >&2
+  exit 1
+fi
+exec /opt/itamos-mcp-tools/scripts/create-slots.sh "$1" "${2:-500}" "${3:-2G}" itamos-mcp

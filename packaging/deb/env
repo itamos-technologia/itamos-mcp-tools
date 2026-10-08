@@ -1,0 +1,23 @@
+# Settings for the Itamos MCP Tools sandbox server.
+# Every setting is described in /opt/itamos-mcp-tools/README.md ("Settings").
+# After a change: sudo systemctl restart itamos-mcp-tools
+
+# Where the ZFS slot datasets are mounted (itamos-mcp-create-slots prints it).
+SANDBOX_ROOT=/tank/sandboxes
+SANDBOX_TOTAL_SLOTS=500
+SANDBOX_PORT=4200
+SANDBOX_TTL_MINUTES=10
+
+# Data written by the server and tools (the code itself is read-only).
+SANDBOX_DATA_DIR=/var/lib/itamos-mcp-tools
+MCP_DATA_DIR=/var/lib/itamos-mcp-tools
+MASTER_ARCHITECT_DB=/var/lib/itamos-mcp-tools/master-architect.db
+ITAMOS_COSTS_DB=/var/lib/itamos-mcp-tools/costs.db
+
+# On a public server, web_skeleton must not reach private or local addresses.
+WEB_SKELETON_PUBLIC_ONLY=1
+
+# Optional:
+#PUBLIC_BASE_URL=https://mcp.example.com
+#PUBLIC_MCP_URL=https://mcp.example.com/mcp
+#SANDBOX_SMTP_CREDENTIALS=/etc/itamos-mcp-tools/smtp.json
