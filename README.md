@@ -9,7 +9,7 @@
 
 Every LLM coding assistant faces the same wall: codebases are too large to fit in context. The standard response is to dump files — grep for something promising, cat it, hope for the best. At 50k files this breaks. At 240k files it never worked.
 
-We built five tools that give an LLM structured perception of a codebase instead of raw file access. The result is a model that navigates code the way a senior engineer does — starting from the architecture, narrowing to the module, reading only the segment it needs.
+We built four tools that give an LLM structured perception of a codebase instead of raw file access, plus a sandboxed git to bring code in. The result is a model that navigates code the way a senior engineer does — starting from the architecture, narrowing to the module, reading only the segment it needs.
 
 
 **Read the full paper:** [docs/PAPER.md](docs/PAPER.md): how each tool works, why it was designed that way, and how the hosted sandbox runs, with diagrams.
@@ -129,7 +129,7 @@ llama-server -m gemma-4-E4B-it-Q4_0.gguf -ngl 99 --port 8190 \
 
 **The router** (`router/llm-router.js`, service `itamos-llm-router`) listens on 8090 (summarizer) and 8091 (embedder). Before sending a request it counts its tokens with the backend's own tokenizer, sends it to a GPU whose pool has room (preferring faster GPUs by weight), and makes it wait in line when none has. A GPU that fails is skipped for 15 seconds and the request is retried on another. Configure it with `ROUTES` (in the package: `/etc/itamos-mcp-tools/router.env`); `GET /router/status` shows each GPU's pool, reserved tokens and queue.
 
-The embedder on 8091 serves other Itamos services; the five tools don't use embeddings yet.
+The embedder on 8091 serves other Itamos services; the tools don't use embeddings yet.
 
 ### Settings
 

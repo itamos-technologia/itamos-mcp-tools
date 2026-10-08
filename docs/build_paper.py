@@ -219,7 +219,7 @@ PAGES = [
         'page_title': 'Itamos MCP Tools: free live alpha sandbox for AI agents | Itamos Technologia',
         'desc': ('Structured code tools for AI agents: a project map, a segment editor and safe, '
                  'verified commits. How they work, why, and a free hosted sandbox to try them.'),
-        'lead': ('Five tools that let an AI agent see and change code the way an engineer does: a '
+        'lead': ('Four tools, plus a sandboxed git, that let an AI agent see and change code the way an engineer does: a '
                  'map of the project, named parts of every file, and checks before anything is '
                  'saved. Try them free in a private sandbox, with no account and nothing to install.'),
         'blocks': [
@@ -586,7 +586,7 @@ def svg_deps(key):
 
 
 def svg_hub():
-    """The clickable overview: client → server → five tools → your sandbox."""
+    """The clickable overview: client → server → four tools and git → your sandbox."""
     W = 400
     out = [f'<svg viewBox="0 0 {W} 494" role="img" aria-label="Itamos MCP: server, tools and sandbox. Select a part for details." class="dg dg-hub">',
            _markers('hub')]

@@ -1,6 +1,6 @@
 # Itamos MCP Tools
 
-*Five tools that let an AI agent see and change code the way an engineer does: a map of the project, named parts of every file, and checks before anything is saved. Try them free in a private sandbox, with no account and nothing to install.*
+*Four tools, plus a sandboxed git, that let an AI agent see and change code the way an engineer does: a map of the project, named parts of every file, and checks before anything is saved. Try them free in a private sandbox, with no account and nothing to install.*
 
 **Live alpha, free:** connect any MCP client to `https://mcp.itamos-technologia.com/mcp` (details at the end).
 
