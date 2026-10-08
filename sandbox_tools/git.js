@@ -49,7 +49,10 @@ export default {
           }
         }
 
-        const { stdout, stderr } = await execFileAsync('git', ['clone', '--depth=1', '--', url, dest], { timeout: 120000 });
+        // core.symlinks=false: symlinks in the repo are checked out as plain
+        // text files holding the link target, so a cloned repo can never plant
+        // a link that points out of the sandbox.
+        const { stdout, stderr } = await execFileAsync('git', ['-c', 'core.symlinks=false', 'clone', '--depth=1', '--', url, dest], { timeout: 120000 });
         const label = args.dir || '. (sandbox root)';
         return { content: [{ type: 'text', text: `Cloned into ${label}\n${stdout || stderr}` }] };
       }

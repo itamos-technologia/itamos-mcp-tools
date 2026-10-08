@@ -62,6 +62,10 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--
 h1{font-size:1.3rem;margin:0 0 8px}
 p,ul{color:var(--muted);margin:0 0 16px}
 ul{padding-left:20px}
+label{display:block;font-weight:600;margin:0 0 6px}
+input[type=email]{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);
+  background:transparent;color:var(--fg);font-size:1rem;margin:0 0 6px}
+.small{font-size:.85rem}
 .row{display:flex;flex-direction:row-reverse;gap:10px}
 button{flex:1;padding:12px;border-radius:10px;font-size:1rem;cursor:pointer}
 .go{background:var(--accent);color:#fff;border:0}
@@ -75,8 +79,13 @@ function shell(title, body) {
 }
 
 // The approve button comes first in the markup so that pressing Enter creates
-// the sandbox; row-reverse puts it on the right visually.
+// the sandbox; row-reverse puts it on the right visually. When all sandboxes
+// are in use, an optional email field offers a one-time "ready" notice.
 function consentHtml(clientName, requestId, ttlText, busyNote) {
+  const emailField = busyNote ? `
+  <label for="email">Email me when my sandbox is ready (optional)</label>
+  <input type="email" id="email" name="email" maxlength="254" autocomplete="email" placeholder="you@example.com">
+  <p class="small">Used for this one notice only. Kept in memory, never stored on disk, and deleted once sent (or after 24 hours).</p>` : '';
   return shell('Itamos MCP Sandbox', `
 <h1>Create your sandbox</h1>
 <p><strong>${esc(clientName)}</strong> wants to connect to an Itamos MCP sandbox.</p>
@@ -87,7 +96,7 @@ ${busyNote ? `<p><strong>${esc(busyNote)}</strong></p>\n` : ''}<ul>
   <li><strong>Demonstration service:</strong> don't put anything sensitive or confidential in the sandbox. It is built for trying the tools, not for private data.</li>
 </ul>
 <form method="post" action="/authorize">
-  <input type="hidden" name="request_id" value="${esc(requestId)}">
+  <input type="hidden" name="request_id" value="${esc(requestId)}">${emailField}
   <div class="row">
     <button class="go" name="decision" value="approve">Create my sandbox</button>
     <button class="no" name="decision" value="deny">Cancel</button>
@@ -124,6 +133,10 @@ export function mountOAuth(app, {
   // A login issued within this window also counts as active (it has not had
   // time to make its first tool call yet).
   activeWindowMs = 10 * 60 * 1000,
+  // onNotifyEmail(key, email, clientName): the user asked on the consent page
+  // to be emailed when their sandbox is ready. The address is passed on and
+  // not kept here.
+  onNotifyEmail = () => {},
   ttlText = '10 minutes of inactivity',
   clientIp = (req) => req.socket.remoteAddress || '',
 }) {
@@ -308,6 +321,12 @@ export function mountOAuth(app, {
       clientId: p.clientId, redirectUri: p.redirectUri, codeChallenge: p.codeChallenge,
       sandboxKey, expires: Date.now() + CODE_TTL_MS,
     });
+    // Optional "email me when ready" field. A malformed address is ignored:
+    // the login itself must never fail because of it.
+    const email = String(req.body?.email || '').trim();
+    if (email && email.length <= 254 && /^[^\s@<>()",;:\\]+@[^\s@<>()",;:\\]+\.[A-Za-z]{2,}$/.test(email)) {
+      onNotifyEmail(sandboxKey, email, store.clients[p.clientId]?.name || '');
+    }
     console.log(`[OAuth] ${chk.replace ? 'Resumed' : 'New'} sandbox identity ${sandboxKey.slice(0, 8)}… for "${store.clients[p.clientId]?.name}"`);
     redirectWith(res, p.redirectUri, { code, state: p.state });
   });

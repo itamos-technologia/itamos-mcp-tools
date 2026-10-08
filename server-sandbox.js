@@ -28,7 +28,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -96,6 +96,51 @@ const notices   = new Map();   // identity → one-time note shown with its next
 const expiredAt = new Map();   // identity → when its last sandbox expired
 const LOGIN_MAX_MS = 30 * 24 * 60 * 60 * 1000;   // refresh tokens last 30 days (oauth.js)
 
+// ── "Sandbox ready" email (optional, asked for on the consent page) ─────────
+// Sent once, when the sandbox is created from the queue. The address is kept
+// in memory only, never written to disk or logs, and deleted when the email is
+// sent or after 24 hours. The text is fixed: it never includes anything the
+// client chose (such as its registered name), so nobody can use it to put
+// their own words in an email from our address.
+const notifyEmails   = new Map();   // identity → { email, added }
+const NOTIFY_KEEP_MS = 24 * 60 * 60 * 1000;
+const MAIL_PER_HOUR  = 60;          // server-wide cap
+const mailTimes      = [];
+const MAIL_HELPER    = path.join(__dirname, 'notify_email.py');
+const READY_MAIL_BODY = [
+  'Your Itamos MCP sandbox is ready.',
+  '',
+  'Go back to the AI app you connected from and keep working: your next tool call uses it.',
+  `The sandbox is deleted after ${TTL_TEXT}, so use it soon. If it has expired by then, your next tool call starts a new one (through the queue if all sandboxes are in use).`,
+  '',
+  'You get this one-time message because you asked for it when connecting. Your email address has now been deleted from our server.',
+  '',
+  'Itamos Technologia',
+  'https://mcp.itamos-technologia.com',
+].join('\n');
+
+function sendReadyEmail(who) {
+  const n = notifyEmails.get(who);
+  if (!n) return;
+  notifyEmails.delete(who);
+  const now = Date.now();
+  while (mailTimes.length && now - mailTimes[0] > 60 * 60 * 1000) mailTimes.shift();
+  if (mailTimes.length >= MAIL_PER_HOUR) {
+    console.warn(`[Mail] Hourly cap reached; ready email for ${label(who)} not sent`);
+    return;
+  }
+  mailTimes.push(now);
+  const child = spawn('python3', [MAIL_HELPER], { stdio: ['pipe', 'ignore', 'pipe'], timeout: 60000 });
+  let err = '';
+  child.stderr.on('data', (d) => { err += d; });
+  child.on('error', (e) => console.warn(`[Mail] Could not start sender: ${e.message}`));
+  child.on('close', (code) => {
+    if (code === 0) console.log(`[Mail] Ready email sent for ${label(who)}`);
+    else console.warn(`[Mail] Ready email for ${label(who)} failed: ${err.trim() || `exit ${code}`}`);
+  });
+  child.stdin.end(JSON.stringify({ to: n.email, subject: 'Your Itamos MCP sandbox is ready', body: READY_MAIL_BODY }));
+}
+
 function giveSlot(who, n) {
   sessions.set(who, { slot: n, lastActive: Date.now() });
   slotToIp.set(slotName(n), who);
@@ -116,6 +161,7 @@ function drainQueue() {
     const note = notices.get(who);
     notices.set(who, `Your sandbox is ready (you waited in the queue).${note ? ` ${note}` : ''}`);
     console.log(`[Queue] ${label(who)} left the queue after ${Math.round((Date.now() - joined) / 1000)}s`);
+    sendReadyEmail(who);
   }
 }
 
@@ -189,6 +235,8 @@ async function cleanupExpired() {
   }
   if (releases.length > 1000) releases.splice(0, releases.length - 1000);
   for (const [who, t] of expiredAt) if (now - t > LOGIN_MAX_MS) expiredAt.delete(who);
+  // Email addresses never used within 24 hours are deleted.
+  for (const [who, n] of notifyEmails) if (now - n.added > NOTIFY_KEEP_MS) notifyEmails.delete(who);
   // Freed slots go to the front of the queue right away.
   drainQueue();
 }
@@ -200,10 +248,22 @@ setInterval(cleanupExpired, 60 * 1000);
 // ═══════════════════════════════════════════════════════════════════════════
 
 function jailPath(sandboxDir, requestedPath) {
+  const deny = () => { throw new Error('Access denied — path outside sandbox'); };
   const resolved = path.resolve(sandboxDir, requestedPath);
-  if (!resolved.startsWith(sandboxDir + path.sep) && resolved !== sandboxDir) {
-    throw new Error('Access denied — path outside sandbox');
+  if (!resolved.startsWith(sandboxDir + path.sep) && resolved !== sandboxDir) deny();
+  // The text check alone is not enough: a symlink inside the sandbox (e.g. from
+  // a cloned repo) can point anywhere. Find the deepest part of the path that
+  // exists (lstat, so a dangling link still counts as existing) and check where
+  // it really lives. A link that cannot be resolved is refused.
+  let probe = resolved;
+  for (;;) {
+    try { fs.lstatSync(probe); break; }
+    catch { const up = path.dirname(probe); if (up === probe) deny(); probe = up; }
   }
+  let real, rootReal;
+  try { real = fs.realpathSync(probe); rootReal = fs.realpathSync(sandboxDir); }
+  catch { deny(); }
+  if (real !== rootReal && !real.startsWith(rootReal + path.sep)) deny();
   return resolved;
 }
 
@@ -330,6 +390,8 @@ const oauth = mountOAuth(app, {
   // holds a sandbox or a queue place (oauth.js adds recent logins).
   isActive: (key) => sessions.has(`key:${key}`) || waitQueue.has(`key:${key}`),
   activeWindowMs: INACTIVE_TTL,
+  // Optional "email me when ready" (in memory only; see sendReadyEmail).
+  onNotifyEmail: (key, email) => notifyEmails.set(`key:${key}`, { email, added: Date.now() }),
   ttlText: TTL_TEXT,
   clientIp,
 });

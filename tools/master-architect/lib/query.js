@@ -15,6 +15,21 @@ import path from 'path';
 import { getDb } from './db.js';
 import { detectLanguage, getParser } from './registry.js';
 
+// Sandbox containment. In the public sandbox (__sandboxCtx present) every file
+// the architect reads or indexes must really live inside the caller's slot,
+// symlinks resolved; otherwise a file's imports could pull host files into the
+// index. Outside the sandbox (private server) this always returns false.
+function outsideSandbox(p) {
+  if (!globalThis.__sandboxCtx) return false;
+  const slot = globalThis.__sandboxCtx.getStore?.()?.slotDir;
+  if (!slot) return true;
+  let real, rootReal;
+  try { rootReal = fs.realpathSync(slot); } catch { return true; }
+  try { real = fs.realpathSync(p); } catch { real = path.resolve(p); }
+  return real !== rootReal && !real.startsWith(rootReal + path.sep);
+}
+
+
 // ─── getProjectForFile ───────────────────────────────────────────────────
 //
 // The auto-prompt trigger. Called by read_file on every file open.
@@ -94,6 +109,10 @@ export function getProjectForFile(absPath) {
 export async function associateFile(filePath, projectId) {
   const db = getDb();
   const absPath = path.resolve(filePath);
+
+  if (outsideSandbox(absPath)) {
+    return { ok: false, error: 'Access denied — path outside sandbox' };
+  }
 
   if (!fs.existsSync(absPath) || !fs.statSync(absPath).isFile()) {
     return { ok: false, error: `Not a file: ${absPath}` };
@@ -300,6 +319,10 @@ export async function discoverProject(seedAbsPath, opts = {}) {
   const maxDepth = opts.maxDepth ?? 5;
   seedAbsPath = path.resolve(seedAbsPath);
 
+  if (outsideSandbox(seedAbsPath)) {
+    return { ok: false, error: 'Access denied — path outside sandbox' };
+  }
+
   if (!fs.existsSync(seedAbsPath) || !fs.statSync(seedAbsPath).isFile()) {
     return { ok: false, error: `Not a file: ${seedAbsPath}` };
   }
@@ -317,6 +340,8 @@ export async function discoverProject(seedAbsPath, opts = {}) {
     const { absPath, depth } = queue.shift();
     if (visited.has(absPath)) continue;
     visited.add(absPath);
+    // Sandbox: an import that leads outside the slot is not followed or recorded.
+    if (outsideSandbox(absPath)) continue;
 
     const det = detectLanguage(absPath);
     if (det.kind !== 'supported') {
@@ -429,6 +454,12 @@ export async function registerDiscoveredProject(seedPath, projectName, opts = {}
   const rootPath = opts.rootPath
     ? path.resolve(opts.rootPath)
     : discovery.likely_project_root;
+
+  // Sandbox: a caller-supplied root (master_architect register's absolute
+  // address) must stay inside the slot too.
+  if (outsideSandbox(rootPath)) {
+    return { ok: false, error: 'Access denied — project root outside sandbox' };
+  }
 
   // Check root collision: does any existing project's root contain this seed,
   // or does this root contain any existing project?
