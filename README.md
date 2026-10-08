@@ -88,6 +88,8 @@ npm install
 
 One `npm install` sets up everything, including the tools folder.
 
+**On Ubuntu 26.04** you can install the package from [Releases](https://github.com/itamos-technologia/itamos-mcp-tools/releases) instead: `sudo apt install ./itamos-mcp-tools_1.1.0_all.deb`. It sets up a service user, a systemd service, settings in `/etc/itamos-mcp-tools/env` and the command `itamos-mcp-create-slots`, then tells you the next two steps.
+
 ### Create the sandbox slots
 
 ```sh
