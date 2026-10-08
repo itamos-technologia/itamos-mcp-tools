@@ -28,7 +28,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { execFile, spawn } from 'child_process';
+import { execFile, execFileSync, spawn } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -473,6 +473,44 @@ app.get('/health', (req, res) => {
     queue: waitQueue.size,
   });
 });
+
+// ── ZFS requirement ─────────────────────────────────────────────────────────
+// Every slot must be its own ZFS dataset with a hard size limit (quota) and
+// compression. A plain folder has neither, so one user could fill the disk for
+// everyone. Checked once at startup, before any slot is touched; the server
+// refuses to start otherwise. Create the slots with scripts/create-slots.sh.
+function verifyZfsSlots() {
+  let rows;
+  try {
+    rows = execFileSync('zfs', ['list', '-H', '-p', '-t', 'filesystem', '-o', 'mountpoint,quota,compression'],
+      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  } catch (e) {
+    return [`cannot run "zfs list" (${e.code || e.message.split('\n')[0]}): is ZFS installed?`];
+  }
+  const byMount = new Map();
+  for (const line of rows.split('\n')) {
+    const [mount, quota, compression] = line.split('\t');
+    if (mount) byMount.set(mount, { quota: Number(quota) || 0, compression });
+  }
+  const problems = [];
+  for (let i = 1; i <= TOTAL_SLOTS && problems.length < 5; i++) {
+    const p = slotPath(i);
+    const ds = byMount.get(p);
+    if (!ds) problems.push(`${p} is not a ZFS dataset`);
+    else if (!ds.quota) problems.push(`${p} has no quota`);
+    else if (!ds.compression || ds.compression === 'off') problems.push(`${p} has compression off`);
+  }
+  return problems;
+}
+{
+  const problems = verifyZfsSlots();
+  if (problems.length) {
+    console.error('[Pool] ZFS check failed: every slot must be a ZFS dataset with a quota and compression.\n  - '
+      + problems.join('\n  - ') + '\nCreate the slots with scripts/create-slots.sh, then start again.');
+    process.exit(1);
+  }
+  console.log(`[Pool] ZFS check passed: ${TOTAL_SLOTS} slots are datasets with a quota and compression`);
+}
 
 // Sessions live only in memory, so after a restart no slot belongs to anyone.
 // Wipe every non-empty slot at startup; otherwise the next user handed a slot

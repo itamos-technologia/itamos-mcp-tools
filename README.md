@@ -70,6 +70,60 @@ Hosted sandbox (free live alpha): add `https://mcp.itamos-technologia.com/mcp` a
 
 ---
 
+## Self-hosting
+
+### Requirements
+
+- **Linux with ZFS (required).** Every sandbox is its own ZFS dataset with a hard size limit (quota) and compression, so no user can fill the disk for everyone else. The server checks this at startup and refuses to start without it.
+- **Node.js 20 or newer**, plus build tools for the native modules (Debian/Ubuntu: `apt install build-essential python3`).
+- **git** for the git tool, and **Chrome or Chromium** for web_skeleton.
+
+### Install
+
+```sh
+git clone https://github.com/itamos-technologia/itamos-mcp-tools.git
+cd itamos-mcp-tools
+npm install
+```
+
+One `npm install` sets up everything, including the tools folder.
+
+### Create the sandbox slots
+
+```sh
+sudo scripts/create-slots.sh tank/sandboxes 500 2G $USER
+```
+
+This creates `slot_001` to `slot_500` under the ZFS dataset `tank/sandboxes` (use your own pool name), each with a 2 GB quota and lz4 compression, owned by the user the server runs as. It is safe to run again.
+
+### Start
+
+```sh
+SANDBOX_ROOT=/tank/sandboxes SANDBOX_TOTAL_SLOTS=500 npm start
+```
+
+From the same machine, add `http://localhost:4200/mcp` as a connector in your MCP client. Local connections are identified by IP address and need no sign-in.
+
+### Going public
+
+**Firewall port 4200** and put an HTTPS reverse proxy (for example nginx) in front of it that sets `X-Forwarded-For` and `X-Forwarded-Proto`. Requests that arrive through the proxy use the anonymous one-click sign-in, so users on shared addresses (such as claude.ai) each get their own sandbox. Direct connections to port 4200 skip the sign-in, which is why the port must not be reachable from outside.
+
+### Settings
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SANDBOX_ROOT` | `/fast/sandboxes` | Folder holding the slot datasets |
+| `SANDBOX_TOTAL_SLOTS` | `500` | Number of slots |
+| `SANDBOX_PORT` | `4200` | Port the server listens on |
+| `SANDBOX_TTL_MINUTES` | `10` | Idle minutes before a sandbox is emptied |
+| `SANDBOX_DATA_DIR` | `./data` | Where sign-in data is kept (hashed) |
+| `PUBLIC_BASE_URL`, `PUBLIC_MCP_URL` | from the proxy headers | Public addresses, if the proxy can't supply them |
+| `WEB_SKELETON_PUBLIC_ONLY` | off | Set to `1` on a public server: web_skeleton then refuses private and local addresses |
+| `SANDBOX_SMTP_CREDENTIALS` | a path on the Itamos server | JSON file (`email`, `app_password`, `smtp_server`, `smtp_port`) for the optional "your sandbox is ready" email. Without it the email is not sent and the server logs why. |
+| `ITAMOS_COSTS_DB` | a path on the Itamos server | SQLite file for token-savings statistics. If it can't be written, statistics are skipped. |
+
+---
+
 ## License
 
 Dual licensed. Free under **AGPL-3.0**: use, modify and share, with source published for modified versions, including network use. Building it into a closed product? A **commercial licence** removes the AGPL obligations. Contact info@itamos-technologia.com.
