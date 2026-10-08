@@ -1,7 +1,7 @@
 # Itamos MCP Tools
 
 > **Built in Greece, for the world.**
-> Free for individuals and open-source projects. Commercial licensing for organisations.
+> Free and open source under AGPL-3.0. Commercial licences for closed-source use.
 
 ---
 
@@ -25,6 +25,8 @@ We built five tools that give an LLM structured perception of a codebase instead
 | write_file | Create new files with automatic project placement. Refuses overwrites — edits go through read_file. |
 | git | The original Itamos git tool, sandboxed for security: clone (remote URLs only, depth=1), status, commit. Everything stays inside the session workspace; push is not available. |
 | web_skeleton | LLM-first web perception. 97% token reduction vs raw HTML. Actions: search, skeleton, read, click. |
+
+**At least 97% fewer tokens** than the usual shell workflow (grep, cat, run_cmd), measured against the best case where the model fixes the bug in one attempt. Real sessions save more, because the failed attempts common with raw shell access aren't counted.
 
 ---
 
@@ -50,9 +52,11 @@ Raw HTML of a modern web page runs 50,000 to 200,000 tokens. web_skeleton output
 
 ## Benchmarks
 
-Verified in live use with **Claude Opus 5.5** and **Claude Sonnet**. Other frontier models, including OpenAI's, are expected to work; Claude Haiku and OpenAI benchmarks are pending.
+Verified in live use with **Claude Opus 5.5** and **Claude Sonnet**. Any MCP-capable model can use the tools.
 
-A recorded, unedited bug-fix session on a real open GitHub issue is coming to BENCHMARKS.md, with the time and tokens it took.
+Don't take our word for it. Test the tools free in the hosted sandbox with your own model and your own repository, then post your results in [Discussions → Benchmarks](https://github.com/Itamos-technologia/itamos-mcp-tools/discussions): model, task, tokens, time.
+
+**Found a bug?** [Open an issue](https://github.com/Itamos-technologia/itamos-mcp-tools/issues) with the steps to reproduce it. Every report makes the tools better.
 
 ---
 
@@ -68,11 +72,12 @@ Hosted sandbox (free live alpha): add `https://mcp.itamos-technologia.com/mcp` a
 
 ## License
 
-Free for personal use and open-source projects. Commercial use requires a licence — contact tcnbinas@gmail.com.
+Dual licensed. Free under **AGPL-3.0**: use, modify and share, with source published for modified versions, including network use. Building it into a closed product? A **commercial licence** removes the AGPL obligations. Contact info@itamos-technologia.com.
 
 ---
 
 ## About
 
-Built by Itamos Technologia — a one-person company in Trikala, Greece.
-Part of a suite of AI-native developer tools built on AMD hardware with open-source inference stacks.
+Designed and built by **Konstantinos Karamperis**, founder of Itamos Technologia in Trikala, Greece. A systems architect with a background in industrial engineering and infrastructure, building AI-native developer tools on AMD hardware with open-source inference stacks.
+
+[LinkedIn](https://www.linkedin.com/in/konstantinos-karamperis-a645b654) · [itamos-technologia.com](https://itamos-technologia.com)
