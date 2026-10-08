@@ -25,3 +25,6 @@ data/
 # node_modules symlinks to the shared install (git sees symlinks as files)
 mcp_tools/node_modules
 tools/node_modules
+
+# Python bytecode
+__pycache__/

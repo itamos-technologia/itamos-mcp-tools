@@ -5,10 +5,13 @@
   "description": "Itamos public MCP sandbox server",
   "main": "server-sandbox.js",
   "scripts": {
-    "start": "node server-sandbox.js"
+    "start": "node server-sandbox.js",
+    "postinstall": "npm --prefix tools/master-architect install"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "*",
-    "express": "*"
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "better-sqlite3": "^12.9.0",
+    "express": "^5.2.1",
+    "zod": "^4.6.5"
   }
 }
