@@ -932,6 +932,35 @@ async function segmentPlainText(content, language, aiTitle) {
   }
   flushChunk();
 
+  // Cover every byte, same rule as walkSegments: each space between
+  // segments becomes its own 'whitespace' segment (hidden in skeletons), so
+  // joining all segments gives back the exact original content on commit.
+  {
+    const filled = [];
+    let pos = 0;
+    const pushGap = (from, to) => {
+      if (from >= to) return;
+      const blank = /^\s*$/.test(content.slice(from, to));
+      filled.push({
+        id: freshId(),
+        kind: blank ? 'whitespace' : 'gap',
+        name: blank ? '(blank)' : '(gap)',
+        startByte: from,
+        endByte: to,
+        startLine: byteToLine(content, from),
+        endLine: byteToLine(content, to - 1),
+      });
+    };
+    for (const seg of segments) {
+      pushGap(pos, seg.startByte);
+      filled.push(seg);
+      pos = seg.endByte;
+    }
+    pushGap(pos, content.length);
+    segments.length = 0;
+    segments.push(...filled);
+  }
+
   // AI-title paragraphs that have no detected heading (optional, injected)
   if (typeof aiTitle === 'function') {
     await aiTitle(segments, content);
