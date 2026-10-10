@@ -464,6 +464,26 @@ app.post('/mcp', async (req, res) => {
   }
 });
 
+// The server is stateless and offers no GET stream, so GET and DELETE on /mcp
+// answer 405 as the MCP spec asks (not 404), telling clients the endpoint is
+// here and takes POST only.
+app.all('/mcp', (req, res) => {
+  res.set('Allow', 'POST');
+  res.status(405).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Method not allowed. This MCP endpoint accepts POST only.' },
+    id: null,
+  });
+});
+
+// ── Glama ownership file ────────────────────────────────────────────────────
+// Glama reads this to link the hosted server to its maintainers' accounts.
+const GLAMA_MAINTAINERS = (process.env.GLAMA_MAINTAINERS || 'itamos-technologia')
+  .split(',').map(s => s.trim()).filter(Boolean);
+app.get('/.well-known/glama.json', (req, res) => {
+  res.json({ $schema: 'https://glama.ai/mcp/schemas/server.json', maintainers: GLAMA_MAINTAINERS });
+});
+
 // ── Health ──────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
