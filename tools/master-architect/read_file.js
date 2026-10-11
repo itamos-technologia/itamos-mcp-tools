@@ -72,7 +72,7 @@ import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { checkImportsInContent } from './lib/import_check.js';
 import { listProjectsView, resolveProjectTarget, projectStructure, resolveCoordinate,
-         projectDataFlow, scanForView } from './lib/project_view.js';
+         projectDataFlow, scanForView, needsLetterRescan } from './lib/project_view.js';
 import { reindexFile } from './lib/scan.js';
 import { matchProjectRoot } from './lib/editor/architect-link.js';
 import { getProjectInfoForFile, markFileVerified, markFileUnverified, checkAndHandleDrift, checkImportResolution, discoverAndFileByLinks, storeFileContent, getStoredSkeleton, refreshFileModules, updateExternalSpecs } from './lib/editor/architect-link.js';
@@ -2618,6 +2618,11 @@ export default {
           return wrap({ scanned_now: true, ...view(again.project, again.subRel) });
         }
         const { project } = target;
+        // Scanned before letter coordinates (files were numbered)? Rescan once.
+        if (needsLetterRescan(project)) {
+          const s = await scanForView(project.root_path, _ctx?.touch);
+          if (!s.scanned) return wrap({ ...s, note: 'Updating this project to letter coordinates (one-time rescan).' });
+        }
         const wantsTrace = args.trace !== undefined && args.trace !== false && args.trace !== 'false';
         if (args.segment === undefined) {
           return wrap(wantsTrace ? projectDataFlow(project) : view(project, target.subRel));

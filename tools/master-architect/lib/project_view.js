@@ -113,7 +113,7 @@ export function projectStructure(project, { search = null, full = false, subRel 
     entries = [...dirHits, ...hits];
   }
 
-  // Tree order: a folder's files first, then each subfolder with its contents.
+  // Tree order: each subfolder with its contents, then the folder's files.
   const parentOf = (rel) => (rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
   const kids = new Map();   // parent rel → entries
   for (const e of entries) {
@@ -128,8 +128,10 @@ export function projectStructure(project, { search = null, full = false, subRel 
     const list = (kids.get(parentRel) || []).slice();
     const fls = list.filter(e => !e.dir).sort((a, b) => natural(a.addr, b.addr) || (a.rel < b.rel ? -1 : 1));
     const dirsHere = list.filter(e => e.dir).sort((a, b) => natural(a.addr, b.addr));
-    ordered.push(...fls);
+    // Subfolders first: they hold a folder's first letters (files continue
+    // the same counter), so coordinates read in order top to bottom.
     for (const d of dirsHere) { ordered.push(d); emit(d.rel); }
+    ordered.push(...fls);
   };
   emit(subRel || '');
   // Entries whose parent folder isn't listed (e.g. files of an unscanned
@@ -174,6 +176,13 @@ export function projectStructure(project, { search = null, full = false, subRel 
     next: `Narrow it: read_file(path="${project.name}", search="<part of a file or folder name>"), `
       + `or a folder: read_file(path="<folder>"). full_skeleton=true forces the whole list.`,
   };
+}
+
+// Files addressed by number come from scans before letter coordinates.
+export function needsLetterRescan(project) {
+  return !!getDb().prepare(`
+    SELECT 1 FROM files WHERE project_id = ? AND present_on_disk = 1
+      AND address != 'pending' AND address GLOB '*[0-9]' LIMIT 1`).get(project.id);
 }
 
 // ── Coordinates ─────────────────────────────────────────────────────────────

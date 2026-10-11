@@ -66,7 +66,7 @@ export async function reindexFile(absPath, content) {
   const db = getDb();
   absPath = path.resolve(absPath);
   const findRow = db.prepare(`
-    SELECT f.id, f.project_id, f.address, p.root_path
+    SELECT f.id, f.project_id, f.address, f.rel_path, p.root_path
     FROM files f JOIN projects p ON p.id = f.project_id
     WHERE f.abs_path = ?`);
   let row = findRow.get(absPath);
@@ -85,6 +85,17 @@ export async function reindexFile(absPath, content) {
     row = findRow.get(absPath);
   }
   const rootPath = row.root_path.startsWith('unknown://') ? path.dirname(absPath) : row.root_path;
+
+  // A file created by write_file (or found later) has no coordinate yet:
+  // give it the next free letter in its folder, creating folder rows as needed.
+  if ((!row.address || row.address === 'pending') && !row.root_path.startsWith('unknown://')) {
+    const relDir = row.rel_path && row.rel_path.includes('/') ? row.rel_path.slice(0, row.rel_path.lastIndexOf('/')) : '';
+    const dir = ensureDirRow(db, row.project_id, relDir);
+    const letter = nextChildLetter(db, row.project_id, dir.address);
+    const address = dir.address ? `${dir.address}.${letter}` : letter;
+    db.prepare('UPDATE files SET address = ?, directory_id = ? WHERE id = ?').run(address, dir.id, row.id);
+    row = { ...row, address };
+  }
 
   const detection = detectLanguage(absPath);
   const cls = classifyForDb(detection);
@@ -261,6 +272,45 @@ export function listActiveScans(userId) {
 }
 
 // ─── Address helpers ─────────────────────────────────────────────────────
+
+// Inverse of letterFor: 'a' → 0, 'z' → 25, 'aa' → 26.
+function letterIndex(s) {
+  let n = 0;
+  for (const ch of s) n = n * 26 + (ch.charCodeAt(0) - 96);
+  return n - 1;
+}
+
+// Next free letter among a folder's children (subfolders + files share it).
+function nextChildLetter(db, projectId, parentAddr) {
+  const rows = [
+    ...db.prepare('SELECT address FROM directories WHERE project_id = ?').all(projectId),
+    ...db.prepare("SELECT address FROM files WHERE project_id = ? AND address != 'pending'").all(projectId),
+  ];
+  let max = -1;
+  for (const { address } of rows) {
+    if (!address) continue;
+    let rest;
+    if (parentAddr === '') rest = address;
+    else if (address.startsWith(parentAddr + '.')) rest = address.slice(parentAddr.length + 1);
+    else continue;
+    if (/^[a-z]+$/.test(rest)) max = Math.max(max, letterIndex(rest));
+  }
+  return letterFor(max + 1);
+}
+
+// Folder row (and coordinate) for relDir, creating missing folders down from the root.
+function ensureDirRow(db, projectId, relDir) {
+  if (!relDir) return { id: null, address: '' };
+  const hit = db.prepare('SELECT id, address FROM directories WHERE project_id = ? AND rel_path = ?').get(projectId, relDir);
+  if (hit) return hit;
+  const parentRel = relDir.includes('/') ? relDir.slice(0, relDir.lastIndexOf('/')) : '';
+  const parent = ensureDirRow(db, projectId, parentRel);
+  const letter = nextChildLetter(db, projectId, parent.address);
+  const address = parent.address ? `${parent.address}.${letter}` : letter;
+  const r = db.prepare('INSERT INTO directories (project_id, parent_id, address, name, rel_path) VALUES (?, ?, ?, ?, ?)')
+    .run(projectId, parent.id, address, path.basename(relDir), relDir);
+  return { id: r.lastInsertRowid, address };
+}
 
 function letterFor(n) {
   let s = '';
@@ -567,12 +617,13 @@ export async function scanProject(rootPath, projectName, opts = {}) {
       if (!cls) { summary.files_skipped += 1; continue; }
 
       const dirAddr = dirAddressByRelPath.get(f.dirRelPath) ?? '';
-      // ALL files (supported AND opaque) get NUMBER addresses now — the
-      // letter namespace belongs exclusively to directories, so files and
-      // dirs can never share an address. Single counter per directory.
-      const nextNum = (fileCountersByDir.get(f.dirRelPath) ?? 0) + 1;
-      fileCountersByDir.set(f.dirRelPath, nextNum);
-      const fileAddr = dirAddr === '' ? String(nextNum) : `${dirAddr}.${nextNum}`;
+      // Coordinates: letters name LOCATION (folders and files), numbers only
+      // ever mean "inside a file" (segments). A folder's files continue the
+      // same letter counter after its subfolders, so the two never collide:
+      // a folder with 2 subfolders and 3 files reads  a/ b/ c d e.
+      const idx = dirChildCounters.get(f.dirRelPath) ?? 0;
+      dirChildCounters.set(f.dirRelPath, idx + 1);
+      const fileAddr = dirAddr === '' ? letterFor(idx) : `${dirAddr}.${letterFor(idx)}`;
 
       const stat = statSafe(f.absPath);
       const byteSize = stat?.size ?? 0;
