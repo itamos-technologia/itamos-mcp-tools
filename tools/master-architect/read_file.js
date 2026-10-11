@@ -1297,6 +1297,50 @@ function bufferStateHash(buffer) {
 // OPERATIONS
 // =============================================================================
 
+// ── Compact skeleton: one line per segment ──────────────────────────────────
+// "<address>  <kind> <name>  (<from>-<to>)". Containers (classes, groups, objects
+// holding functions) list their members; other bodies collapse to "[N parts]",
+// still readable by address. Runs of imports collapse into one range line.
+// Whitespace/gaps are not listed (their numbers are skipped).
+const SEG_HIDDEN = new Set(['whitespace', 'gap']);
+const SEG_DEF = /(function|method|class|interface|struct|impl|trait|enum|module|namespace|section_group|decorated|constructor)/;
+function segLabel(s) {
+  const kind = String(s.kind || 'segment')
+    .replace(/_(definition|declaration|statement|item|specifier)$/, '').replace(/_/g, ' ');
+  const nm = s.name && !/^\(.*\)$/.test(s.name) && s.name !== '<gap>' ? s.name : '';
+  return nm ? `${kind} ${nm}` : kind;
+}
+function hasDefChildren(s) {
+  return (s.children || []).some(c => SEG_DEF.test(c.kind || ''));
+}
+function compactSkeleton(segments, prefix = '') {
+  const out = [];
+  let run = null;   // consecutive imports at this level
+  const flush = () => {
+    if (!run) return;
+    out.push(run.count === 1
+      ? `${run.first}  ${run.label}  (${run.from}-${run.to})`
+      : `${run.first}–${run.last}  ${run.count} imports  (lines ${run.from}-${run.to})`);
+    run = null;
+  };
+  segments.forEach((s, i) => {
+    const addr = prefix ? `${prefix}.${i + 1}` : `${i + 1}`;
+    if (SEG_HIDDEN.has(s.kind)) return;
+    if (/import|use_declaration|preproc_include|require/.test(s.kind || '')) {
+      if (!run) run = { first: addr, last: addr, count: 0, label: segLabel(s), from: s.startLine, to: s.endLine };
+      run.last = addr; run.count += 1; run.to = s.endLine;
+      return;
+    }
+    flush();
+    const kids = (s.children || []).filter(c => !SEG_HIDDEN.has(c.kind));
+    const expand = kids.length > 0 && hasDefChildren(s);
+    out.push(`${addr}  ${segLabel(s)}  (${s.startLine}-${s.endLine})${kids.length && !expand ? `  [${kids.length} part${kids.length === 1 ? '' : 's'}]` : ''}`);
+    if (expand) out.push(...compactSkeleton(s.children, addr));
+  });
+  flush();
+  return out;
+}
+
 function segmentToSummary(seg) {
   const HIDDEN_KINDS = new Set(['whitespace', 'gap']);
   let children;
@@ -1336,8 +1380,10 @@ async function opSkeleton(buffer, { noLog = false, search = null, fullSkeleton =
   // segment names (returning only matching containers of 10) or return a prompt
   // asking for one. Keyword match is instant and zero-GPU — the segment names
   // already exist from the parse.
-  const _projTokens = Math.ceil(JSON.stringify(visibleSegments).length / 4);
-  if (!fullSkeleton && _projTokens > SKELETON_TOKEN_THRESHOLD) {
+  const _compact = compactSkeleton(buffer.segments);
+  const _projTokens = Math.ceil(JSON.stringify(_compact).length / 4);
+  // search works on any file; the size rule only decides when to ASK for one.
+  if (search || (!fullSkeleton && _projTokens > SKELETON_TOKEN_THRESHOLD)) {
     if (search) {
       const q = String(search).toLowerCase();
       // Walk the WHOLE tree tracking the STABLE dotted address (1-based index
@@ -1356,13 +1402,7 @@ async function opSkeleton(buffer, { noLog = false, search = null, fullSkeleton =
             const nm = seg.name ? String(seg.name).toLowerCase() : '';
             const kd = seg.kind ? String(seg.kind).toLowerCase() : '';
             if (nm.includes(q) || kd.includes(q)) {
-              hits.push({
-                pos: visPos,
-                address: addr,
-                name: seg.name,
-                kind: seg.kind,
-                lines: (seg.startLine != null && seg.endLine != null) ? `${seg.startLine}-${seg.endLine}` : undefined,
-              });
+              hits.push(`${addr}  ${segLabel(seg)}  (${seg.startLine}-${seg.endLine})`);
             }
             visPos++;
           }
@@ -1370,28 +1410,14 @@ async function opSkeleton(buffer, { noLog = false, search = null, fullSkeleton =
         });
       };
       walk(buffer.segments, '');
-      // group hits into containers of 10 by visible pre-order position // 10
-      const containers = {};
-      for (const h of hits) {
-        const c = Math.floor(h.pos / 10);
-        (containers[c] = containers[c] || []).push({ address: h.address, name: h.name, kind: h.kind, lines: h.lines });
-      }
-      const grouped = Object.keys(containers).sort((a, b) => a - b).map(c => ({
-        container: Number(c),
-        matches: containers[c],
-      }));
       const out = {
         path: buffer.path,
         language: buffer.language,
         search,
-        too_large: true,
-        skeleton_tokens: _projTokens,
-        total_segments: buffer.segments.length,
-        match_count: hits.length,
-        containers: grouped,
-        hint: hits.length
-          ? 'Matching segments grouped in 10s. Read one with segment="<address>" (the dotted address shown), or pass full_skeleton:true for the entire map.'
-          : 'No segment names matched. Try another term, or pass full_skeleton:true to load the full skeleton.',
+        matches: hits,
+        next: hits.length
+          ? 'Read one: segment="<address>" with this file\'s path, or from the project: segment="<file coordinate>.<address>". full_skeleton=true shows the whole file map.'
+          : 'No segment names matched. Try another word, or full_skeleton=true for the whole map.',
       };
       if (!noLog) { try { const _r=Math.ceil(total.length/4), _a=Math.ceil(JSON.stringify(out).length/4); logCost("read_file", _r, _a); } catch{} }
       return out;
@@ -1403,7 +1429,7 @@ async function opSkeleton(buffer, { noLog = false, search = null, fullSkeleton =
       too_large: true,
       skeleton_tokens: _projTokens,
       total_segments: buffer.segments.length,
-      message: `This file's skeleton is ~${_projTokens} tokens (${buffer.segments.length} segments). Provide a search string to navigate to the relevant segments (keyword over segment names), or pass full_skeleton:true to load the entire skeleton.`,
+      message: `This file's map is ~${_projTokens} tokens (${_compact.length} lines). Pass search="<part of a function/class name>" to find segments, or full_skeleton=true for the whole map.`,
     };
     if (!noLog) { try { const _r=Math.ceil(total.length/4), _a=Math.ceil(JSON.stringify(prompt).length/4); logCost("read_file", _r, _a); } catch{} }
     return prompt;
@@ -1416,15 +1442,9 @@ async function opSkeleton(buffer, { noLog = false, search = null, fullSkeleton =
     // Truth hygiene: parse status is the architect's verdict, valid only for the
     // state it last checked. With pending edits the buffer is unverified — report
     // null ("unknown until verify"), never a stale claim from the pre-edit state.
-    parse_errors: buffer.editStack.length > 0 ? null : buffer.hasParseErrors,
-    dirty: buffer.isDirty(),
-    edits_pending: buffer.editStack.length,
-    total_segments: buffer.segments.length,
-    hidden_segments: buffer.segments.length - visibleSegments.length,
-    verify_token: buffer.verifyToken
-      ? { level: buffer.verifyToken.level, at: buffer.verifyToken.timestamp }
-      : null,
-    segments: visibleSegments,
+    ...(buffer.editStack.length === 0 && buffer.hasParseErrors ? { parse_errors: true } : {}),
+    ...(buffer.isDirty() ? { unsaved_edit: true } : {}),
+    segments: _compact,
   };
     if (result.lines <= SMALL_FILE_THRESHOLD) result.full_content = total;
 
@@ -1490,15 +1510,26 @@ async function opSkeleton(buffer, { noLog = false, search = null, fullSkeleton =
           console.error(`[read_file] link-discovery error: ${de.message}`);
         }
       }
-      result.project = projectInfo;
+      // Compact tag: which project and where this file sits in it. Internals
+      // (status, numeric id, root path) stay out; warnings stay in.
+      result.project = projectInfo.project_name
+        ? {
+            name: projectInfo.project_name,
+            ...(projectInfo.file_address && projectInfo.file_address !== 'pending' ? { coordinate: projectInfo.file_address } : {}),
+            ...(projectInfo.integrity_warnings ? { integrity_warnings: projectInfo.integrity_warnings } : {}),
+            ...(projectInfo.drift_detected ? { drift_hint: projectInfo.drift_hint } : {}),
+            hint: projectInfo.hint,
+          }
+        : { hint: projectInfo.hint };
     }
   } catch (err) {
     console.error(`[read_file] architect-link error: ${err.message}`);
   }
 
+  delete result.store_check;   // internal consistency probe: logged, not shown
   if (!noLog) { try { const _r=Math.ceil(total.length/4), _a=Math.ceil(JSON.stringify(result).length/4); logCost("read_file", _r, _a); } catch{} }
   return result;
-}
+  }
 
 function opReadSegment(buffer, address) {
   const seg = buffer.findSegment(address);

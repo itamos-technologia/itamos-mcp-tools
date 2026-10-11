@@ -138,9 +138,11 @@ export function projectStructure(project, { search = null, full = false, subRel 
   for (const e of entries) if (!seen.has(e)) ordered.push(e);
   const lines = ordered.map(e => e.dir ? `${e.addr}/  ${e.rel}/` : `${e.addr}  ${e.rel}  (${e.info || 'not parsed'})`);
 
+  // Broken imports inside what is being viewed (the folder, or the project).
   const broken = db.prepare(`
     SELECT COUNT(*) c FROM imports i JOIN files f ON f.id = i.file_id
-    WHERE f.project_id = ? AND i.is_external = 0 AND i.resolved_file_id IS NULL`).get(project.id).c;
+    WHERE f.project_id = ? AND i.is_external = 0 AND i.resolved_file_id IS NULL
+      AND (? = '' OR substr(f.rel_path, 1, length(?) + 1) = ? || '/')`).get(project.id, subRel, subRel, subRel).c;
 
   const head = {
     project: project.name,

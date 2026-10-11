@@ -287,7 +287,7 @@ export function getProjectInfoForFile(absPath) {
           project_name: fileRow.project_name,
           project_root: fileRow.project_root,
           file_address: fileRow.file_address,
-          hint: `Part of project '${fileRow.project_name}'. Project structure: read_file(path="${fileRow.project_name}").`,
+          hint: `Part of project '${fileRow.project_name}'. A segment from the project: read_file(path="${fileRow.project_name}", segment="${fileRow.file_address}.<segment>"); project structure: read_file(path="${fileRow.project_name}").`,
         };
       }
       // First time seeing this project this session — run integrity check
@@ -302,7 +302,7 @@ export function getProjectInfoForFile(absPath) {
       _loadedProjectsThisSession.add(`${resolveDbPath()}#${fileRow.project_id}`);
       // Only a project tag here — never the whole project. The structure is
       // its own call: read_file(path=<project>), with the 3k-token rule.
-      const baseHint = `Part of project '${fileRow.project_name}'. Project structure: read_file(path="${fileRow.project_name}").`;
+      const baseHint = `Part of project '${fileRow.project_name}'. A segment from the project: read_file(path="${fileRow.project_name}", segment="${fileRow.file_address}.<segment>"); project structure: read_file(path="${fileRow.project_name}").`;
       const integrityHint = integrity.demoted > 0
         ? ` Integrity check demoted ${integrity.demoted} file(s) to unverified — see integrity_warnings for details. Re-verify before trusting them.`
         : '';
