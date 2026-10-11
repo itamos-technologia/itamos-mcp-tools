@@ -65,11 +65,25 @@ const SHARED_PARSERS = {
 export async function reindexFile(absPath, content) {
   const db = getDb();
   absPath = path.resolve(absPath);
-  const row = db.prepare(`
+  const findRow = db.prepare(`
     SELECT f.id, f.project_id, f.address, p.root_path
     FROM files f JOIN projects p ON p.id = f.project_id
-    WHERE f.abs_path = ?`).get(absPath);
-  if (!row) return { reindexed: false, reason: 'file not in any project' };
+    WHERE f.abs_path = ?`);
+  let row = findRow.get(absPath);
+  if (!row) {
+    // Inside a project folder but never indexed (added by other means): file it
+    // under the deepest project whose folder contains it, then index it.
+    const owner = db.prepare(`
+      SELECT id, root_path FROM projects
+      WHERE root_path NOT LIKE 'unknown://%' AND (? = root_path OR substr(?, 1, length(root_path) + 1) = root_path || '/')
+      ORDER BY length(root_path) DESC LIMIT 1`).get(absPath, absPath);
+    if (!owner) return { reindexed: false, reason: 'file not in any project' };
+    db.prepare(`INSERT INTO files (project_id, directory_id, address, name, rel_path, abs_path, language, category,
+                  parse_status, is_readable_text, verification_status, version, present_on_disk)
+                VALUES (?, NULL, 'pending', ?, ?, ?, NULL, 'pending', 'pending', 1, 'unverified', 0, 1)`)
+      .run(owner.id, path.basename(absPath), absPath.slice(owner.root_path.length + 1), absPath);
+    row = findRow.get(absPath);
+  }
   const rootPath = row.root_path.startsWith('unknown://') ? path.dirname(absPath) : row.root_path;
 
   const detection = detectLanguage(absPath);

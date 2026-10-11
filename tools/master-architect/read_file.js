@@ -71,6 +71,8 @@ import os from 'os';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { checkImportsInContent } from './lib/import_check.js';
+import { listProjectsView, resolveProjectTarget, projectStructure, resolveCoordinate,
+         projectDataFlow, scanForView } from './lib/project_view.js';
 import { reindexFile } from './lib/scan.js';
 import { matchProjectRoot } from './lib/editor/architect-link.js';
 import { getProjectInfoForFile, markFileVerified, markFileUnverified, checkAndHandleDrift, checkImportResolution, discoverAndFileByLinks, storeFileContent, getStoredSkeleton, refreshFileModules, updateExternalSpecs } from './lib/editor/architect-link.js';
@@ -2566,8 +2568,42 @@ export default {
   async handler(args, _ctx) {
     try {
       if (args.action === 'status') return wrap(opStatus());
-      if (!args.path) return wrap({ error: 'path is required for all actions except action="status"' });
-      if (!existsSync(args.path) && !args.discard) return wrap({ error: `File not found: ${args.path}` });
+
+      // ── Projects: read_file is the single door ──────────────────────────
+      // no path → project list; project name/folder → structure (no code);
+      // coordinate → file skeleton or segment; unscanned folder → scan first.
+      if (!args.path) return wrap(listProjectsView());
+      const target = resolveProjectTarget(args.path);
+      if (target) {
+        const view = (project, subRel) => projectStructure(project,
+          { search: args.search || null, full: !!args.full_skeleton, subRel });
+        if (target.kind === 'unscanned_dir') {
+          const s = await scanForView(target.dir, _ctx?.touch);
+          if (!s.scanned) return wrap(s);
+          const again = resolveProjectTarget(target.dir);
+          if (!again || again.kind !== 'project') {
+            return wrap({ scanned: true, note: 'scan finished but produced no project', files_total: s.result?.files_total ?? null });
+          }
+          return wrap({ scanned_now: true, ...view(again.project, again.subRel) });
+        }
+        const { project } = target;
+        const wantsTrace = args.trace !== undefined && args.trace !== false && args.trace !== 'false';
+        if (args.segment === undefined) {
+          return wrap(wantsTrace ? projectDataFlow(project) : view(project, target.subRel));
+        }
+        const c = resolveCoordinate(project, args.segment);
+        if (!c) {
+          return wrap({ error: `nothing at coordinate ${args.segment} in project '${project.name}'`,
+                        next: `read_file(path="${project.name}") lists the coordinates` });
+        }
+        if (c.kind === 'folder') return wrap(view(project, c.subRel));
+        // A file (+ optional segment): continue as an ordinary read of that file.
+        args = { ...args, path: c.absPath };
+        if (c.segment) args.segment = c.segment; else delete args.segment;
+      }
+      if (!existsSync(args.path) && !args.discard) {
+        return wrap({ error: `No file, folder or project named ${args.path}`, next: 'read_file() lists your projects' });
+      }
 
       if (args.discard) {
         clearReadMarks(args.path);

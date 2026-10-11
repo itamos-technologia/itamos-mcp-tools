@@ -279,17 +279,11 @@ const loadedTools = new Map();   // tool name → tool module (filled by loadToo
 
 // git.js runs clone + scan as a background job and calls this (as ctx.scanRepo)
 // to map the cloned folder with master_architect. Returns the parsed scan result.
+// The architect engine is internal (no master_architect tool on the sandbox):
+// the clone hands its folder straight to the scanner read_file uses.
 async function scanRepo(dir, ctx, runCtx) {
-  const architect = loadedTools.get('master_architect');
-  if (!architect) throw new Error('master_architect is not loaded');
-  const scan = await globalThis.__sandboxCtx.run(runCtx,
-    () => architect.handler({ action: 'scan', path: dir }, ctx));
-  try {
-    return JSON.parse(scan?.content?.[0]?.text || '{}');
-  } catch {
-    console.warn('[AutoScan] Scan reply was not JSON');
-    return {};
-  }
+  const { scanProject } = await import('./tools/master-architect/lib/scan.js');
+  return globalThis.__sandboxCtx.run(runCtx, () => scanProject(dir));
 }
 // ═══════════════════════════════════════════════════════════════════════════
 // TOOL LOADER

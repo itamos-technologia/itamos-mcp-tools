@@ -287,7 +287,7 @@ export function getProjectInfoForFile(absPath) {
           project_name: fileRow.project_name,
           project_root: fileRow.project_root,
           file_address: fileRow.file_address,
-          hint: `This file is part of project '${fileRow.project_name}' (loaded earlier in this session). Use master_architect navigate/connections to explore.`,
+          hint: `Part of project '${fileRow.project_name}'. Project structure: read_file(path="${fileRow.project_name}").`,
         };
       }
       // First time seeing this project this session — run integrity check
@@ -299,12 +299,10 @@ export function getProjectInfoForFile(absPath) {
       // direct IDE save, etc.) get demoted to 'unverified' here — their
       // current content isn't what we verified, even if it might be valid.
       const integrity = runIntegrityCheck(fileRow.project_id);
-      const skeleton = buildProjectSkeleton(fileRow.project_id);
-      if (!skeleton) {
-        return null;
-      }
       _loadedProjectsThisSession.add(`${resolveDbPath()}#${fileRow.project_id}`);
-      const baseHint = `Project '${fileRow.project_name}' loaded. Numeric addresses (1.2.3) navigate code; letter addresses (1.a) are non-parseable files. Use master_architect navigate/connections from here.`;
+      // Only a project tag here — never the whole project. The structure is
+      // its own call: read_file(path=<project>), with the 3k-token rule.
+      const baseHint = `Part of project '${fileRow.project_name}'. Project structure: read_file(path="${fileRow.project_name}").`;
       const integrityHint = integrity.demoted > 0
         ? ` Integrity check demoted ${integrity.demoted} file(s) to unverified — see integrity_warnings for details. Re-verify before trusting them.`
         : '';
@@ -314,7 +312,6 @@ export function getProjectInfoForFile(absPath) {
         project_name: fileRow.project_name,
         project_root: fileRow.project_root,
         file_address: fileRow.file_address,
-        skeleton,
         ...(integrity.demoted > 0
           ? { integrity_warnings: integrity.demoted_files }
           : {}),
@@ -328,7 +325,7 @@ export function getProjectInfoForFile(absPath) {
       project_id: matchedProject.id,
       project_name: matchedProject.name,
       project_root: matchedProject.root_path,
-      hint: `This file is inside project '${matchedProject.name}' but not in the index. Call master_architect.associate(path='${absPath}', project_id=${matchedProject.id}) to add it to that project, or master_architect.scan(path='${matchedProject.root_path}') to refresh the whole project from disk.`,
+      hint: `Inside project '${matchedProject.name}' but not indexed yet; it is indexed the first time it is saved.`,
     };
   }
 
@@ -345,7 +342,7 @@ export function getProjectInfoForFile(absPath) {
   return {
     status: 'unassigned',
     abs_path: absPath,
-    hint: `This file isn't part of any known project. Ask the user if they'd like to start one. If yes, call master_architect.register(path='${absPath}', project_name='<name>') — it will crawl imports from this file and create a project from the connected files. Or call master_architect.scan(path='${path.dirname(absPath)}', project_name='<name>') for a full directory scan instead.`,
+    hint: `Not part of any project. read_file(path="${path.dirname(absPath)}") scans its folder into a project.`,
   };
 }
 

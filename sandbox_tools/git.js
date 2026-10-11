@@ -52,14 +52,14 @@ function startCloneJob(sandboxDir, url, dest, label, scanLabel, ctx) {
       if (ctx.scanRepo) {
         try {
           const info = await ctx.scanRepo(dest);
-          if (info.ok && info.project_id !== undefined) {
-            scanNote = `Repository mapped automatically: project_id ${info.project_id} (${info.files_total} files). `
-              + `Next: call master_architect with action "topology" and project_id ${info.project_id} to see the map.`;
+          if (info.ok) {
+            scanNote = `Scanned into project '${info.project_name}' (${info.files_total} files). `
+              + `Next: read_file(path="${scanLabel}") shows its structure.`;
           } else {
-            scanNote = `The automatic scan did not finish; run master_architect with action "scan" and path "${scanLabel}".`;
+            scanNote = `The scan did not finish; read_file(path="${scanLabel}") scans it.`;
           }
         } catch (e) {
-          scanNote = `The automatic scan failed (${e.message}); run master_architect with action "scan" and path "${scanLabel}".`;
+          scanNote = `The scan failed (${e.message}); read_file(path="${scanLabel}") scans it.`;
         }
       }
       job.result = `Cloned into ${label}.\n${scanNote}`.trim();
@@ -116,7 +116,7 @@ function jobReport(job, sandboxDir) {
 
 export default {
   name: 'git',
-  description: 'Git operations inside your sandbox. Use clone to pull a repo: it is mapped automatically for master_architect, and the result gives you the project_id for topology. '
+  description: 'Git operations inside your sandbox. Use clone to pull a repo: when it finishes, the folder is scanned into a project and read_file(path="<folder>") shows its structure. '
     + 'Small repos return the finished result directly; for bigger ones clone replies at once and keeps working in the background, so check it with action "job" every few seconds (never start the clone again). '
     + 'Use status to see changes and commit to save your work. clone defaults to the sandbox root when dir is omitted; pass the same dir to status/commit afterwards.',
   schema: {
