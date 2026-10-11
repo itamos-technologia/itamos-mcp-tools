@@ -73,7 +73,7 @@ import Database from 'better-sqlite3';
 import { checkImportsInContent } from './lib/import_check.js';
 import { listProjectsView, resolveProjectTarget, projectStructure, resolveCoordinate,
          projectDataFlow, scanForView, needsLetterRescan } from './lib/project_view.js';
-import { reindexFile } from './lib/scan.js';
+import { reindexFile, withBufferFacts } from './lib/scan.js';
 import { matchProjectRoot } from './lib/editor/architect-link.js';
 import { getProjectInfoForFile, markFileVerified, markFileUnverified, checkAndHandleDrift, checkImportResolution, discoverAndFileByLinks, storeFileContent, getStoredSkeleton, refreshFileModules, updateExternalSpecs } from './lib/editor/architect-link.js';
 import { detectExternalRefs, gatherSpecs } from './lib/external_detect.js';
@@ -1159,37 +1159,21 @@ async function verifyL3(filePath, content, language) {
     };
   }
 
-  if (importCheck.note && importCheck.checked === 0) {
-    // File not in any project, or architect DB unavailable.
-    // Pass through with a note — there's nothing to check.
-    return {
-      level: 3,
-      ok: l2.ok,
-      messages: [...l2.messages, `L3 import resolution: ${importCheck.note}`],
-    };
-  }
-
+  // Imports and databases are BOTH always checked: a broken import must never
+  // hide a broken query, and the other way round.
+  let importOk = true;
+  const importMessages = [...l2.messages];
   if (!importCheck.ok) {
+    importOk = false;
     const unresolvedList = importCheck.unresolved
       .map(u => `'${u.import_path}'${u.line ? ` (line ${u.line})` : ''}${u.reason ? ` — ${u.reason}` : ''}`)
       .join(', ');
-    return {
-      level: 3,
-      ok: false,
-      messages: [
-        ...l2.messages,
-        `L3 import resolution: ${importCheck.unresolved.length} import(s) lead nowhere: ${unresolvedList}`,
-        'Note: file CAN still be committed at L1 or L2; only the verified status is blocked at L3.',
-      ],
-    };
+    importMessages.push(`L3 import resolution: ${importCheck.unresolved.length} import(s) lead nowhere: ${unresolvedList}`);
+  } else if (importCheck.note && importCheck.checked === 0) {
+    importMessages.push(`L3 import resolution: ${importCheck.note}`);
+  } else {
+    importMessages.push(`L3 import resolution: all ${importCheck.checked} local import(s) resolve correctly (${importCheck.external_imports} external skipped)`);
   }
-
-  // Local imports resolved. Now check SQL queries against their live schemas.
-  // Schema-only check via SQLite prepare() — does not read or modify data.
-  const importMessages = [
-    ...l2.messages,
-    `L3 import resolution: all ${importCheck.checked} local import(s) resolve correctly (${importCheck.external_imports} external skipped)`,
-  ];
 
   // ─── L3 SQL check (schema-only, never reads data) ────────────────────
   // Validates SQL queries against live DB schemas via prepare(). Schema
@@ -1198,14 +1182,12 @@ async function verifyL3(filePath, content, language) {
   // (SQL queries, LMDB sub-DB refs, Postgres queries, etc.). Each adapter
   // is a self-contained module under lib/adapters/<type>/. The dispatcher
   // discovers them by convention and lazy-loads only what's needed.
+  // The adapters read the queries IN THIS CONTENT, not the last scan's index:
+  // withBufferFacts substitutes this file's facts inside a rolled-back
+  // transaction on a separate connection.
   let adapterResults;
   try {
-    const archDb = _openArchitectDbReadOnly();
-    try {
-      adapterResults = await runAdapters(filePath, archDb);
-    } finally {
-      try { archDb.close(); } catch {}
-    }
+    adapterResults = await withBufferFacts(filePath, content, (conn) => runAdapters(path.resolve(filePath), conn));
   } catch (err) {
     return {
       level: 3,
@@ -1218,7 +1200,7 @@ async function verifyL3(filePath, content, language) {
   const messages = [...importMessages];
   if (adapterResults.by_adapter.size === 0) {
     messages.push(`L3 DB check: ${adapterResults.summary}`);
-    return { level: 3, ok: true, messages };
+    return { level: 3, ok: importOk, messages };
   }
 
   // Each adapter's result is the standard { ok, checked, failures,
@@ -1280,10 +1262,7 @@ async function verifyL3(filePath, content, language) {
     }
   }
 
-  if (!allOk) {
-    messages.push('Note: file CAN still be committed at L1 or L2; only the verified status is blocked at L3.');
-  }
-  return { level: 3, ok: allOk, messages };
+  return { level: 3, ok: allOk && importOk, messages };
 }
 
 function bufferStateHash(buffer) {

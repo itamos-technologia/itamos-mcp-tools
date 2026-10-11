@@ -56,6 +56,157 @@ const SHARED_PARSERS = {
   rust: (rootNode) => rustParseWithRootNode(rootNode),
 };
 
+// ─── Per-file facts: ONE source of truth for scan, save and L3 ────────────
+// The scan, reindexFile (after every save) and L3 (checking the content being
+// saved) all record a file's external refs, databases, SQL queries and LMDB
+// refs through these functions, so the three can never disagree.
+
+// External refs of one file (servers/models/services/binaries/ports). Parser
+// refs and code listeners are authoritative over generic text detection: the
+// global external_refs table is keyed by (kind, locator), so the richer ref
+// must win. Parser refs FIRST, generic ones only where kind+locator is new.
+export function collectExternalRefs(content, language, analysis) {
+  const _ext = detectExternalRefs(content, language);
+  const _parserExt = (analysis.external_refs || []).map(r => ({
+    kind: r.kind, name: r.name, locator: r.locator, line: r.line,
+    extra: r.extra == null ? null : (typeof r.extra === 'string' ? r.extra : JSON.stringify(r.extra)),
+  }));
+  // Code listeners (app.listen / createServer().listen) → role='listen' refs,
+  // same shape as an nginx `listen`; locator host:port (host 0.0.0.0 when not
+  // a literal; port '?' when env-only, stored honestly and never matched).
+  for (const L of (analysis.listeners || [])) {
+    const host = L.host || '0.0.0.0';
+    const locator = L.port != null ? `${host}:${L.port}` : `${host}:?`;
+    _parserExt.push({
+      kind: 'server', name: locator, locator, line: L.line,
+      extra: JSON.stringify({ role: 'listen', host, port: L.port, port_expr: L.port_expr, source: 'code' }),
+    });
+  }
+  const merged = [];
+  const byKL = new Set();
+  for (const r of _parserExt) {
+    const k = r.kind + '|' + r.locator;
+    if (byKL.has(k)) continue;
+    byKL.add(k); merged.push(r);
+  }
+  for (const r of (_ext || [])) {
+    const k = r.kind + '|' + r.locator;
+    if (byKL.has(k)) continue;
+    byKL.add(k); merged.push(r);
+  }
+  return merged;
+}
+
+// Writer for one project's per-file DB facts. Database identity is
+// (project_id, path_or_uri): existing rows are reused, new paths get a row
+// with a synthetic 99.N address. Each SQL query is attributed to the handle it
+// runs on: receiver matches a known handle → that db; else exactly one
+// SQL-shaped db in the file → that one; else NULL (no guessing — L3 reports it).
+export function makeFactWriter(db, projectId) {
+  const insertDatabase = db.prepare('INSERT INTO databases (project_id, address, name, type, path_or_uri, extra) VALUES (?, ?, ?, ?, ?, ?)');
+  const insertSqlQuery = db.prepare('INSERT INTO sql_queries (file_id, line, method, sql, is_dynamic, inferred_database_id) VALUES (?, ?, ?, ?, ?, ?)');
+  const insertLmdbRef = db.prepare('INSERT INTO lmdb_subdb_refs (file_id, line, name, inferred_database_id) VALUES (?, ?, ?, ?)');
+  const insertDbConn = db.prepare('INSERT INTO db_connections (file_id, database_id, line) VALUES (?, ?, ?)');
+  const upsertExtRef = db.prepare(
+    'INSERT INTO external_refs (kind, name, locator, version, extra) VALUES (?, ?, ?, ?, ?) ' +
+    'ON CONFLICT(kind, locator) DO UPDATE SET ' +
+    '  name  = excluded.name, ' +
+    '  extra = COALESCE(excluded.extra, external_refs.extra) ' +
+    'WHERE external_refs.name != excluded.name ' +
+    '   OR (excluded.extra IS NOT NULL AND IFNULL(external_refs.extra, \'\') != excluded.extra)'
+  );
+  const getExtRefId = db.prepare('SELECT id FROM external_refs WHERE kind = ? AND locator = ?');
+  const addExtRefProject = db.prepare('INSERT OR IGNORE INTO external_ref_projects (external_ref_id, project_id) VALUES (?, ?)');
+  const insertFileExtRef = db.prepare('INSERT INTO file_external_refs (file_id, external_ref_id, line) VALUES (?, ?, ?)');
+  const fileLmdb = db.prepare(`
+    SELECT d.id FROM databases d
+    JOIN db_connections dc ON dc.database_id = d.id
+    WHERE d.project_id = ? AND dc.file_id = ? AND d.type = 'lmdb'
+    LIMIT 1`);
+
+  const dbByPath = new Map();
+  for (const r of db.prepare('SELECT id, path_or_uri FROM databases WHERE project_id = ?').all(projectId)) {
+    if (r.path_or_uri != null) dbByPath.set(r.path_or_uri, r.id);
+  }
+  let dbCounter = db.prepare('SELECT COUNT(*) AS c FROM databases WHERE project_id = ?').get(projectId).c;
+
+  return function writeFileFacts(fileId, { databases = [], sql_queries = [], lmdb_subdbs = [], external_refs = [] } = {}) {
+    for (const er of external_refs) {
+      upsertExtRef.run(er.kind, er.name, er.locator, er.version ?? null, er.extra ?? null);
+      const row = getExtRefId.get(er.kind, er.locator);
+      if (row) {
+        addExtRefProject.run(row.id, projectId);
+        insertFileExtRef.run(fileId, row.id, er.line ?? null);
+      }
+    }
+    const handleVarToDbId = new Map();
+    const sqlDbIds = [];
+    for (const dbDecl of databases) {
+      let dbId = dbByPath.get(dbDecl.path_or_uri);
+      if (!dbId) {
+        dbCounter += 1;
+        const r = insertDatabase.run(projectId, `99.${dbCounter}`, dbDecl.name, dbDecl.type, dbDecl.path_or_uri, dbDecl.extra ?? null);
+        dbId = r.lastInsertRowid;
+        dbByPath.set(dbDecl.path_or_uri, dbId);
+      }
+      insertDbConn.run(fileId, dbId, dbDecl.line ?? null);
+      if (dbDecl.handle_var) handleVarToDbId.set(dbDecl.handle_var, dbId);
+      if (['sqlite', 'postgres', 'mysql', 'duckdb'].includes(dbDecl.type)) sqlDbIds.push(dbId);
+    }
+    for (const q of sql_queries) {
+      let inferredDbId = null;
+      if (q.receiver && handleVarToDbId.has(q.receiver)) inferredDbId = handleVarToDbId.get(q.receiver);
+      else if (sqlDbIds.length === 1) inferredDbId = sqlDbIds[0];
+      insertSqlQuery.run(fileId, q.line ?? null, q.method ?? null, q.sql, q.dynamic ? 1 : 0, inferredDbId);
+    }
+    const lmdbDbId = fileLmdb.get(projectId, fileId)?.id ?? null;
+    for (const ref of lmdb_subdbs) insertLmdbRef.run(fileId, ref.line ?? null, ref.name, lmdbDbId);
+  };
+}
+
+const FILE_FACT_TABLES = ['db_connections', 'sql_queries', 'lmdb_subdb_refs', 'file_external_refs'];
+function clearFileFacts(db, fileId) {
+  for (const t of FILE_FACT_TABLES) db.prepare(`DELETE FROM ${t} WHERE file_id = ?`).run(fileId);
+}
+function gcUnusedDatabases(db, projectId) {
+  db.prepare(`DELETE FROM databases WHERE project_id = ?
+                AND id NOT IN (SELECT DISTINCT database_id FROM db_connections)`).run(projectId);
+}
+
+// L3 against the content being SAVED. On a separate connection, inside a
+// transaction: replace this file's DB facts with those parsed from `content`,
+// let fn(conn) (the adapters) read them, then roll back. Other writers simply
+// wait (busy timeout) — nothing of theirs can be swept into this rollback.
+// A file outside any project, or content that does not parse, runs fn on the
+// normal connection (nothing to substitute).
+export async function withBufferFacts(absPath, content, fn) {
+  const base = getDb();
+  absPath = path.resolve(absPath);
+  const row = base.prepare('SELECT id, project_id FROM files WHERE abs_path = ?').get(absPath);
+  let a = null;
+  if (row) { try { a = await analyzeContent(absPath, content); } catch {} }
+  if (!row || !a || !a.analysis || a.analysis.parse_error) return fn(base);
+
+  let ext = [];
+  try { ext = collectExternalRefs(content, a.language, a.analysis); } catch {}
+  const conn = new Database(base.name, { timeout: 5000 });
+  conn.pragma('foreign_keys = ON');
+  conn.exec('BEGIN IMMEDIATE');
+  try {
+    clearFileFacts(conn, row.id);
+    makeFactWriter(conn, row.project_id)(row.id, {
+      databases: a.analysis.databases || [],
+      sql_queries: a.analysis.sql_queries || [],
+      lmdb_subdbs: a.analysis.lmdb_subdbs || [],
+      external_refs: ext,
+    });
+    return await fn(conn);
+  } finally {
+    try { conn.exec('ROLLBACK'); } catch {}
+    try { conn.close(); } catch {}
+  }
+}
+
 // Re-index ONE file from its current content: what a scan does for that file,
 // without walking the project. Runs after every save (read_file commit) and
 // after write_file creates a file, so the index never lags behind disk. Every
@@ -158,8 +309,21 @@ export async function reindexFile(absPath, content) {
       importCount += 1;
     }
 
+    // Databases, SQL queries, LMDB refs, external refs: same writer as the
+    // scan, so L3 and the topology see exactly what is on disk now.
+    clearFileFacts(db, row.id);
+    let ext = [];
+    try { ext = collectExternalRefs(content, cls.language, analysis); } catch {}
+    makeFactWriter(db, row.project_id)(row.id, {
+      databases: analysis.databases || [],
+      sql_queries: analysis.sql_queries || [],
+      lmdb_subdbs: analysis.lmdb_subdbs || [],
+      external_refs: ext,
+    });
+    gcUnusedDatabases(db, row.project_id);
+
     // Fingerprint only after a full re-index, so the scan's unchanged-file
-    // shortcut never skips a file whose imports were not refreshed.
+    // shortcut never skips a file whose imports or DB facts were not refreshed.
     db.prepare('UPDATE files SET content_hash = ?, parser_version = ? WHERE id = ?')
       .run(createHash('sha256').update(content, 'utf8').digest('hex'), PARSER_VERSION, row.id);
   })();
@@ -391,6 +555,7 @@ function walk(rootAbs) {
 // ─── Main scan ───────────────────────────────────────────────────────────
 
 import { detectExternalRefs } from './external_detect.js';
+import Database from 'better-sqlite3';
 
 // Project names are UNIQUE in the DB. Return `desired` if free (or already
 // owned by excludeId), otherwise the first free "desired-N".
@@ -710,6 +875,11 @@ export async function scanProject(rootPath, projectName, opts = {}) {
           // External refs (servers/models/services/binaries/ports) — detect from
           // raw content BEFORE dropping it. Stashed for the second pass.
           try {
+            // Same rules as reindexFile / L3 (collectExternalRefs).
+            const _merged = collectExternalRefs(content, f.detection.language, analysis);
+            if (_merged.length) externalRefsByFile.set(fileId, _merged);
+          } catch (_e) { /* detection must never break a scan */ }
+          if (false) try {
             const _ext = detectExternalRefs(content, f.detection.language);
             // Merge any external refs the PARSER itself produced (e.g. the nginx
             // parser emits listen/proxy_pass endpoints with role metadata that
@@ -862,7 +1032,16 @@ export async function scanProject(rootPath, projectName, opts = {}) {
       'INSERT INTO file_external_refs (file_id, external_ref_id, line) VALUES (?, ?, ?)'
     );
 
+    const writeFileFacts = makeFactWriter(db, projectId);   // same rules as reindexFile / L3
     for (const [fileId, pr] of pendingResolution.entries()) {
+      writeFileFacts(fileId, {
+        databases: pr.databases || [],
+        sql_queries: pr.sql_queries || [],
+        lmdb_subdbs: pr.lmdb_subdbs || [],
+        external_refs: externalRefsByFile.get(fileId) || [],
+      });
+      const handleVarToDbId = new Map(), sqlDbIds = [];   // (kept for the disabled legacy blocks below)
+      if (false) {
       // External refs first (shared nodes deduped globally by kind+locator).
       const extRefs = externalRefsByFile.get(fileId);
       if (extRefs) {
@@ -898,6 +1077,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
         if (dbDecl.handle_var) handleVarToDbId.set(dbDecl.handle_var, dbId);
         if (['sqlite', 'postgres', 'mysql', 'duckdb'].includes(dbDecl.type)) sqlDbIds.push(dbId);
       }
+      }   // end disabled legacy external-refs + databases block (now in makeFactWriter)
       // Imports — resolve against project files.
       //
       // is_external = 0 when the import is local by syntax ('.' or '/'),
@@ -978,7 +1158,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
       //   3. Else (receiver unknown AND multiple candidate dbs) → leave NULL.
       //      We do NOT guess: a wrong link is worse than an honest null, which
       //      the L3 check surfaces as an unresolved case.
-      for (const q of (pr.sql_queries || [])) {
+      if (false) for (const q of (pr.sql_queries || [])) {   // now in makeFactWriter
         let inferredDbId = null;
         if (q.receiver && handleVarToDbId.has(q.receiver)) {
           inferredDbId = handleVarToDbId.get(q.receiver);
@@ -1005,7 +1185,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
         LIMIT 1
       `).get(projectId, fileId);
       const lmdbDbId = fileLmdbDb?.id ?? null;
-      for (const ref of (pr.lmdb_subdbs || [])) {
+      if (false) for (const ref of (pr.lmdb_subdbs || [])) {   // now in makeFactWriter
         insertLmdbRef.run(fileId, ref.line ?? null, ref.name, lmdbDbId);
       }
     }
