@@ -267,6 +267,30 @@ function jailPath(sandboxDir, requestedPath) {
   return resolved;
 }
 
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUTO-SCAN AFTER CLONE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// A fresh clone is scanned right away, so the AI gets a project_id together
+// with the clone result and can go straight to topology instead of guessing.
+const loadedTools = new Map();   // tool name → tool module (filled by loadTools)
+
+// git.js runs clone + scan as a background job and calls this (as ctx.scanRepo)
+// to map the cloned folder with master_architect. Returns the parsed scan result.
+async function scanRepo(dir, ctx, runCtx) {
+  const architect = loadedTools.get('master_architect');
+  if (!architect) throw new Error('master_architect is not loaded');
+  const scan = await globalThis.__sandboxCtx.run(runCtx,
+    () => architect.handler({ action: 'scan', path: dir }, ctx));
+  try {
+    return JSON.parse(scan?.content?.[0]?.text || '{}');
+  } catch {
+    console.warn('[AutoScan] Scan reply was not JSON');
+    return {};
+  }
+}
 // ═══════════════════════════════════════════════════════════════════════════
 // TOOL LOADER
 // ═══════════════════════════════════════════════════════════════════════════
@@ -282,6 +306,7 @@ async function loadTools(server, who) {
       const mod = await import(pathToFileURL(path.join(dir, file)).href);
       const tool = mod.default;
       if (!tool?.name || typeof tool.handler !== 'function') continue;
+      loadedTools.set(tool.name, tool);
       server.tool(
         tool.name,
         tool.description || '',
@@ -297,12 +322,21 @@ async function loadTools(server, who) {
           if (resolvedArgs.path !== undefined) {
             resolvedArgs.path = jailPath(sandboxDir, resolvedArgs.path);
           }
-          const ctx = { sandboxDir, jailPath: (p) => jailPath(sandboxDir, p), execFileAsync };
-          const result = await globalThis.__sandboxCtx.run({
+          const runCtx = {
             slotDir: sandboxDir,
             architectDb: path.join(sandboxDir, '.architect.db'),
             stateDir: path.join(sandboxDir, '.read_file_state'),
-          }, () => tool.handler(resolvedArgs, ctx));
+          };
+          // touch keeps the sandbox alive while a background job runs;
+          // scanRepo lets git.js map a fresh clone with master_architect.
+          const ctx = {
+            sandboxDir,
+            jailPath: (p) => jailPath(sandboxDir, p),
+            execFileAsync,
+            touch: () => touchSession(who),
+          };
+          ctx.scanRepo = (dir) => scanRepo(dir, ctx, runCtx);
+          const result = await globalThis.__sandboxCtx.run(runCtx, () => tool.handler(resolvedArgs, ctx));
           // One-time note (sandbox ready after the queue, or a new sandbox
           // after expiry) goes in front of the first result it can join.
           const note = notices.get(who);
