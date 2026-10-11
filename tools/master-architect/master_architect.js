@@ -54,20 +54,20 @@ function isFileAddress(address) {
 
 export default {
   name: 'master_architect',
-  description: 'Project-aware code skeleton + navigation. START with topology(project_id) to see the data-flow graph. Then bones(project_id, address) to see a file\'s structure. Then read_file to read/edit specific segments. NEVER call navigate or list to browse the full project — always start with topology.',
+  description: 'Code map of a project: files, their structure, and how data flows between them (imports, databases, external servers). Typical flow: get a project_id (list, or read_file on any file in the project returns it) → topology for the data-flow graph and file addresses → bones on one file → read_file to read or edit segments. Folder not indexed yet: estimate (size and time, no writes), then scan. Do not use navigate to browse directories; topology is the entry point.',
 
   schema: {
     action: z.enum([
       'estimate', 'scan', 'project_for', 'register', 'associate',
       'navigate', 'connections', 'ping', 'context', 'missing',
       'topology', 'bones', 'languages', 'stats', 'list', 'crawl',
-    ]).describe('Operation. ALWAYS start with topology to orient. bones = compact file structure view (imports + modules). navigate = only for file/module/method addresses when you already know the exact address from bones. topology = data-flow graph entry point. NEVER use navigate to browse directories.'),
-    path: z.string().optional().describe('Absolute file path (for path-based actions, or bones by path)'),
-    project_id: z.number().int().optional().describe('Project id (for navigate/connections/missing/topology/bones/crawl)'),
-    project_name: z.string().optional().describe('Optional project name override (for scan)'),
-    address: z.string().optional().describe('Hierarchical address e.g. 1.2.3 (for navigate/connections/bones) — must be a file or module address, not a directory'),
+    ]).describe('Operation. topology = data-flow graph of a project (entry points, files, edges); start here. bones = compact structure of one file (imports + modules), by project_id + address or by path. navigate = content at a known file/module/method address (mode structural or raw). connections = imports in/out and database references of one address. ping = trace-route: follows imports hop by hop from a file until each branch ends (external, unresolved, cycle or leaf). missing = local imports that do not resolve. context = connections looked up by absolute path. list = all indexed projects with their ids. scan = index a folder (path). estimate = size and time of a scan before running it. project_for = which project a file belongs to. register = create a new project from a seed file plus every file it imports (path + project_name). associate = add one file to an existing project. crawl = pull files linked to a seed file into an existing project (path + project_id). languages = supported languages. stats = totals across all projects and active scans.'),
+    path: z.string().optional().describe('Absolute path (estimate, scan, project_for, register, associate, crawl, context, or bones by path)'),
+    project_id: z.number().int().optional().describe('Project id, from list or from read_file on any file in the project (topology, bones, navigate, connections, ping, missing, associate, crawl)'),
+    project_name: z.string().optional().describe('Project name (required for register; optional override for scan)'),
+    address: z.string().optional().describe('Hierarchical address from topology or bones, e.g. 1.2.3 or d.a.1 (navigate, connections, ping, bones). Must be a file, module or method, not a directory. For register, an absolute path here sets the project root.'),
     mode: z.enum(['structural', 'raw']).optional().describe('navigate mode: structural skeleton or raw content (default structural)'),
-    max_depth: z.number().int().optional().describe('discover crawl depth limit (default 5)'),
+    max_depth: z.number().int().optional().describe('Depth limit: how far register and crawl follow imports; for ping, the hop limit (default 25)'),
   },
 
   async handler(args, ctx) {

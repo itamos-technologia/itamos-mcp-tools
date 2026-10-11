@@ -2498,7 +2498,7 @@ function unreadTargetError(buffer, address, verb) {
 
 export default {
   name: 'read_file',
-  description: 'Segment-addressed file editor. Default returns the file skeleton (a list of named segments). Use segment="N" to read a specific part. trace=true follows the file\'s signal through the codebase (imports in/out, databases, external binaries/servers) and validation-walks its direct connections: unverified neighbors get an L3 attempt; the first failure stops the walk. Edits are one-per-transaction: edit → verify → commit, and READ-BEFORE-WRITE: any destructive verb (replace/delete/move/comment_out/uncomment/paste) requires its target segment to have been displayed (segment="N") since the last change — you cannot modify code you have not looked at.',
+  description: 'Read any file, and edit it safely. With just path: the file skeleton (numbered segments such as functions, classes, blocks) plus its project_id for master_architect. segment="N" (or "5.3" for nested) returns that segment in full; search filters the skeleton of large files. Editing: one edit per call (replace/insert/delete/move/paste/comment_out/uncomment), and you can only change segments displayed since the last change, so re-read a segment before each edit. Edits stack in a buffer: verify, then commit writes them all to disk atomically; undo, diff and discard are available. Verify levels: 1 = syntax, 2 = syntax + linter, 3 = also all imports resolve. Commit works at any level; only level 3 marks the file verified in the project map. trace=true shows what the file connects to (imports in/out, databases, external servers and binaries) and re-checks unverified neighbours at level 3, stopping at the first failure.',
   schema: {
     path: z.string().optional().describe('File path. Required for everything except action="status".'),
     segment: z.string().optional().describe('Read full text of segment N (or "5.3" for nested). Default if no other op given returns skeleton. Reading a segment also unlocks it (and everything it displays) for destructive verbs.'),
@@ -2515,11 +2515,11 @@ export default {
       after: z.string().optional().describe('Place seg right after this anchor (or "start" for top of file).'),
       before: z.string().optional().describe('Place seg right before this anchor (or "end" for bottom).'),
     }).optional().describe('Reorder a top-level segment.'),
-    comment_out: z.string().optional().describe('Wrap segment in #/// line-comment markers (debugging aid). Target must have been read in the current buffer state.'),
+    comment_out: z.string().optional().describe('Comment out a segment with the language line-comment marker (Python #, JavaScript/TypeScript //; other languages not supported). Debugging aid. Target must have been read in the current buffer state.'),
     uncomment: z.string().optional().describe('Strip line-comment markers from a previously commented segment. Target must have been read in the current buffer state.'),
     undo: z.union([z.boolean(), z.string()]).optional().describe('true=last edit, "all"=full revert, "<address|segId>"=revert that segment. Structural ops (insert/delete/move) require LIFO undo.'),
     diff: z.boolean().optional().describe('Show changes vs disk.'),
-    verify: z.number().optional().describe('Validate buffer at level 1, 2, or 3. Issues verify token on success.'),
+    verify: z.number().optional().describe('Validate the buffer: 1 = syntax, 2 = syntax + linter, 3 = also checks that imports resolve. Returns the token commit needs.'),
     commit: z.boolean().optional().describe('Atomic write to disk. Requires a current verify token.'),
     discard: z.boolean().optional().describe('Drop buffer, no disk change.'),
     paste: z.object({
@@ -2527,7 +2527,7 @@ export default {
       to: z.string().describe('Edit-buffer segment address to overwrite with the copied text. Must have been read in the current buffer state.'),
     }).optional().describe('Clipboard paste: copy verbatim from the read buffer into an edit-target segment.'),
     search: z.string().optional().describe('For huge files: keyword to filter the skeleton to matching segments (grouped in 10s) instead of dumping all titles.'),
-    full_skeleton: z.boolean().optional().describe('Force the entire skeleton even if it exceeds the explosion-radius threshold.'),
+    full_skeleton: z.boolean().optional().describe('Show the whole skeleton even when it is very large (above ~3000 tokens the skeleton is not dumped; use search or this flag).'),
     action: z.enum(['status']).optional().describe('Tool-level action: "status" lists open buffers.'),
   },
   async handler(args, _ctx) {
