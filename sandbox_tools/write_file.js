@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { registerBareFile, listProjects, createProject } from '../tools/master-architect/lib/editor/architect-link.js';
+import { reindexFile } from '../tools/master-architect/lib/scan.js';
 
 // write_file creates NEW files only (never overwrites) and never decides a
 // project on its own: the agent names one every time — an existing project
@@ -57,6 +58,9 @@ export default {
       await fs.writeFile(absPath, content, 'utf8');
 
       const r = registerBareFile(absPath, target.id);
+      // Index the new file right away (structure + imports, re-link others).
+      // Not a check: write_file never refuses a file over its content.
+      try { await reindexFile(absPath, content); } catch (e) { console.error(`[write_file] reindex: ${e.message}`); }
       const outside = !(absPath === target.root_path || absPath.startsWith(target.root_path + path.sep));
       return reply(
         `Written: ${filePath} — ${created ? 'new project' : 'attached to project'} '${target.name}'`

@@ -71,6 +71,7 @@ import os from 'os';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import { checkImportsInContent } from './lib/import_check.js';
+import { reindexFile } from './lib/scan.js';
 import { matchProjectRoot } from './lib/editor/architect-link.js';
 import { getProjectInfoForFile, markFileVerified, markFileUnverified, checkAndHandleDrift, checkImportResolution, discoverAndFileByLinks, storeFileContent, getStoredSkeleton, refreshFileModules, updateExternalSpecs } from './lib/editor/architect-link.js';
 import { detectExternalRefs, gatherSpecs } from './lib/external_detect.js';
@@ -2321,7 +2322,7 @@ async function opCommit(buffer) {
   // Fresh-per-file navigate: refresh this file's modules/methods rows from the
   // just-committed content (JS uses the shared parse; non-JS skipped). Best-effort.
   try {
-    refreshFileModules(buffer.path, finalText, buffer.language || null);
+    await reindexFile(buffer.path, finalText);   // every language: structure + imports + re-link
   } catch (err) {
     console.error(`[read_file] refreshFileModules error: ${err.message}`);
   }

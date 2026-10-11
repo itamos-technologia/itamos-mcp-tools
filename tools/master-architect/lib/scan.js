@@ -56,6 +56,118 @@ const SHARED_PARSERS = {
   rust: (rootNode) => rustParseWithRootNode(rootNode),
 };
 
+// Re-index ONE file from its current content: what a scan does for that file,
+// without walking the project. Runs after every save (read_file commit) and
+// after write_file creates a file, so the index never lags behind disk. Every
+// language with a scanner parser is covered. Other files' broken imports that
+// this file now satisfies are re-linked (e.g. a module created after the file
+// importing it). Addresses stay with the scan (addressing is project-wide).
+export async function reindexFile(absPath, content) {
+  const db = getDb();
+  absPath = path.resolve(absPath);
+  const row = db.prepare(`
+    SELECT f.id, f.project_id, f.address, p.root_path
+    FROM files f JOIN projects p ON p.id = f.project_id
+    WHERE f.abs_path = ?`).get(absPath);
+  if (!row) return { reindexed: false, reason: 'file not in any project' };
+  const rootPath = row.root_path.startsWith('unknown://') ? path.dirname(absPath) : row.root_path;
+
+  const detection = detectLanguage(absPath);
+  const cls = classifyForDb(detection);
+  if (!cls) return { reindexed: false, reason: 'unrecognized file type' };
+  if (content == null && cls.is_readable_text) content = readSafe(absPath);
+  const stat = statSafe(absPath);
+  const byteSize = stat?.size ?? (content != null ? Buffer.byteLength(content, 'utf8') : 0);
+  const lineCount = content == null ? null : (content.length === 0 ? 0 : content.split('\n').length);
+
+  let analysis = null, parser = null, parseStatus = cls.parse_status;
+  if (cls.category === 'supported' && content != null) {
+    try {
+      const a = await analyzeContent(absPath, content);
+      if (a) { analysis = a.analysis; parser = a.parser; }
+      if (!analysis || analysis.parse_error) parseStatus = 'parse_error';
+    } catch { parseStatus = 'parse_error'; }
+  }
+  const parsedOk = !!analysis && parseStatus !== 'parse_error';
+  const fileAddr = row.address && row.address !== 'pending' ? row.address : String(row.id);
+  const globalFile = db.prepare('SELECT id FROM files WHERE abs_path = ? LIMIT 1');
+  let moduleCount = 0, importCount = 0;
+
+  db.transaction(() => {
+    db.prepare(`UPDATE files SET language = ?, category = ?, parse_status = ?, is_readable_text = ?,
+                  line_count = ?, byte_size = ?, est_tokens = ?, last_modified = ?, present_on_disk = 1
+                WHERE id = ?`)
+      .run(cls.language, cls.category, parseStatus, cls.is_readable_text, lineCount, byteSize,
+           estimateTokens(byteSize), stat ? stat.mtime.toISOString() : null, row.id);
+    if (!parsedOk) return;
+
+    db.prepare('DELETE FROM methods WHERE module_id IN (SELECT id FROM modules WHERE file_id = ?)').run(row.id);
+    db.prepare('DELETE FROM modules WHERE file_id = ?').run(row.id);
+    db.prepare('DELETE FROM imports WHERE file_id = ?').run(row.id);
+    const insModule = db.prepare('INSERT INTO modules (file_id, address, name, kind, line_start, line_end) VALUES (?, ?, ?, ?, ?, ?)');
+    const insMethod = db.prepare('INSERT INTO methods (module_id, address, name, kind, line_start, line_end) VALUES (?, ?, ?, ?, ?, ?)');
+    (analysis.modules || []).forEach((mod, i) => {
+      const modAddr = `${fileAddr}.${i + 1}`;
+      const modId = insModule.run(row.id, modAddr, mod.name, mod.kind, mod.line_start, mod.line_end).lastInsertRowid;
+      (mod.methods || []).forEach((m, j) => insMethod.run(modId, `${modAddr}.${j + 1}`, m.name, m.kind, m.line_start, m.line_end));
+      moduleCount += 1;
+    });
+
+    // Imports: same resolution rules as the scan's second pass.
+    const insImport = db.prepare('INSERT INTO imports (file_id, import_path, resolved_file_id, is_external, line, edge_kind) VALUES (?, ?, ?, ?, ?, ?)');
+    for (const imp of (analysis.imports || [])) {
+      if (!imp.import_path) continue;
+      const looksLocal = imp.import_path.startsWith('.') || imp.import_path.startsWith('/');
+      let resolvedId = null;
+      if (parser.resolveImport) {
+        try {
+          const rp = parser.resolveImport(imp.import_path, absPath, fs, path, rootPath);
+          if (rp) resolvedId = globalFile.get(rp)?.id ?? null;
+        } catch {}
+      }
+      let isLocal = looksLocal || !!resolvedId;
+      if (!isLocal && parser.isLocalModule) {
+        try { isLocal = !!parser.isLocalModule(imp.import_path, absPath, fs, path, rootPath); } catch {}
+      }
+      insImport.run(row.id, imp.import_path, resolvedId, isLocal ? 0 : 1, imp.line ?? null, 'import');
+      importCount += 1;
+    }
+
+    // Fingerprint only after a full re-index, so the scan's unchanged-file
+    // shortcut never skips a file whose imports were not refreshed.
+    db.prepare('UPDATE files SET content_hash = ?, parser_version = ? WHERE id = ?')
+      .run(createHash('sha256').update(content, 'utf8').digest('hex'), PARSER_VERSION, row.id);
+  })();
+
+  // Re-link: broken imports elsewhere in the project that this file now satisfies.
+  let relinked = 0;
+  const stem = path.basename(absPath).replace(/\.[^.]+$/, '');
+  const key = (stem === 'index' || stem === '__init__' || stem === 'mod') ? path.basename(path.dirname(absPath)) : stem;
+  if (key) {
+    const cands = db.prepare(`
+      SELECT i.id, i.import_path, f.abs_path AS from_abs
+      FROM imports i JOIN files f ON f.id = i.file_id
+      WHERE f.project_id = ? AND i.file_id != ? AND i.resolved_file_id IS NULL
+        AND instr(i.import_path, ?) > 0`).all(row.project_id, row.id, key);
+    const setRes = db.prepare('UPDATE imports SET resolved_file_id = ?, is_external = 0 WHERE id = ?');
+    for (const c of cands) {
+      try {
+        const det2 = detectLanguage(c.from_abs);
+        if (!det2 || det2.kind !== 'supported') continue;
+        const p2 = await getParser(det2.language, det2.parserFile);
+        if (!p2 || !p2.resolveImport) continue;
+        if (p2.resolveImport(c.import_path, c.from_abs, fs, path, rootPath) === absPath) {
+          setRes.run(row.id, c.id);
+          relinked += 1;
+        }
+      } catch {}
+    }
+  }
+
+  return { reindexed: true, language: cls.language, parse_status: parseStatus,
+           modules: moduleCount, imports: importCount, relinked };
+}
+
 // The scanner's parse of one file's text, without a scan: L3 uses this to read
 // the imports of the content being SAVED (lib/import_check.js). Same detection,
 // parser and shared-parse path as scanProject. Returns { language, parser,
