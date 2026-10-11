@@ -2564,11 +2564,11 @@ function unreadTargetError(buffer, address, verb) {
 
 export default {
   name: 'read_file',
-  description: 'Read any file, and edit it safely. With just path: the file skeleton (numbered segments such as functions, classes, blocks) plus its project_id for master_architect. segment="N" (or "5.3" for nested) returns that segment in full; search filters the skeleton of large files. Editing: one edit per call (replace/insert/delete/move/paste/comment_out/uncomment), and you can only change segments displayed since the last change, so re-read a segment before each edit. Edits stack in a buffer: verify, then commit writes them all to disk atomically; undo, diff and discard are available. Verify levels: 1 = syntax, 2 = syntax + linter, 3 = also all imports resolve. Commit works at any level; only level 3 marks the file verified in the project map. trace=true shows what the file connects to (imports in/out, databases, external servers and binaries) and re-checks unverified neighbours at level 3, stopping at the first failure.',
+  description: 'Read anything, and edit it safely. read_file() lists your projects. path=<project name or folder>: its structure only, no code: folders and files with coordinates (letters = location, e.g. "d.a.f"); over ~3000 tokens it asks for search. A folder not scanned yet is scanned first. path=<project> with segment="<file coordinate>" gives that file map (one line per segment); segment="<file coordinate>.<segment>" (e.g. "d.a.f.31.17") gives that code in one call. path=<file> works the same with plain segment numbers. Editing: one edit (replace/insert/delete/move/paste/comment_out/uncomment), then commit, undo or discard before the next; you can only change segments displayed since the last change. commit checks before writing: a syntax error (L1) or a failing config checker (L2) blocks the save; imports that lead nowhere or SQL that does not match the schema (L3) still save but are listed. trace=true: what a file connects to, or a project data-flow map.',
   schema: {
-    path: z.string().optional().describe('File path. Required for everything except action="status".'),
-    segment: z.string().optional().describe('Read full text of segment N (or "5.3" for nested). Default if no other op given returns skeleton. Reading a segment also unlocks it (and everything it displays) for destructive verbs.'),
-    trace: z.union([z.boolean(), z.string()]).optional().describe('true = trace this file\'s signal flow: outgoing imports (resolved to project files), incoming importers, databases, and external binaries/servers it touches. Unverified direct connections get an L3 validation attempt, walked in order — first failure stops the walk. "N" reserved for segment-level trace (currently returns file-level with a granularity note).'),
+    path: z.string().optional().describe('A project name, a folder, or a file. Omit to list your projects.'),
+    segment: z.string().optional().describe('In a file: a segment number ("31" or "31.17"). In a project: a coordinate, a file ("d.a.f") or a file plus segment ("d.a.f.31.17"). Reading a segment unlocks it for editing.'),
+    trace: z.union([z.boolean(), z.string()]).optional().describe('true on a file: its imports in and out, databases and external servers, and any imports that lead nowhere right now. true on a project: its data-flow map.'),
     replace: z.string().optional().describe('Address of segment to replace (used with content). Target must have been read in the current buffer state.'),
     content: z.string().optional().describe('New text for replace.'),
     delete: z.array(z.string()).optional().describe('List of segment addresses to remove. Each target must have been read in the current buffer state.'),
@@ -2585,14 +2585,14 @@ export default {
     uncomment: z.string().optional().describe('Strip line-comment markers from a previously commented segment. Target must have been read in the current buffer state.'),
     undo: z.union([z.boolean(), z.string()]).optional().describe('true=last edit, "all"=full revert, "<address|segId>"=revert that segment. Structural ops (insert/delete/move) require LIFO undo.'),
     diff: z.boolean().optional().describe('Show changes vs disk.'),
-    verify: z.number().optional().describe('Validate the buffer: 1 = syntax, 2 = syntax + linter, 3 = also checks that imports resolve. Returns the token commit needs.'),
-    commit: z.boolean().optional().describe('Atomic write to disk. Requires a current verify token.'),
+    // (verify happens inside commit)
+    commit: z.boolean().optional().describe('Save the edit. Checks first: an L1 syntax or L2 config failure blocks the save; L3 issues (imports, SQL) save but are reported.'),
     discard: z.boolean().optional().describe('Drop buffer, no disk change.'),
     paste: z.object({
       from: z.string().optional().describe('Read-buffer segment address to copy (omit or "all" for whole file).'),
       to: z.string().describe('Edit-buffer segment address to overwrite with the copied text. Must have been read in the current buffer state.'),
     }).optional().describe('Clipboard paste: copy verbatim from the read buffer into an edit-target segment.'),
-    search: z.string().optional().describe('For huge files: keyword to filter the skeleton to matching segments (grouped in 10s) instead of dumping all titles.'),
+    search: z.string().optional().describe('Filter by name. On a project: files and folders whose path matches. On a file: segments whose name matches.'),
     full_skeleton: z.boolean().optional().describe('Show the whole skeleton even when it is very large (above ~3000 tokens the skeleton is not dumped; use search or this flag).'),
     action: z.enum(['status']).optional().describe('Tool-level action: "status" lists open buffers.'),
   },
@@ -2710,7 +2710,7 @@ export default {
       const txGuard = (buffer) => {
         if (buffer.editStack && buffer.editStack.length > 0) {
           return {
-            error: 'transaction open: an uncommitted edit is pending — verify+commit, undo, or discard before the next edit',
+            error: 'an edit is waiting: commit, undo or discard it before the next edit',
             edits_pending: buffer.editStack.length,
             dirty: true,
           };
