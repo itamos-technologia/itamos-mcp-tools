@@ -50,6 +50,7 @@ function sha256OfFile(absPath) {
 //   architect DB lives at:      <root>/master-architect.db
 // (two .. up from this file)
 const _THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
+import { getDb as ensureArchitectDb } from '../db.js';   // creates the DB + schema when missing
 const DEFAULT_ARCHITECT_DB = path.join(_THIS_DIR, '..', '..', 'master-architect.db');
 
 const ROOTS_REFRESH_MS = 60 * 1000;   // refresh project-roots cache every 60s
@@ -1772,3 +1773,44 @@ export function updateExternalSpecs(absPath, refs) {
   for (const p of [..._rootsCaches.keys()]) if (under(p)) _rootsCaches.delete(p);
   for (const k of [..._loadedProjectsThisSession]) if (under(k.split('#')[0])) _loadedProjectsThisSession.delete(k);
 });
+
+/**
+ * Real projects (placeholder unknown_N clusters excluded), for write_file's
+ * "which project?" question. Returns [] when there is no architect DB yet.
+ */
+export function listProjects() {
+  const db = getDb();
+  if (!db) return [];
+  try {
+    return db.prepare(
+      "SELECT id, name, root_path FROM projects WHERE root_path NOT LIKE 'unknown://%' ORDER BY name"
+    ).all();
+  } catch (err) {
+    console.error(`[architect-link] listProjects error: ${err.message}`);
+    return [];
+  }
+}
+
+/**
+ * Create a new, empty project rooted at rootPath (write_file: the agent chose a
+ * new project name for a new file). Creates the architect DB first if this
+ * sandbox has none yet. One folder can host only one project (root_path is
+ * UNIQUE), so a folder that is already a project root is refused with its name.
+ * Returns { ok, project_id } or { ok:false, error }.
+ */
+export function createProject(name, rootPath) {
+  try { ensureArchitectDb(); } catch (err) { return { ok: false, error: err.message }; }
+  const db = getWriteDb();
+  if (!db) return { ok: false, error: 'architect DB unavailable' };
+  rootPath = path.resolve(rootPath);
+  const byName = db.prepare('SELECT id FROM projects WHERE name = ?').get(name);
+  if (byName) return { ok: false, error: `a project named '${name}' already exists` };
+  const byRoot = db.prepare('SELECT name FROM projects WHERE root_path = ?').get(rootPath);
+  if (byRoot) {
+    return { ok: false, error: `the folder ${rootPath} is already the root of project '${byRoot.name}' — attach the file to that project instead` };
+  }
+  const r = db.prepare('INSERT INTO projects (name, root_path) VALUES (?, ?)').run(name, rootPath);
+  _rootsCaches.delete(resolveDbPath());   // the new root must be visible to matchProjectRoot at once
+  return { ok: true, project_id: r.lastInsertRowid };
+}
+

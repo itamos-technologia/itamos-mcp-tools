@@ -1,46 +1,69 @@
 import { z } from 'zod';
 import { promises as fs } from 'fs';
-import path from 'path';import { fileIntoProject } from '../tools/master-architect/lib/editor/architect-link.js';
+import path from 'path';
+import { registerBareFile, listProjects, createProject } from '../tools/master-architect/lib/editor/architect-link.js';
 
-
+// write_file creates NEW files only (never overwrites) and never decides a
+// project on its own: the agent names one every time — an existing project
+// to attach the file to, or a new name to start a project with this file.
 export default {
   name: 'write_file',
-  description: 'Write content to NEW file. Cannot overwrite existing files — use read_file replace to edit existing files.',
+  description: 'Create a NEW file (never overwrites; edit existing files with read_file). Every new file must belong to a project: pass project="<existing name>" to attach it, or a new name to start a new project rooted at the file\'s folder. Called without project, nothing is written and the existing projects are listed.',
   schema: {
     path: z.string().describe('File path'),
     content: z.string().describe('Content to write'),
+    project: z.string().optional().describe('Project this file belongs to: an existing project name (attach) or a new name (creates the project, rooted at this file\'s folder). Required — without it the call only lists projects.'),
   },
-  async handler({ path: filePath, content }) {
+  async handler({ path: filePath, content, project }) {
+    const reply = (text) => ({ content: [{ type: 'text', text }] });
     try {
-      // Block overwriting existing files — use read_file replace instead
+      // Block overwriting existing files — use read_file to edit them
       try {
         await fs.access(filePath);
-        return { content: [{ type: 'text', text: `File already exists: ${filePath}. Use read_file with replace to edit existing files.` }] };
+        return reply(`File already exists: ${filePath}. Use read_file to edit existing files.`);
       } catch {}
-      // Ensure parent directory exists
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, content, 'utf8');
 
-      // PLACEMENT GATE (H7/H8): file the new file into a project as a bare
-      // record. Never prompts — under a project root -> that project; else an
-      // unknown_N cluster that self-corrects later. Best-effort: a placement
-      // failure must NOT fail the write itself.
-      let placementMsg = '';
-      try {
-        const r = fileIntoProject(filePath);
-        if (r && r.filed) {
-          placementMsg = ` — filed under project '${r.project_name}'`
-            + (r.placement === 'unknown'
-                ? ' (unknown cluster, will reconcile as links are discovered)'
-                : ' (v1 bare record, unparsed)');
+      const absPath = path.resolve(filePath);
+      const folder = path.dirname(absPath);
+      const projects = listProjects() || [];
+      const listing = projects.length
+        ? projects.map(p => `  - ${p.name}  (${p.root_path})`).join('\n')
+        : '  (no projects yet)';
+
+      // No project named: ask, write nothing.
+      if (!project || !project.trim()) {
+        return reply(
+          `Not written: which project does ${filePath} belong to?\n`
+          + `Existing projects:\n${listing}\n`
+          + `Call write_file again with project="<existing name>" to attach it, `
+          + `or project="<new name>" to start a new project rooted at ${folder}.`);
+      }
+      project = project.trim();
+
+      // Existing project → attach. New name → create (rooted at this file's folder).
+      let target = projects.find(p => p.name === project);
+      let created = false;
+      if (!target) {
+        const c = createProject(project, folder);
+        if (!c || !c.ok) {
+          return reply(`Not written: could not create project '${project}' (${c?.error || 'architect DB unavailable'}).\n`
+            + `Existing projects:\n${listing}`);
         }
-      } catch (pe) {
-        placementMsg = ` — (architect placement skipped: ${pe.message})`;
+        target = { id: c.project_id, name: project, root_path: folder };
+        created = true;
       }
 
-      return { content: [{ type: 'text', text: `Written: ${filePath}${placementMsg}` }] };
+      await fs.mkdir(folder, { recursive: true });
+      await fs.writeFile(absPath, content, 'utf8');
+
+      const r = registerBareFile(absPath, target.id);
+      const outside = !(absPath === target.root_path || absPath.startsWith(target.root_path + path.sep));
+      return reply(
+        `Written: ${filePath} — ${created ? 'new project' : 'attached to project'} '${target.name}'`
+        + (r && r.filed ? '' : ` (project record not updated: ${r?.error || 'architect DB unavailable'})`)
+        + (outside ? `. Note: the file is outside the project folder ${target.root_path}.` : '.'));
     } catch (e) {
-      return { content: [{ type: 'text', text: `Error writing ${filePath}: ${e.message}` }] };
+      return reply(`Error writing ${filePath}: ${e.message}`);
     }
   },
 };

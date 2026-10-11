@@ -70,6 +70,8 @@ import { promisify } from 'util';
 import os from 'os';
 import crypto from 'crypto';
 import Database from 'better-sqlite3';
+import { checkImportsInContent } from './lib/import_check.js';
+import { matchProjectRoot } from './lib/editor/architect-link.js';
 import { getProjectInfoForFile, markFileVerified, markFileUnverified, checkAndHandleDrift, checkImportResolution, discoverAndFileByLinks, storeFileContent, getStoredSkeleton, refreshFileModules, updateExternalSpecs } from './lib/editor/architect-link.js';
 import { detectExternalRefs, gatherSpecs } from './lib/external_detect.js';
 import { segmentFile as workerSegmentFile } from './lib/segmenter.js';
@@ -935,6 +937,22 @@ async function checkCFamilyInContext(filePath, tmp, content, language) {
   }
 }
 
+// First ERROR / MISSING node, as "at line N: <that line>" so an agent can find it.
+function firstParseError(root, content) {
+  const isMissing = (n) => (typeof n.isMissing === 'function' ? n.isMissing() : !!n.isMissing);
+  const stack = [root];
+  while (stack.length) {
+    const n = stack.shift();
+    if (n.type === 'ERROR' || isMissing(n)) {
+      const row = n.startPosition.row;
+      const text = (content.split('\n')[row] || '').trim().slice(0, 120);
+      return `at line ${row + 1}${isMissing(n) ? ` (missing ${n.type})` : ''}: ${text}`;
+    }
+    for (let i = 0; i < n.childCount; i++) stack.push(n.child(i));
+  }
+  return '(location unknown)';
+}
+
 async function verifyL1(filePath, content, language) {
   // Config files: real syntax / structure checks (JSON, YAML, TOML parsers;
   // brace, tag and INI structure) instead of "plain text, no check".
@@ -949,7 +967,7 @@ async function verifyL1(filePath, content, language) {
   if (parser) {
     const tree = parser.parse(content);
     if (tree.rootNode.hasError) {
-      return { level: 1, ok: false, messages: ['L1 tree-sitter: parse errors detected'] };
+      return { level: 1, ok: false, messages: [`L1 tree-sitter: parse error ${firstParseError(tree.rootNode, content)}`] };
     }
   }
   const tmp = await writeBufferToTemp(filePath, content);
@@ -961,7 +979,7 @@ async function verifyL1(filePath, content, language) {
       } catch (e) {
         return { level: 1, ok: false, messages: ['L1 tree-sitter: OK', `L1 py_compile: ${(e.stderr || e.message).trim()}`] };
       }
-    } else if (language === 'javascript' || language === 'typescript') {
+    } else if (language === 'javascript') {
       try {
         await execAsync(`node --check "${tmp}"`, { timeout: 10000 });
         return { level: 1, ok: true, messages: ['L1 tree-sitter: OK', 'L1 node --check: OK'] };
@@ -1128,7 +1146,8 @@ async function verifyL3(filePath, content, language) {
   // until the imports are fixed and L3 passes.
   let importCheck;
   try {
-    importCheck = checkImportResolution(filePath);
+    importCheck = await checkImportsInContent(filePath, content,
+      matchProjectRoot(path.resolve(filePath))?.root_path || null);
   } catch (err) {
     return {
       level: 3,
@@ -1149,14 +1168,14 @@ async function verifyL3(filePath, content, language) {
 
   if (!importCheck.ok) {
     const unresolvedList = importCheck.unresolved
-      .map(u => `'${u.import_path}'${u.line ? ` (line ${u.line})` : ''}`)
+      .map(u => `'${u.import_path}'${u.line ? ` (line ${u.line})` : ''}${u.reason ? ` — ${u.reason}` : ''}`)
       .join(', ');
     return {
       level: 3,
       ok: false,
       messages: [
         ...l2.messages,
-        `L3 import resolution: ${importCheck.unresolved.length} unresolved local import(s): ${unresolvedList}`,
+        `L3 import resolution: ${importCheck.unresolved.length} import(s) lead nowhere: ${unresolvedList}`,
         'Note: file CAN still be committed at L1 or L2; only the verified status is blocked at L3.',
       ],
     };
@@ -2212,6 +2231,7 @@ async function opCommit(buffer) {
   const _l1Ceiling = PLAINTEXT_LANGS.has(buffer.language);
 
   let verifiedLevel;
+  let l3ok = false, l3msgs = [];
   if (_l1Ceiling) {
     // plain-text/json/markdown top out at L1 — L1 is their ceiling and floor.
     const l1 = await verifyL1(buffer.path, _content, buffer.language);
@@ -2235,7 +2255,6 @@ async function opCommit(buffer) {
       };
     }
     // L2 passed — attempt L3 (best-effort; failure just caps the stamp at L2).
-    let l3ok = false, l3msgs = [];
     try {
       const l3 = await verifyL3(buffer.path, _content, buffer.language);
       l3ok = !!l3.ok; l3msgs = l3.messages || [];
@@ -2330,14 +2349,27 @@ async function opCommit(buffer) {
       // L1/L2 commit: file changed but not L3-verified. Mark unverified.
       const r = markFileUnverified(buffer.path);
       if (r) projectStatusUpdate = { file: buffer.path, status: 'unverified',
-                                     hint: 'Commit succeeded but verify level < 3. File flagged unverified. Run verify=3 + commit again to mark verified.' };
+                                     hint: 'Saved, but level 3 is incomplete. Fix the issues listed under check and save again to mark the file verified.' };
     }
   } catch (err) {
     console.error(`[read_file] architect-link write error: ${err.message}`);
   }
 
+  // L3 failure never blocks the save (a new project's first files import
+  // files that don't exist yet) — but it is reported, with the call that
+  // lists exactly what is still unresolved.
+  const l3Issues = l3msgs.filter(m => !/^L[12]\b/.test(m) && !/OK\b|resolve correctly|no DB references/.test(m)
+    && !/^Note: file CAN still be committed/.test(m));
+  const check = _l1Ceiling
+    ? 'pass L1 (plain text: syntax only)'
+    : (verifiedLevel >= 3 ? 'pass L3' : 'saved — L3 incomplete');
   return {
     committed: true,
+    check,
+    ...(verifiedLevel < 3 && !_l1Ceiling ? {
+      incomplete: l3Issues.length ? l3Issues : ['level 3 did not pass'],
+      see_what_is_missing: `read_file(path="${buffer.path}", trace=true)`,
+    } : {}),
     path: buffer.path,
     bytes_written: finalText.length,
     edits_applied: editsApplied,
@@ -2577,6 +2609,14 @@ export default {
           project: proj.project_name,
           ...conn,
         };
+        // Live check of the file as it is on disk (the index above can lag
+        // behind the last save): which imports lead nowhere right now.
+        try {
+          const live = await checkImportsInContent(args.path, readFileSync(args.path, 'utf8'),
+            matchProjectRoot(path.resolve(args.path))?.root_path || null);
+          out.imports_leading_nowhere = live.unresolved;
+          if (live.note) out.imports_note = live.note;
+        } catch (e) { out.imports_note = `live import check failed: ${e.message}`; }
         // Validation walk: one hop over direct connections, in order.
         // Verified neighbors pass silently; unverified ones get an L3 attempt;
         // the first failure stops the walk (and says so).

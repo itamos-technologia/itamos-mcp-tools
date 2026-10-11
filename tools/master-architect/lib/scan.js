@@ -56,6 +56,26 @@ const SHARED_PARSERS = {
   rust: (rootNode) => rustParseWithRootNode(rootNode),
 };
 
+// The scanner's parse of one file's text, without a scan: L3 uses this to read
+// the imports of the content being SAVED (lib/import_check.js). Same detection,
+// parser and shared-parse path as scanProject. Returns { language, parser,
+// analysis } or null for files that have no parser.
+export async function analyzeContent(absPath, content) {
+  const det = detectLanguage(absPath);
+  if (!det || det.kind !== 'supported') return null;
+  const parser = await getParser(det.language, det.parserFile);
+  if (!parser) return null;
+  const sharedFn = SHARED_PARSERS[det.language];
+  let analysis;
+  if (sharedFn) {
+    const { rootNode } = parseTree(content, det.language);
+    analysis = sharedFn(rootNode, content);
+  } else {
+    analysis = parser.parseFile(content);
+  }
+  return { language: det.language, parser, analysis };
+}
+
 // ─── Concurrency control ─────────────────────────────────────────────────
 
 const _activeScans = new Map();   // userId → { startedAt, startedAtMs, expectedMs }
