@@ -87,7 +87,7 @@ The sandbox server speaks standard MCP over HTTP POST with SSE support.
 
 Compatible with any MCP client. Used in practice through Claude.ai and through direct API integration (our benchmark harness).
 
-Hosted sandbox (free live alpha): add `https://mcp.itamos-technologia.com/mcp` as a connector in any MCP client. A page opens where you create your sandbox with one click, no account needed. Sandboxes are deleted after 10 minutes of inactivity, so don't use them for sensitive data.
+**Try it in Claude (free live alpha):** copy `https://mcp.itamos-technologia.com/mcp`, open [Claude's connector settings](https://claude.ai/customize/connectors), click **Add custom connector**, paste the address and click **Add**. A page opens with one button, **Create my sandbox**: no account, no email. Switch it on in a chat (**+** → **Connectors**) and ask, for example, *"Go to bbc.com/news and tell me the top stories."* In other MCP clients, add the same address as a remote MCP server. Sandboxes are deleted after 10 minutes of inactivity, so don't use them for sensitive data.
 
 ---
 

@@ -19,6 +19,30 @@
 <a id="overview"></a>
 ## Overview
 
+### Give Claude a sharper web browser
+
+Claude can read web pages already. With this add-on it sees a page the way you do: its layout, menus and buttons. It reads only the part you ask about and can click through to the next page. It works in the Claude app on the web and on the desktop. Free, nothing to install, no sign-up.
+
+1. Copy this address:
+
+   ```
+   https://mcp.itamos-technologia.com/mcp
+   ```
+
+2. [Open Claude's connector settings](https://claude.ai/customize/connectors), click **Add custom connector**, paste the address and click **Add**.
+3. A small page appears with one button, **Create my sandbox**. Click it. No account, no email, no password.
+4. In a new chat, click **+** → **Connectors** and switch it on. Then just ask. For example:
+   - "Go to bbc.com/news and tell me the top stories."
+   - "Open this pancake recipe and give me only the ingredients: bbcgoodfood.com/recipes/easy-pancakes"
+   - "What are the British Museum's opening hours? Check britishmuseum.org/visit"
+   - Developers: "Clone github.com/pallets/flask and show me how routing works."
+
+**Is it safe?**
+
+- It can't see your computer, your files or your other chats. It only visits the pages you ask about, inside a private space of its own.
+- Nothing is kept: your space and everything in it are deleted after 10 minutes without use. We keep only daily totals per tool and standard web-server logs (IP addresses, 14 days).
+- Free, and open source: anyone can check the code.
+
 ```mermaid
 flowchart TD
   c["<b>Your MCP client</b>"] --> s["<b>Sandbox server</b><br/>sign-in, slots, queue, isolation"]
@@ -592,17 +616,29 @@ Pages are rendered in headless Chromium through the Chrome DevTools Protocol, so
 - Only https for public sites; `file://`, `data:` and similar schemes are blocked.
 
 <a id="try-it"></a>
-## Try it
+## Try it in Claude in under a minute
 
-Add this URL as a custom connector in your MCP client:
+1. Copy this address:
 
-```
-https://mcp.itamos-technologia.com/mcp
-```
+   ```
+   https://mcp.itamos-technologia.com/mcp
+   ```
 
-1. Add the URL as a connector in your MCP client.
-2. A page opens: choose **Create my sandbox**. No account needed.
-3. Ask your agent to clone a repository and explore it with the tools.
+2. [Open Claude's connector settings](https://claude.ai/customize/connectors), click **Add custom connector**, paste the address and click **Add**.
+3. A small page appears with one button, **Create my sandbox**. Click it. No account, no email, no password.
+4. In a new chat, click **+** → **Connectors** and switch it on. Then just ask. For example:
+   - "Go to bbc.com/news and tell me the top stories."
+   - "Open this pancake recipe and give me only the ingredients: bbcgoodfood.com/recipes/easy-pancakes"
+   - "What are the British Museum's opening hours? Check britishmuseum.org/visit"
+   - Developers: "Clone github.com/pallets/flask and show me how routing works."
+
+**Team or Enterprise plan?** An Owner adds the address once in [Organization connectors](https://claude.ai/admin-settings/connectors); members then click **Connect**. **Another AI app?** Add the same address as a remote MCP server.
+
+**Is it safe?**
+
+- It can't see your computer, your files or your other chats. It only visits the pages you ask about, inside a private space of its own.
+- Nothing is kept: your space and everything in it are deleted after 10 minutes without use. We keep only daily totals per tool and standard web-server logs (IP addresses, 14 days).
+- Free, and open source: anyone can check the code.
 
 Source code: [https://github.com/itamos-technologia/itamos-mcp-tools](https://github.com/itamos-technologia/itamos-mcp-tools)
 
