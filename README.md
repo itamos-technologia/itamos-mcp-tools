@@ -9,7 +9,7 @@
 
 Every LLM coding assistant faces the same wall: codebases are too large to fit in context. The standard response is to dump files — grep for something promising, cat it, hope for the best. At 50k files this breaks. At 240k files it never worked.
 
-We built four tools that give an LLM structured perception of a codebase instead of raw file access, plus a sandboxed git to bring code in. The result is a model that navigates code the way a senior engineer does — starting from the architecture, narrowing to the module, reading only the segment it needs.
+We built four tools that give an LLM structured perception of a codebase instead of raw file access, plus a sandboxed git to bring code in. The result is a model that navigates code the way a senior engineer does — starting from the architecture, narrowing to the module, reading only the segment it needs. One call takes it from the project straight to the lines it needs, and every save is checked before it lands.
 
 
 **Read the full paper:** [docs/PAPER.md](docs/PAPER.md): how each tool works, why it was designed that way, and how the hosted sandbox runs, with diagrams.
@@ -20,10 +20,10 @@ We built four tools that give an LLM structured perception of a codebase instead
 
 | Tool | What it does |
 |------|-------------|
-| master_architect | Project-aware code navigation. Builds a graph of your codebase, exposes topology, per-file bone structure, and segment-level addressing. The entry point for any codebase task. |
-| read_file | Segment-addressed file editor. Returns a skeleton by default. Read segment N to get the code. Edit with verify then commit. Project-aware. |
-| write_file | Create new files with automatic project placement. Refuses overwrites — edits go through read_file. |
-| git | The original Itamos git tool, sandboxed for security: clone (remote URLs only, depth=1), status, commit. Everything stays inside the session workspace; push is not available. |
+| read_file | The single entry point. With no path it lists your projects; a project name shows its structure with coordinates (no code); a coordinate opens a file map or one segment in a single call. Edits one segment at a time, and every save is verified automatically. |
+| master_architect | The engine behind read_file. Indexes the codebase into a graph (files, imports, databases, servers) and keeps it in step with every save. In the sandbox it is not called directly: read_file does it. |
+| write_file | Creates new files only and never overwrites; edits go through read_file. Every new file belongs to a project the agent names: an existing one, or a new name to start one. Nothing is placed automatically. |
+| git | The original Itamos git tool, sandboxed for security: clone (remote URLs only, depth=1), status, commit. A clone is scanned into a project as soon as it finishes. Everything stays inside the session workspace; push is not available. |
 | web_skeleton | LLM-first web perception. 97% token reduction vs raw HTML. Actions: search, skeleton, read, click. |
 
 **At least 97% fewer tokens** than the usual shell workflow (grep, cat, run_cmd), measured against the best case where the model fixes the bug in one attempt. Real sessions save more, because the failed attempts common with raw shell access aren't counted.
@@ -36,13 +36,34 @@ We built four tools that give an LLM structured perception of a codebase instead
 
 Every client gets an isolated workspace. No shared state, no cross-session leakage. Workspaces are wiped after 10 minutes of inactivity.
 
-### master_architect navigation flow
+### Navigation: project → file → segment
 
-The model is guided through four phases: scan to index the repo, topology to see the data-flow graph, bones to inspect a file, navigate or read_file to read the specific segment. The model never reads a file it has not first located in the graph.
+```
+read_file()                                            → your projects
+read_file(path="itsdangerous")                         → the structure: folders and files with coordinates, no code
+read_file(path="itsdangerous", segment="d.a.f")        → the map of signer.py, one line per segment
+read_file(path="itsdangerous", segment="d.a.f.31.17")  → the code of verify_signature, nothing else
+```
 
-### read_file segment addressing
+**Coordinates**: letters are location (folders and files share one sequence per folder), numbers are what is inside a file. `d.a.f.31.17` reads as src → itsdangerous → signer.py → segment 31.17. A folder that has never been scanned is scanned on first read; a cloned repository is scanned as soon as the clone finishes.
 
-Files are parsed into named segments. A 5000-line file might have 40 segments. The model reads the skeleton, picks the segment it needs, reads that segment. Total context used is roughly 120 lines instead of 5000.
+**Nothing is dumped**: a structure or file map over ~3,000 tokens returns an overview and asks for a search term instead. `search` works on both: file and folder names in a project, segment names in a file. `trace=true` shows what a file connects to, or a project's data flow.
+
+### Segments
+
+Files are parsed into named segments. A 5000-line file might have 40 segments; its map is one line per segment, with classes listing their methods. The model reads the map, picks the segment it needs, reads that segment. Total context used is roughly 120 lines instead of 5000.
+
+### Editing and verification
+
+One edit at a time, and only on segments the model has read since the last change, so it can never change code it has not looked at. Saving verifies the file first:
+
+| Level | Checks | On failure |
+|---|---|---|
+| L1 | Syntax: tree-sitter plus the language's own checker (py_compile, node --check, php -l, bash -n, gofmt, C/C++ in project context, config parsers) | Not saved; the error names the line |
+| L2 | Config files through their service's checker (nginx -t, sshd -t, visudo, systemd-analyze). Linters run too | Config failure: not saved. Linter findings are only reported |
+| L3 | Connections: every local import resolves to a project file (Python and JavaScript/TypeScript: any other import must be an installed package); SQL is checked against the live database schema | Saved, with what is incomplete and how to see it, so a project's first files can import files that don't exist yet |
+
+L3 checks the content being saved, not an older index, and every save re-indexes the file in every supported language, so the map never lags behind the disk.
 
 ### web_skeleton token reduction
 
