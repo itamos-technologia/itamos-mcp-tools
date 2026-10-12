@@ -34,33 +34,33 @@ PAGE_KEYWORDS = ('MCP, Model Context Protocol, MCP server, MCP sandbox, AI agent
 # ── diagrams: vertical flows. nodes = (title, detail); back = (from, to, label) ──
 DIAGRAMS = {
     'architect': {
-        'caption': 'master_architect turns a project into a map the agent can query.',
-        'nodes': [('scan', 'parse every file once'),
-                  ('project graph (SQLite)', 'files, modules, imports, databases'),
-                  ('topology', 'the map: files and how they connect'),
-                  ('bones / connections / missing', 'zoom into one file or one link'),
-                  ('read_file', 'open the exact segment')],
+        'caption': 'master_architect: the engine that keeps the map read_file answers from.',
+        'nodes': [('scan', 'once per project; every save keeps it current'),
+                  ('project graph (SQLite)', 'files, imports, databases, servers'),
+                  ('coordinates', 'letters: folders and files; numbers: inside'),
+                  ('read_file', 'structure, file map, segment: one door')],
     },
     'read_file': {
-        'caption': 'read_file: nothing reaches disk until it passes verification.',
-        'nodes': [('skeleton', 'named segments, no code yet'),
+        'caption': 'read_file: from the project to one segment, and nothing broken reaches disk.',
+        'nodes': [('structure', 'a project: folders and files, no code'),
+                  ('file map', 'one line per segment'),
                   ('read segment', 'displaying it unlocks it for editing'),
-                  ('edit in a buffer', 'replace, insert, delete, move, paste'),
-                  ('verify 1 → 2 → 3', 'syntax, compiler or service check, references'),
-                  ('commit', 'atomic write; undo is possible until then')],
-        'back': (3, 2, 'fails: fix, verify again'),
+                  ('one edit', 'replace, insert, delete, move, paste'),
+                  ('save', 'checked first, then an atomic write')],
+        'back': (4, 3, 'fails: not saved, fix the edit'),
     },
     'write_file': {
-        'caption': 'write_file: new files only, filed into the project map.',
+        'caption': 'write_file: new files only, always in a project the agent names.',
         'nodes': [('path', 'where the new file goes'),
                   ('jail check', 'must stay inside your sandbox'),
                   ('exists?', 'refused: edit it with read_file'),
-                  ('write', 'missing folders are created'),
-                  ('file into the map', 'master_architect knows it at once')],
+                  ('which project?', 'an existing one, or a new name'),
+                  ('write and index', 'the map knows it at once')],
     },
     'git': {
         'caption': 'git: code comes in, nothing goes out.',
         'nodes': [('clone', 'remote URL, shallow, symlinks off'),
+                  ('scanned', 'into a project, automatically'),
                   ('work', 'with the other tools'),
                   ('status', 'what changed'),
                   ('commit', 'saved in your sandbox, no push')],
@@ -73,15 +73,14 @@ DIAGRAMS = {
                   ('click', 'follow a link or button by id')],
     },
     'loop': {
-        'caption': 'The working loop: locate, read, change, verify, commit.',
-        'nodes': [('scan', 'index the project once'),
-                  ('topology', 'see files and how they connect'),
-                  ('bones', 'one file: imports and functions'),
+        'caption': 'The working loop: locate, read, change, save.',
+        'nodes': [('clone or open', 'a project is scanned once'),
+                  ('structure', 'folders and files with coordinates'),
+                  ('file map', 'one line per segment'),
                   ('read a segment', 'only the part you need'),
-                  ('edit', 'in a buffer, not on disk'),
-                  ('verify', 'parse, compile, check references'),
-                  ('commit', 'atomic write to disk')],
-        'back': (5, 4, 'fails: fix, verify again'),
+                  ('edit', 'one change at a time'),
+                  ('save', 'checked, then written atomically')],
+        'back': (5, 4, 'fails: not saved, fix and save again'),
     },
     'request': {
         'caption': 'One tool call, from your client to your sandbox.',
@@ -127,11 +126,11 @@ DEPS = {
     },
     'master_architect': {
         'caption': 'master_architect components. Dashed: third-party software.',
-        'root': ('master_architect', 'project map tool'),
+        'root': ('master_architect', 'the engine behind read_file'),
         'items': [('scan.js', 'walks and indexes the project', False),
                   ('parsers', '16 languages, incl. nginx and SQL', False),
                   ('db.js', 'graph storage', False),
-                  ('query.js', 'topology, bones, connections, ping', False),
+                  ('query.js', 'structure, data flow, connections', False),
                   ('registry.js', 'languages and file types', False),
                   ('estimate.js', 'size check before a scan', False),
                   ('architect-link.js', 'follows links between files', False),
@@ -140,8 +139,10 @@ DEPS = {
     },
     'read_file': {
         'caption': 'read_file components. Dashed: third-party software.',
-        'root': ('read_file', 'segment editor'),
-        'items': [('segmenter.js', 'files into named segments', False),
+        'root': ('read_file', 'the single door'),
+        'items': [('project_view.js', 'projects, structure, coordinates', False),
+                  ('segmenter.js', 'files into named segments', False),
+                  ('import_check.js', 'imports of the code being saved', False),
                   ('config_segmenter.js', 'nginx, systemd, INI and more', False),
                   ('config_validators.js', 'service checks such as nginx -t', False),
                   ('external_detect.js', 'binaries and servers in code', False),
@@ -154,7 +155,8 @@ DEPS = {
         'caption': 'write_file components.',
         'root': ('write_file', 'creates new files'),
         'items': [('path jail', 'confines the target path', False),
-                  ('architect-link.js', 'files it into the project map', False)],
+                  ('architect-link.js', 'creates or joins the project', False),
+                  ('scan.js', 'indexes the new file at once', False)],
     },
     'git': {
         'caption': 'git components. Dashed: third-party software.',
@@ -233,17 +235,17 @@ PAGES = [
                   'edits and broken files, and leaves the agent without a map of how files connect.'),
             ('h2', 'principles', 'Design principles'),
             ('ul', ['**Structure before text.** The agent sees the map first, then zooms in.',
-                    '**Addresses, not line numbers.** Code is referred to by structural addresses that stay valid when other parts of the file change.',
+                    '**Coordinates, not line numbers.** Folders, files and the parts inside them have short coordinates such as `d.a.f.31.17` that stay valid when other parts of a file change.',
                     '**Read before write.** A tool will not change code the model has not displayed since the last change.',
-                    '**Verify before commit.** Edits stay in a buffer until they pass checks; only then do they reach disk.',
-                    '**One job per tool.** Small, predictable tools are easier for a model to use correctly than one tool that does everything.',
+                    '**Checked before saved.** Every save is verified first: broken syntax or configuration never reaches disk, and missing connections are saved but reported.',
+                    '**Few tools, one door.** The agent reads and edits through read_file and creates through write_file; the project map works behind them. Few, predictable tools are easier for a model to use correctly.',
                     '**The smallest useful answer.** Every response is the least text that answers the question, with a way to ask for more.']),
             ('h2', 'together', 'How the tools work together'),
             ('diagram', 'loop'),
-            ('p', 'A typical bug fix: the agent scans the repository, uses `topology` and `bones` to '
-                  'find the function named in the error, reads that one segment, replaces it, '
-                  'verifies and commits. If verification fails, it gets the exact error and tries '
-                  'again; the broken version never touches disk.'),
+            ('p', 'A typical bug fix: the agent clones the repository, which is scanned on arrival, '
+                  'opens the project structure, opens the file named in the error by its coordinate, '
+                  'reads that one function, replaces it and saves. If the save fails its checks, it '
+                  'gets the exact error and line and tries again; the broken version never touches disk.'),
             ('h2', 'evidence', 'Evidence so far'),
             ('ul', ['In live use with Claude models (Opus and Sonnet), agents use the tools to navigate and change real codebases end to end.',
                     'Locally run open models of 27 to 31 billion parameters found the right file and function in an unfamiliar codebase, but did not complete the fix without guidance. Good tools help; model capability still matters.']
@@ -332,9 +334,9 @@ PAGES = [
     {
         'file': 'mcp-tool-master-architect.html',
         'title': 'master_architect',
-        'desc': 'master_architect: a project map for AI agents. How it indexes a codebase and what it can do.',
-        'lead': ('The project map. It indexes a codebase once and lets the agent see files, '
-                 'functions and how they connect, before reading a single line.'),
+        'desc': 'master_architect: the engine behind read_file. How it indexes a codebase and keeps the map current.',
+        'lead': ('The project map. It indexes a codebase and keeps the index current on every save, '
+                 'so read_file can show files, functions and how they connect before a single line is read.'),
         'blocks': [
             ('diagram', 'architect'),
             ('h2', 'components', 'Components'),
@@ -342,35 +344,26 @@ PAGES = [
             ('h2', 'how', 'How it works'),
             ('p', 'master_architect scans a project and stores it as a graph in SQLite: every file, '
                   'module, function and import, plus the databases, programs and servers the code '
-                  'refers to. Each item gets a hierarchical address such as `13.2.4`: file 13, '
-                  'module 2, method 4. Files it cannot parse still get an address (with letters), '
-                  'so they can be linked to.'),
-            ('h2', 'capabilities', 'Capabilities'),
-            ('ul', ['**topology:** the starting point. The project\'s files and how they import each other, plus databases and external programs.',
-                    '**bones:** one file\'s structure: its imports and its functions, with addresses.',
-                    '**navigate:** open a file, module or method by its address.',
-                    '**connections:** follow the links into and out of a file.',
-            '**ping:** traces where a file leads, hop by hop through its imports (see below).',
-            '**context:** a cross-reference summary for a file, by its path.',
-                    '**missing:** imports that point at nothing, found before anything runs.',
-                    '**estimate** and **scan:** check a project\'s size, then index it.',
-                    '**crawl:** follow links outward from a file to discover related files.',
-                    '**languages** and **stats:** supported languages and index statistics.']),
-            ('h2', 'trace', 'Tracing: where does a file lead?'),
-            ('p', '`ping` works like a network trace-route, over the import graph. Starting from one file, '
-                  'it follows every internal import hop by hop, numbering the hops, until each branch ends. '
-                  'Each route is labelled by how it ends:'),
-            ('ul', ['**external:** an import of an outside library.',
-                    '**blocked:** an internal import that resolves to nothing: a broken link.',
-                    '**cycle:** an import of a file the trace has already reached.',
-                    '**leaf:** a file that imports nothing.',
-                    '**endpoint:** a server, program, model or port the code refers to.']),
-            ('p', 'Routes come back longest first, the best place to start looking for a bug that '
-                  'surfaces far from its cause. The walk stops after 25 hops unless told otherwise. Tracing '
-                  'is per file today; tracing individual function calls is planned.'),
+                  'refers to. Every save re-indexes the saved file in every supported language, so the '
+                  'graph never lags behind the disk. The agent never calls it directly: read_file asks it.'),
+            ('h2', 'coordinates', 'Coordinates'),
+            ('p', 'Folders and files get letters, one sequence per folder: subfolders first, then files. '
+                  'What is inside a file gets numbers. `d.a.f.31.17` reads as folder `src`, folder '
+                  '`itsdangerous`, file `signer.py`, segment 31.17: the method `verify_signature`. One '
+                  'coordinate takes the agent from the project straight to the code in a single call.'),
+            ('h2', 'capabilities', 'What read_file gets from it'),
+            ('ul', ['**scan:** automatic, when a repository is cloned or a folder is first read, and per file on every save.',
+                    '**structure:** a project\'s folders and files with coordinates, language and size.',
+                    '**data flow:** which files import which, plus the databases, programs and servers they use.',
+                    '**connections:** one file\'s links in and out, and imports that lead nowhere.',
+                    '**database facts:** each SQL query linked to the database it runs on, so it can be checked against the live schema.']),
+            ('h2', 'venv', 'Python environments'),
+            ('ul', ['A project inside a Python virtual environment uses the venv folder as its root. The venv\'s own machinery (bin, lib, site-packages) is never indexed, only the project\'s code.',
+                    'A venv inside a project is left out of the index and reported in the project structure.',
+                    'Package checks look inside the project\'s venv, the way Python would at run time. Nothing from the project folder is ever executed to do so.']),
             ('h2', 'why', 'Why it is built this way'),
             ('ul', ['**SQLite** keeps the graph self-contained: no database server, and it handles graphs with hundreds of thousands of items.',
-                    '**Hierarchical addresses** are short enough to pass between tool calls and stay valid when lines move.',
+                    '**Coordinates** are short enough to pass between tool calls and say where something is at a glance: letters for location, numbers for code.',
                     '**Import resolution follows real project layouts:** packages, plain sibling imports in script folders, and `src/` layouts. An import rooted in the project that resolves to nothing is reported as broken, instead of being mistaken for an external library.']),
             ('h2', 'sandbox-notes', 'In the sandbox'),
             ('p', 'Scanning is limited to your sandbox, and your project map is stored inside it, so '
@@ -380,28 +373,34 @@ PAGES = [
     {
         'file': 'mcp-tool-read-file.html',
         'title': 'read_file',
-        'desc': 'read_file: a segment-addressed editor for AI agents with read-before-write and three-level verification.',
-        'lead': ('The segment editor. It shows a file as named parts, lets the agent change exactly '
-                 'one of them and refuses to save anything that does not pass verification.'),
+        'desc': 'read_file: the single door for AI agents: project structure, file maps and segments by coordinate, with read-before-write and checked saves.',
+        'lead': ('The single door. It shows a project as folders and files and a file as named parts, '
+                 'lets the agent change exactly one part at a time, and never saves a change that breaks '
+                 'syntax or configuration.'),
         'blocks': [
             ('diagram', 'read_file'),
             ('h2', 'components', 'Components'),
             ('deps', 'read_file'),
             ('h2', 'how', 'How it works'),
-            ('p', 'read_file parses a file into named segments: functions, classes, configuration '
-                  'blocks, paragraphs. By default it returns the skeleton, the list of segments '
-                  'with their names and sizes, not the code. The agent reads only the segment it '
-                  'needs. Every byte of the file belongs to exactly one segment, including blank '
-                  'lines, so joining the segments always gives back the original file.'),
+            ('p', '`read_file()` lists your projects; a project name shows its structure, with '
+                  'coordinates and no code; a coordinate opens a file\'s map or one segment. read_file '
+                  'parses a file into named segments: functions, classes, configuration blocks, '
+                  'paragraphs. The file map is one line per segment, with classes listing their methods. '
+                  'The agent reads only the segment it needs. Every byte of the file belongs to exactly '
+                  'one segment, including blank lines, so joining the segments always gives back the '
+                  'original file.'),
             ('h2', 'capabilities', 'Capabilities'),
             ('h3', 'Reading'),
-            ('ul', ['**skeleton:** the default view; `full_skeleton` forces the whole map of a very large file.',
-                    '**search:** narrows a large skeleton to matching segments.',
-                    '**segment:** reads one part by address, such as `5.3`.',
-            '**trace:** follows the file\'s signal through the codebase: what it imports, who imports it, and the databases, programs and servers it touches. It then checks the direct neighbours: any that has not been verified gets a level 3 check, and the walk stops at the first failure.',
+            ('ul', ['**projects:** `read_file()` with no path lists them.',
+                    '**structure:** a project name or a folder: folders and files with coordinates. Above about 3,000 tokens it gives an overview per folder and asks for a search.',
+                    '**file map:** the default view of a file, one line per segment. The same 3,000-token rule applies; `full_skeleton` forces the whole map.',
+                    '**search:** file and folder names in a project, segment names in a file.',
+                    '**segment:** one part by address, such as `5.3`, or straight from the project by coordinate, such as `d.a.f.31.17`.',
+                    '**trace:** on a file, what it imports, who imports it, the databases, programs and servers it touches, and any import that leads nowhere right now; direct neighbours not yet verified get a level 3 check, stopping at the first failure. On a project, its data flow.',
                     '**status:** lists open edit buffers.']),
             ('h3', 'Editing'),
-            ('ul', ['**replace**, **insert** between two segments, **delete**, **move**.',
+            ('ul', ['**One edit at a time:** each change is saved, undone or discarded before the next.',
+                    '**replace**, **insert** between two segments, **delete**, **move**.',
                     '**comment_out** and **uncomment** a segment while debugging.',
             '**paste:** copy a segment, or a whole file, verbatim from the read buffer into the file being edited (see the clipboard below).']),
             ('h3', 'Two buffers and the clipboard'),
@@ -417,12 +416,15 @@ PAGES = [
                     '**undo** with an address reverts the latest change to that one segment, even when other edits came after it.',
                     '**undo all** reverts every edit since the last commit.',
                     'Inserts, deletes and moves change the structure of the file, so they are undone in reverse order (last in, first out). Text replacements can be undone in any order.',
-                    'Every undo clears the verification: the file must pass verify again before it can be committed.']),
+                    'Every save is checked again, so an undo never slips past the checks.']),
             ('h3', 'Safety'),
             ('ul', ['**Read before write:** a segment must have been displayed since the last change before it can be changed.',
-                    '**verify:** level 1 syntax; level 2 the language\'s compiler or the service\'s own checker, such as `nginx -t`, `systemd-analyze verify` or `sshd -t`; level 3 imports and external references must resolve.',
+                    '**Checked saves, level 1:** syntax, with the language\'s own checker where there is one. A failure is not saved, and the error names the line.',
+                    '**Level 2:** configuration files through their service\'s checker, such as `nginx -t`, `systemd-analyze verify` or `sshd -t`. A failure is not saved; linter findings are only reported.',
+                    '**Level 3:** connections. Imports must lead to a project file or an installed package (for Python, in the project\'s venv), and SQL must match the live database schema. A gap is saved and listed, so the first files of a project can import files that do not exist yet.',
+                    '**Level 3 checks the code being saved,** not an older index, and every save re-indexes the file.',
             '**diff** shows changes against disk; **discard** drops the edit buffer.',
-                    '**commit:** an atomic write, only with a current verification. It writes through symlinks to the real file and keeps its permissions.']),
+                    '**save (`commit`):** an atomic write, after the checks. It writes through symlinks to the real file and keeps its permissions.']),
             ('h3', 'Languages'),
             ('p', '16 tree-sitter grammars: Python, JavaScript, TypeScript, HTML, CSS, Go, Rust, C, '
                   'C++, Java, C#, PHP, Ruby, Bash, Swift and Kotlin. Configuration files (nginx, '
@@ -431,14 +433,14 @@ PAGES = [
             ('h2', 'why', 'Why it is built this way'),
             ('ul', ['**Segments instead of lines:** a function named `authenticate_user` stays addressable when it moves from line 214 to line 389.',
                     '**Read before write** stops the most common agent mistake: editing code it never looked at.',
-                    '**Verify before commit** turns a broken edit into a clear error message instead of a broken file.',
+                    '**Checked saves** turn a broken edit into a clear error message with a line number instead of a broken file.',
                     'In typical use the agent reads about 120 lines instead of a whole 5,000-line file.']),
         ],
     },
     {
         'file': 'mcp-tool-write-file.html',
         'title': 'write_file',
-        'desc': 'write_file: creates new files for AI agents, never overwrites, and files them into the project map.',
+        'desc': 'write_file: creates new files for AI agents, never overwrites, and always in a project the agent names.',
         'lead': ('Creates new files, and only new files. Existing files are changed through '
                  'read_file, with its safety rules.'),
         'blocks': [
@@ -448,10 +450,12 @@ PAGES = [
             ('h2', 'capabilities', 'Capabilities'),
             ('ul', ['Creates a file at the given path, creating missing folders.',
                     'Refuses to overwrite: if the file exists, it says so and points to read_file.',
-                    'Files the new file into the project map, so master_architect and read_file know it immediately.']),
+                    'Every new file belongs to a project the agent names: an existing project, or a new name that starts a project rooted at the file\'s folder (or at its Python venv, when the folder is inside one). Without a project nothing is written, and the existing projects are listed.',
+                    'The new file is indexed at once: it gets its coordinate, and other files\' imports that were waiting for it are connected.']),
             ('h2', 'why', 'Why'),
             ('p', 'Silent overwrites are one of the most common ways agents destroy work. Making '
-                  'creating and editing two separate tools removes that ambiguity entirely.'),
+                  'creating and editing two separate tools removes that ambiguity entirely. Where a '
+                  'file belongs is a decision, not a guess, so the agent makes it explicitly.'),
         ],
     },
     {
@@ -465,7 +469,7 @@ PAGES = [
             ('h2', 'components', 'Components'),
             ('deps', 'git'),
             ('h2', 'capabilities', 'Capabilities'),
-            ('ul', ['**clone:** remote URLs only (https, http, git, ssh or `user@host:path`), never a local path. Shallow (`--depth=1`), with a 2-minute limit. Into the sandbox root unless you name a folder.',
+            ('ul', ['**clone:** remote URLs only (https, http, git, ssh or `user@host:path`), never a local path. Shallow (`--depth=1`), with a 2-minute limit. Into the sandbox root unless you name a folder. When it finishes, the folder is scanned into a project, ready for read_file.',
                     '**status:** the changed files in a cloned repository.',
                     '**commit:** saves your changes in the sandbox under a fixed sandbox identity.']),
             ('h2', 'safety', 'Safety'),

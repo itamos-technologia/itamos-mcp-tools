@@ -35,34 +35,32 @@ AI coding agents fail less from a lack of intelligence than from a lack of perce
 ### Design principles
 
 - **Structure before text.** The agent sees the map first, then zooms in.
-- **Addresses, not line numbers.** Code is referred to by structural addresses that stay valid when other parts of the file change.
+- **Coordinates, not line numbers.** Folders, files and the parts inside them have short coordinates such as `d.a.f.31.17` that stay valid when other parts of a file change.
 - **Read before write.** A tool will not change code the model has not displayed since the last change.
-- **Verify before commit.** Edits stay in a buffer until they pass checks; only then do they reach disk.
-- **One job per tool.** Small, predictable tools are easier for a model to use correctly than one tool that does everything.
+- **Checked before saved.** Every save is verified first: broken syntax or configuration never reaches disk, and missing connections are saved but reported.
+- **Few tools, one door.** The agent reads and edits through read_file and creates through write_file; the project map works behind them. Few, predictable tools are easier for a model to use correctly.
 - **The smallest useful answer.** Every response is the least text that answers the question, with a way to ask for more.
 
 ### How the tools work together
 
 ```mermaid
 flowchart TD
-  n0["<b>scan</b><br/>index the project once"]
-  n1["<b>topology</b><br/>see files and how they connect"]
-  n2["<b>bones</b><br/>one file: imports and functions"]
+  n0["<b>clone or open</b><br/>a project is scanned once"]
+  n1["<b>structure</b><br/>folders and files with coordinates"]
+  n2["<b>file map</b><br/>one line per segment"]
   n3["<b>read a segment</b><br/>only the part you need"]
-  n4["<b>edit</b><br/>in a buffer, not on disk"]
-  n5["<b>verify</b><br/>parse, compile, check references"]
-  n6["<b>commit</b><br/>atomic write to disk"]
+  n4["<b>edit</b><br/>one change at a time"]
+  n5["<b>save</b><br/>checked, then written atomically"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
   n3 --> n4
   n4 --> n5
-  n5 --> n6
-  n5 -.->|fails: fix, verify again| n4
+  n5 -.->|fails: not saved, fix and save again| n4
 ```
-*The working loop: locate, read, change, verify, commit.*
+*The working loop: locate, read, change, save.*
 
-A typical bug fix: the agent scans the repository, uses `topology` and `bones` to find the function named in the error, reads that one segment, replaces it, verifies and commits. If verification fails, it gets the exact error and tries again; the broken version never touches disk.
+A typical bug fix: the agent clones the repository, which is scanned on arrival, opens the project structure, opens the file named in the error by its coordinate, reads that one function, replaces it and saves. If the save fails its checks, it gets the exact error and line and tries again; the broken version never touches disk.
 
 ### Evidence so far
 
@@ -231,34 +229,32 @@ A sandbox that empties itself needs no account, no storage plan and no cleanup p
 <a id="mcp-tool-master-architect"></a>
 ## master_architect
 
-*The project map. It indexes a codebase once and lets the agent see files, functions and how they connect, before reading a single line.*
+*The project map. It indexes a codebase and keeps the index current on every save, so read_file can show files, functions and how they connect before a single line is read.*
 
 ```mermaid
 flowchart TD
-  n0["<b>scan</b><br/>parse every file once"]
-  n1["<b>project graph (SQLite)</b><br/>files, modules, imports, databases"]
-  n2["<b>topology</b><br/>the map: files and how they connect"]
-  n3["<b>bones / connections / missing</b><br/>zoom into one file or one link"]
-  n4["<b>read_file</b><br/>open the exact segment"]
+  n0["<b>scan</b><br/>once per project; every save keeps it current"]
+  n1["<b>project graph (SQLite)</b><br/>files, imports, databases, servers"]
+  n2["<b>coordinates</b><br/>letters: folders and files; numbers: inside"]
+  n3["<b>read_file</b><br/>structure, file map, segment: one door"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
-  n3 --> n4
 ```
-*master_architect turns a project into a map the agent can query.*
+*master_architect: the engine that keeps the map read_file answers from.*
 
 ### Components
 
 ```mermaid
 flowchart LR
-  r["<b>master_architect</b><br/>project map tool"]
+  r["<b>master_architect</b><br/>the engine behind read_file"]
   d0["<b>scan.js</b><br/>walks and indexes the project"]
   r --> d0
   d1["<b>parsers</b><br/>16 languages, incl. nginx and SQL"]
   r --> d1
   d2["<b>db.js</b><br/>graph storage"]
   r --> d2
-  d3["<b>query.js</b><br/>topology, bones, connections, ping"]
+  d3["<b>query.js</b><br/>structure, data flow, connections"]
   r --> d3
   d4["<b>registry.js</b><br/>languages and file types"]
   r --> d4
@@ -275,37 +271,30 @@ flowchart LR
 
 ### How it works
 
-master_architect scans a project and stores it as a graph in SQLite: every file, module, function and import, plus the databases, programs and servers the code refers to. Each item gets a hierarchical address such as `13.2.4`: file 13, module 2, method 4. Files it cannot parse still get an address (with letters), so they can be linked to.
+master_architect scans a project and stores it as a graph in SQLite: every file, module, function and import, plus the databases, programs and servers the code refers to. Every save re-indexes the saved file in every supported language, so the graph never lags behind the disk. The agent never calls it directly: read_file asks it.
 
-### Capabilities
+### Coordinates
 
-- **topology:** the starting point. The project's files and how they import each other, plus databases and external programs.
-- **bones:** one file's structure: its imports and its functions, with addresses.
-- **navigate:** open a file, module or method by its address.
-- **connections:** follow the links into and out of a file.
-- **ping:** traces where a file leads, hop by hop through its imports (see below).
-- **context:** a cross-reference summary for a file, by its path.
-- **missing:** imports that point at nothing, found before anything runs.
-- **estimate** and **scan:** check a project's size, then index it.
-- **crawl:** follow links outward from a file to discover related files.
-- **languages** and **stats:** supported languages and index statistics.
+Folders and files get letters, one sequence per folder: subfolders first, then files. What is inside a file gets numbers. `d.a.f.31.17` reads as folder `src`, folder `itsdangerous`, file `signer.py`, segment 31.17: the method `verify_signature`. One coordinate takes the agent from the project straight to the code in a single call.
 
-### Tracing: where does a file lead?
+### What read_file gets from it
 
-`ping` works like a network trace-route, over the import graph. Starting from one file, it follows every internal import hop by hop, numbering the hops, until each branch ends. Each route is labelled by how it ends:
+- **scan:** automatic, when a repository is cloned or a folder is first read, and per file on every save.
+- **structure:** a project's folders and files with coordinates, language and size.
+- **data flow:** which files import which, plus the databases, programs and servers they use.
+- **connections:** one file's links in and out, and imports that lead nowhere.
+- **database facts:** each SQL query linked to the database it runs on, so it can be checked against the live schema.
 
-- **external:** an import of an outside library.
-- **blocked:** an internal import that resolves to nothing: a broken link.
-- **cycle:** an import of a file the trace has already reached.
-- **leaf:** a file that imports nothing.
-- **endpoint:** a server, program, model or port the code refers to.
+### Python environments
 
-Routes come back longest first, the best place to start looking for a bug that surfaces far from its cause. The walk stops after 25 hops unless told otherwise. Tracing is per file today; tracing individual function calls is planned.
+- A project inside a Python virtual environment uses the venv folder as its root. The venv's own machinery (bin, lib, site-packages) is never indexed, only the project's code.
+- A venv inside a project is left out of the index and reported in the project structure.
+- Package checks look inside the project's venv, the way Python would at run time. Nothing from the project folder is ever executed to do so.
 
 ### Why it is built this way
 
 - **SQLite** keeps the graph self-contained: no database server, and it handles graphs with hundreds of thousands of items.
-- **Hierarchical addresses** are short enough to pass between tool calls and stay valid when lines move.
+- **Coordinates** are short enough to pass between tool calls and say where something is at a glance: letters for location, numbers for code.
 - **Import resolution follows real project layouts:** packages, plain sibling imports in script folders, and `src/` layouts. An import rooted in the project that resolves to nothing is reported as broken, instead of being mistaken for an external library.
 
 ### In the sandbox
@@ -315,63 +304,70 @@ Scanning is limited to your sandbox, and your project map is stored inside it, s
 <a id="mcp-tool-read-file"></a>
 ## read_file
 
-*The segment editor. It shows a file as named parts, lets the agent change exactly one of them and refuses to save anything that does not pass verification.*
+*The single door. It shows a project as folders and files and a file as named parts, lets the agent change exactly one part at a time, and never saves a change that breaks syntax or configuration.*
 
 ```mermaid
 flowchart TD
-  n0["<b>skeleton</b><br/>named segments, no code yet"]
-  n1["<b>read segment</b><br/>displaying it unlocks it for editing"]
-  n2["<b>edit in a buffer</b><br/>replace, insert, delete, move, paste"]
-  n3["<b>verify 1 → 2 → 3</b><br/>syntax, compiler or service check, references"]
-  n4["<b>commit</b><br/>atomic write; undo is possible until then"]
+  n0["<b>structure</b><br/>a project: folders and files, no code"]
+  n1["<b>file map</b><br/>one line per segment"]
+  n2["<b>read segment</b><br/>displaying it unlocks it for editing"]
+  n3["<b>one edit</b><br/>replace, insert, delete, move, paste"]
+  n4["<b>save</b><br/>checked first, then an atomic write"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
   n3 --> n4
-  n3 -.->|fails: fix, verify again| n2
+  n4 -.->|fails: not saved, fix the edit| n3
 ```
-*read_file: nothing reaches disk until it passes verification.*
+*read_file: from the project to one segment, and nothing broken reaches disk.*
 
 ### Components
 
 ```mermaid
 flowchart LR
-  r["<b>read_file</b><br/>segment editor"]
-  d0["<b>segmenter.js</b><br/>files into named segments"]
+  r["<b>read_file</b><br/>the single door"]
+  d0["<b>project_view.js</b><br/>projects, structure, coordinates"]
   r --> d0
-  d1["<b>config_segmenter.js</b><br/>nginx, systemd, INI and more"]
+  d1["<b>segmenter.js</b><br/>files into named segments"]
   r --> d1
-  d2["<b>config_validators.js</b><br/>service checks such as nginx -t"]
+  d2["<b>import_check.js</b><br/>imports of the code being saved"]
   r --> d2
-  d3["<b>external_detect.js</b><br/>binaries and servers in code"]
+  d3["<b>config_segmenter.js</b><br/>nginx, systemd, INI and more"]
   r --> d3
-  d4["<b>database adapters</b><br/>SQLite, Postgres, MySQL and more"]
+  d4["<b>config_validators.js</b><br/>service checks such as nginx -t"]
   r --> d4
-  d5["<b>architect-link.js</b><br/>keeps the project map in sync"]
+  d5["<b>external_detect.js</b><br/>binaries and servers in code"]
   r --> d5
-  d6(["<b>tree-sitter</b><br/>16 language grammars"])
+  d6["<b>database adapters</b><br/>SQLite, Postgres, MySQL and more"]
   r --> d6
-  d7(["<b>better-sqlite3</b><br/>edit state storage"])
+  d7["<b>architect-link.js</b><br/>keeps the project map in sync"]
   r --> d7
+  d8(["<b>tree-sitter</b><br/>16 language grammars"])
+  r --> d8
+  d9(["<b>better-sqlite3</b><br/>edit state storage"])
+  r --> d9
 ```
 *read_file components. Rounded: third-party software.*
 
 ### How it works
 
-read_file parses a file into named segments: functions, classes, configuration blocks, paragraphs. By default it returns the skeleton, the list of segments with their names and sizes, not the code. The agent reads only the segment it needs. Every byte of the file belongs to exactly one segment, including blank lines, so joining the segments always gives back the original file.
+`read_file()` lists your projects; a project name shows its structure, with coordinates and no code; a coordinate opens a file's map or one segment. read_file parses a file into named segments: functions, classes, configuration blocks, paragraphs. The file map is one line per segment, with classes listing their methods. The agent reads only the segment it needs. Every byte of the file belongs to exactly one segment, including blank lines, so joining the segments always gives back the original file.
 
 ### Capabilities
 
 #### Reading
 
-- **skeleton:** the default view; `full_skeleton` forces the whole map of a very large file.
-- **search:** narrows a large skeleton to matching segments.
-- **segment:** reads one part by address, such as `5.3`.
-- **trace:** follows the file's signal through the codebase: what it imports, who imports it, and the databases, programs and servers it touches. It then checks the direct neighbours: any that has not been verified gets a level 3 check, and the walk stops at the first failure.
+- **projects:** `read_file()` with no path lists them.
+- **structure:** a project name or a folder: folders and files with coordinates. Above about 3,000 tokens it gives an overview per folder and asks for a search.
+- **file map:** the default view of a file, one line per segment. The same 3,000-token rule applies; `full_skeleton` forces the whole map.
+- **search:** file and folder names in a project, segment names in a file.
+- **segment:** one part by address, such as `5.3`, or straight from the project by coordinate, such as `d.a.f.31.17`.
+- **trace:** on a file, what it imports, who imports it, the databases, programs and servers it touches, and any import that leads nowhere right now; direct neighbours not yet verified get a level 3 check, stopping at the first failure. On a project, its data flow.
 - **status:** lists open edit buffers.
 
 #### Editing
 
+- **One edit at a time:** each change is saved, undone or discarded before the next.
 - **replace**, **insert** between two segments, **delete**, **move**.
 - **comment_out** and **uncomment** a segment while debugging.
 - **paste:** copy a segment, or a whole file, verbatim from the read buffer into the file being edited (see the clipboard below).
@@ -387,14 +383,17 @@ read_file keeps exactly two buffers per sandbox. The read buffer is read-only an
 - **undo** with an address reverts the latest change to that one segment, even when other edits came after it.
 - **undo all** reverts every edit since the last commit.
 - Inserts, deletes and moves change the structure of the file, so they are undone in reverse order (last in, first out). Text replacements can be undone in any order.
-- Every undo clears the verification: the file must pass verify again before it can be committed.
+- Every save is checked again, so an undo never slips past the checks.
 
 #### Safety
 
 - **Read before write:** a segment must have been displayed since the last change before it can be changed.
-- **verify:** level 1 syntax; level 2 the language's compiler or the service's own checker, such as `nginx -t`, `systemd-analyze verify` or `sshd -t`; level 3 imports and external references must resolve.
+- **Checked saves, level 1:** syntax, with the language's own checker where there is one. A failure is not saved, and the error names the line.
+- **Level 2:** configuration files through their service's checker, such as `nginx -t`, `systemd-analyze verify` or `sshd -t`. A failure is not saved; linter findings are only reported.
+- **Level 3:** connections. Imports must lead to a project file or an installed package (for Python, in the project's venv), and SQL must match the live database schema. A gap is saved and listed, so the first files of a project can import files that do not exist yet.
+- **Level 3 checks the code being saved,** not an older index, and every save re-indexes the file.
 - **diff** shows changes against disk; **discard** drops the edit buffer.
-- **commit:** an atomic write, only with a current verification. It writes through symlinks to the real file and keeps its permissions.
+- **save (`commit`):** an atomic write, after the checks. It writes through symlinks to the real file and keeps its permissions.
 
 #### Languages
 
@@ -404,7 +403,7 @@ read_file keeps exactly two buffers per sandbox. The read buffer is read-only an
 
 - **Segments instead of lines:** a function named `authenticate_user` stays addressable when it moves from line 214 to line 389.
 - **Read before write** stops the most common agent mistake: editing code it never looked at.
-- **Verify before commit** turns a broken edit into a clear error message instead of a broken file.
+- **Checked saves** turn a broken edit into a clear error message with a line number instead of a broken file.
 - In typical use the agent reads about 120 lines instead of a whole 5,000-line file.
 
 <a id="mcp-tool-write-file"></a>
@@ -417,14 +416,14 @@ flowchart TD
   n0["<b>path</b><br/>where the new file goes"]
   n1["<b>jail check</b><br/>must stay inside your sandbox"]
   n2["<b>exists?</b><br/>refused: edit it with read_file"]
-  n3["<b>write</b><br/>missing folders are created"]
-  n4["<b>file into the map</b><br/>master_architect knows it at once"]
+  n3["<b>which project?</b><br/>an existing one, or a new name"]
+  n4["<b>write and index</b><br/>the map knows it at once"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
   n3 --> n4
 ```
-*write_file: new files only, filed into the project map.*
+*write_file: new files only, always in a project the agent names.*
 
 ### Components
 
@@ -433,8 +432,10 @@ flowchart LR
   r["<b>write_file</b><br/>creates new files"]
   d0["<b>path jail</b><br/>confines the target path"]
   r --> d0
-  d1["<b>architect-link.js</b><br/>files it into the project map"]
+  d1["<b>architect-link.js</b><br/>creates or joins the project"]
   r --> d1
+  d2["<b>scan.js</b><br/>indexes the new file at once"]
+  r --> d2
 ```
 *write_file components.*
 
@@ -442,11 +443,12 @@ flowchart LR
 
 - Creates a file at the given path, creating missing folders.
 - Refuses to overwrite: if the file exists, it says so and points to read_file.
-- Files the new file into the project map, so master_architect and read_file know it immediately.
+- Every new file belongs to a project the agent names: an existing project, or a new name that starts a project rooted at the file's folder (or at its Python venv, when the folder is inside one). Without a project nothing is written, and the existing projects are listed.
+- The new file is indexed at once: it gets its coordinate, and other files' imports that were waiting for it are connected.
 
 ### Why
 
-Silent overwrites are one of the most common ways agents destroy work. Making creating and editing two separate tools removes that ambiguity entirely.
+Silent overwrites are one of the most common ways agents destroy work. Making creating and editing two separate tools removes that ambiguity entirely. Where a file belongs is a decision, not a guess, so the agent makes it explicitly.
 
 <a id="mcp-tool-git"></a>
 ## git
@@ -456,12 +458,14 @@ Silent overwrites are one of the most common ways agents destroy work. Making cr
 ```mermaid
 flowchart TD
   n0["<b>clone</b><br/>remote URL, shallow, symlinks off"]
-  n1["<b>work</b><br/>with the other tools"]
-  n2["<b>status</b><br/>what changed"]
-  n3["<b>commit</b><br/>saved in your sandbox, no push"]
+  n1["<b>scanned</b><br/>into a project, automatically"]
+  n2["<b>work</b><br/>with the other tools"]
+  n3["<b>status</b><br/>what changed"]
+  n4["<b>commit</b><br/>saved in your sandbox, no push"]
   n0 --> n1
   n1 --> n2
   n2 --> n3
+  n3 --> n4
 ```
 *git: code comes in, nothing goes out.*
 
@@ -481,7 +485,7 @@ flowchart LR
 
 ### Capabilities
 
-- **clone:** remote URLs only (https, http, git, ssh or `user@host:path`), never a local path. Shallow (`--depth=1`), with a 2-minute limit. Into the sandbox root unless you name a folder.
+- **clone:** remote URLs only (https, http, git, ssh or `user@host:path`), never a local path. Shallow (`--depth=1`), with a 2-minute limit. Into the sandbox root unless you name a folder. When it finishes, the folder is scanned into a project, ready for read_file.
 - **status:** the changed files in a cloned repository.
 - **commit:** saves your changes in the sandbox under a fixed sandbox identity.
 

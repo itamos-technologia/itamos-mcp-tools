@@ -61,7 +61,7 @@ One edit at a time, and only on segments the model has read since the last chang
 |---|---|---|
 | L1 | Syntax: tree-sitter plus the language's own checker (py_compile, node --check, php -l, bash -n, gofmt, C/C++ in project context, config parsers) | Not saved; the error names the line |
 | L2 | Config files through their service's checker (nginx -t, sshd -t, visudo, systemd-analyze). Linters run too | Config failure: not saved. Linter findings are only reported |
-| L3 | Connections: every local import resolves to a project file (Python and JavaScript/TypeScript: any other import must be an installed package); SQL is checked against the live database schema | Saved, with what is incomplete and how to see it, so a project's first files can import files that don't exist yet |
+| L3 | Connections: every local import resolves to a project file (Python and JavaScript/TypeScript: any other import must be an installed package, for Python in the project's venv when it has one); SQL is checked against the live database schema | Saved, with what is incomplete and how to see it, so a project's first files can import files that don't exist yet |
 
 L3 checks the content being saved, not an older index, and every save re-indexes the file in every supported language, so the map never lags behind the disk.
 
