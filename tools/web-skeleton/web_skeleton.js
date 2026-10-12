@@ -519,6 +519,34 @@ function cacheSet(url, data) {
   _pageCache.set(url, { ...data, timestamp: Date.now() });
 }
 
+// ── Viewport ─────────────────────────────────────────────────────────────
+// The agent chooses the size: viewport="WIDTHxHEIGHT" in pixels. Below 768 px
+// wide the page is emulated as mobile (touch, mobile layout).
+const DEFAULT_VIEWPORT = { width: 1920, height: 1080 };
+function parseViewport(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const m = String(v).trim().match(/^(\d{2,5})\s*[x×]\s*(\d{2,5})$/i);
+  if (!m) throw new Error(`viewport must look like "1920x1080" (width x height in pixels), got "${v}"`);
+  const width = +m[1], height = +m[2];
+  if (width < 240 || width > 3840 || height < 240 || height > 2160) {
+    throw new Error(`viewport ${width}x${height} is out of range: width 240-3840, height 240-2160`);
+  }
+  return { width, height };
+}
+const sameViewport = (a, b) => !!a && !!b && a.width === b.width && a.height === b.height;
+// The size a cached page was rendered at (entries from before this field: the default).
+const cachedViewport = (c) => (c && c.viewport) || DEFAULT_VIEWPORT;
+// A cached page usable for a skeleton at `viewport`: same URL AND same size.
+function cacheGetFor(url, viewport) {
+  const c = cacheGet(url);
+  return c && sameViewport(cachedViewport(c), viewport) ? c : null;
+}
+// Layout tag: x and w are % of the viewport width; y and h are % of the full page height.
+function posTag(el) {
+  const p = el.pos || {};
+  return ` @${p.x}%,${p.y}%` + (p.w !== undefined && p.h !== undefined ? ` ${p.w}%×${p.h}%` : '');
+}
+
 function cacheGet(url) {
   const slot = _slot();
   if (slot) {
@@ -623,6 +651,9 @@ const DOM_WALKER_SCRIPT = `
   const vw = window.innerWidth || 1920;
   const vh = window.innerHeight || 1080;
   const scrollH = document.documentElement.scrollHeight || vh;
+    // Element ids are stamped on the page (data-wsk) so click can find exactly
+    // the element this walker numbered; old stamps are cleared first.
+    try { document.querySelectorAll('[data-wsk]').forEach((n) => n.removeAttribute('data-wsk')); } catch (e) {}
 
   // Content elements only — what a user sees on the page
   const CONTENT = new Set([
@@ -878,6 +909,7 @@ const DOM_WALKER_SCRIPT = `
 
     if (isContent || (tag === 'DIV')) {
       const eid = 'e' + (nextId++);
+      try { el.setAttribute('data-wsk', eid); } catch (e) {}
       const pos = getPosition(el);
       // Skip invisible elements
       if (pos.w === 0 && pos.h === 0) {
@@ -1038,9 +1070,9 @@ if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
 // ACTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function actionSkeleton(url, viewport = { width: 1920, height: 1080 }, context = null, layout = null) {
-  // Always check cache first — full data is always stored, context only filters display
-  const cached = cacheGet(url);
+async function actionSkeleton(url, viewport = DEFAULT_VIEWPORT, context = null, layout = null) {
+// Cache first — but only a page rendered at THIS size (a different size reflows the page).
+const cached = cacheGetFor(url, viewport);
   if (cached) {
     return formatSkeleton({
       title: cached.title || '',
@@ -1122,6 +1154,7 @@ async function actionSkeleton(url, viewport = { width: 1920, height: 1080 }, con
       url: data.url,
       pageHeight: data.pageHeight,
       rawBytes,
+      viewport: { width: viewport.width, height: viewport.height },
     });
 
     // AI-title text-heavy sections for better navigation
@@ -1149,8 +1182,10 @@ async function actionRead(url, sectionId) {
   return text || `[Section ${sectionId} exists but has no extractable text content]`;
 }
 
-async function actionClick(url, elementId, viewport = { width: 1920, height: 1080 }) {
-  await ensureChrome();
+async function actionClick(url, elementId, viewport = null) {
+// Keep browsing at the size the page was skeletoned at, unless told otherwise.
+viewport = viewport || cachedViewport(cacheGet(url));
+await ensureChrome();
 
   // In the sandbox tabs are closed after every render, so open a fresh one;
   // the check below loads the page before the element is resolved.
@@ -1186,47 +1221,15 @@ async function actionClick(url, elementId, viewport = { width: 1920, height: 108
       }
     }
 
-    // Find the element by re-walking the DOM with the same id counter,
-    // then scroll into view and click
+    // Number the page with the SAME walker the skeleton used (same rules, same
+    // viewport), so an id means the same element in both. The walker stamps each
+    // numbered element with data-wsk; the click selects exactly that element.
+    if (!/^e\d{1,6}$/.test(String(elementId))) throw new Error(`element must be an id from the skeleton, like "e12"`);
+    const stamp = await session.send('Runtime.evaluate', { expression: DOM_WALKER_SCRIPT, returnByValue: true });
+    if (stamp.exceptionDetails) throw new Error('DOM walker error before click: ' + JSON.stringify(stamp.exceptionDetails));
     const clickScript = `(() => {
-      const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','META','LINK','HEAD']);
-      const STRUCTURAL = new Set([
-        'H1','H2','H3','H4','H5','H6',
-        'P','SECTION','ARTICLE','MAIN','ASIDE','NAV','HEADER','FOOTER',
-        'UL','OL','LI','DL','DT','DD',
-        'TABLE','THEAD','TBODY','TR','TH','TD',
-        'FORM','INPUT','BUTTON','SELECT','TEXTAREA',
-        'A','IMG','VIDEO','AUDIO','FIGURE','FIGCAPTION',
-        'BLOCKQUOTE','PRE','CODE','DETAILS','SUMMARY'
-      ]);
-      let nextId = 1;
-
-      function findEl(el) {
-        if (!el || !el.tagName || SKIP.has(el.tagName)) return null;
-        const tag = el.tagName;
-        let isStructural = STRUCTURAL.has(tag);
-        if (tag === 'DIV') {
-          const role = el.getAttribute('role');
-          const id = el.id;
-          isStructural = (role && role !== 'presentation' && role !== 'none')
-                      || (id && !/^[0-9]/.test(id));
-        }
-        if (isStructural) {
-          const eid = 'e' + (nextId++);
-          if (eid === '${elementId}') return el;
-        }
-        if (!isStructural && tag === 'DIV') {
-          // Walk children of non-semantic divs without incrementing
-        }
-        for (const child of el.children) {
-          const found = findEl(child);
-          if (found) return found;
-        }
-        return null;
-      }
-
-      const el = findEl(document.body);
-      if (!el) return JSON.stringify({ error: 'Element ${elementId} not found' });
+      const el = document.querySelector('[data-wsk="${elementId}"]');
+      if (!el) return JSON.stringify({ error: 'Element ${elementId} is not on the page as it is now; take a new skeleton' });
 
       el.scrollIntoView({ behavior: 'instant', block: 'center' });
       el.click();
@@ -1273,6 +1276,10 @@ async function actionClick(url, elementId, viewport = { width: 1920, height: 108
     cacheSet(newUrl, {
       skeleton: data.elements,
       sections: data.sections,
+      title: data.title,
+      url: newUrl,
+      pageHeight: data.pageHeight,
+      viewport: { width: viewport.width, height: viewport.height },
     });
 
     // Format with click context
@@ -1466,7 +1473,7 @@ function formatSkeleton(data, viewport, context = null, layout = null) {
         const unit  = info.type === 'code' ? 'lines'
                     : info.type === 'dropdown' ? 'items'
                     : 'links';
-        const posStr = (layout === 'all' || layout === el.id) ? ` @${el.pos.x}%,${el.pos.y}%` : '';
+        const posStr = (layout === 'all' || layout === el.id) ? posTag(el) : '';
         let labelStr;
         if (info.type === 'code') {
           const lang = (el.label && !/^\d+ lines$/.test(el.label)) ? el.label : '';
@@ -1484,7 +1491,7 @@ function formatSkeleton(data, viewport, context = null, layout = null) {
       let line = `${indent}${click} [${el.id}] ${el.kind}`;
       if (el.label) line += ` "${el.label}"`;
       if (el.dest) line += ` → ${el.dest}`;
-      if (layout === 'all' || layout === el.id) line += ` @${el.pos.x}%,${el.pos.y}%`;
+      if (layout === 'all' || layout === el.id) line += posTag(el);
       // Summary only for leaf elements — parents' children show the content
       const hasChildren = (i + 1 < elements.length && elements[i + 1].depth > el.depth);
       if (!hasChildren && el.summary && el.summary !== el.label && el.summary.length > 5) {
@@ -1540,7 +1547,7 @@ function formatSkeleton(data, viewport, context = null, layout = null) {
         let line = `${indent}${click} [${el.id}] ${el.kind}`;
         if (el.label) line += ` "${el.label}"`;
         if (el.dest) line += ` → ${el.dest}`;
-        if (layout === 'all' || layout === el.id) line += ` @${el.pos.x}%,${el.pos.y}%`;
+        if (layout === 'all' || layout === el.id) line += posTag(el);
         line += ' ★';
         if (el.summary && el.summary !== el.label) {
           line += `\n${indent}  └ ${el.summary}`;
@@ -1549,12 +1556,12 @@ function formatSkeleton(data, viewport, context = null, layout = null) {
       } else if (isParent) {
         let line = `${indent}${click} [${el.id}] ${el.kind}`;
         if (el.label) line += ` "${el.label}"`;
-        if (layout === 'all' || layout === el.id) line += ` @${el.pos.x}%,${el.pos.y}%`;
+        if (layout === 'all' || layout === el.id) line += posTag(el);
         lines.push(line);
       } else if (el.kind === 'heading') {
         let line = `${indent}  [${el.id}] ${el.kind}`;
         if (el.label) line += ` "${el.label}"`;
-        if (layout === 'all' || layout === el.id) line += ` @${el.pos.x}%,${el.pos.y}%`;
+        if (layout === 'all' || layout === el.id) line += posTag(el);
         lines.push(line);
       }
     }
@@ -1597,20 +1604,23 @@ export default {
     section: z.string().optional().describe('Section id to read (from skeleton output, e.g. "e5")'),
     element: z.string().optional().describe('Element id to click (from skeleton output, e.g. "e12")'),
     query: z.string().optional().describe('Search query (for action=search)'),
-    layout: z.string().optional().describe('Show element positions. "all" = every element, or an element id like "e5" for just that subtree. Omit for no positions (default).'),
+    layout: z.string().optional().describe('Show element positions. "all" = every element, or an element id like "e5" for just that subtree. Omit for no positions (default). Format @x%,y% w%×h%: x and w are % of the viewport width, y and h are % of the full page height.'),
+    viewport: z.string().optional().describe('Screen size to render at, "WIDTHxHEIGHT" in pixels, e.g. "390x844" (phone), "1366x768" (laptop). Default 1920x1080. Below 768 px wide the page is rendered as mobile. For skeleton and click; read uses the size of the last skeleton.'),
   },
   async handler(args, ctx) {
     try {
       let result;
 
       switch (args.action) {
-        case 'skeleton':
+        case 'skeleton': {
           if (!args.url) throw new Error('url required for skeleton action');
           validateUrl(args.url);
-          result = cacheGet(args.url)
-            ? await actionSkeleton(args.url, undefined, args.context || null, args.layout || null)
-            : await withRender(() => actionSkeleton(args.url, undefined, args.context || null, args.layout || null));
+          const vp = parseViewport(args.viewport) || DEFAULT_VIEWPORT;
+          result = cacheGetFor(args.url, vp)
+            ? await actionSkeleton(args.url, vp, args.context || null, args.layout || null)
+            : await withRender(() => actionSkeleton(args.url, vp, args.context || null, args.layout || null));
           break;
+        }
 
         case 'read':
           if (!args.url) throw new Error('url required for read action');
@@ -1625,7 +1635,8 @@ export default {
           if (!args.url) throw new Error('url required for click action');
           if (!args.element) throw new Error('element required for click action');
           validateUrl(args.url);
-          result = await withRender(() => actionClick(args.url, args.element));
+          const clickVp = parseViewport(args.viewport);   // null → the size the page was browsed at
+          result = await withRender(() => actionClick(args.url, args.element, clickVp));
           break;
 
         case 'search':
