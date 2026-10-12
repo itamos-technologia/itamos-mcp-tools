@@ -100,7 +100,7 @@ DIAGRAMS = {
     'web': {
         'caption': 'web_skeleton: read the part of a page you need, not the whole page.',
         'nodes': [('search', 'find relevant pages'),
-                  ('skeleton', 'rendered page as sections with ids'),
+                  ('skeleton', 'sections with ids, positions and sizes'),
                   ('read a section', 'only the text you need'),
                   ('click', 'follow a link or button by id')],
     },
@@ -525,9 +525,21 @@ PAGES = [
             ('deps', 'web'),
             ('h2', 'capabilities', 'Capabilities'),
             ('ul', ['**search:** search results, each with a title and a one-line summary.',
-                    '**skeleton:** a rendered page as headings, sections, links and form elements, each with a stable id.',
+                    '**skeleton:** a rendered page as headings, sections, links and form elements, each with a stable id; with `layout`, each with its position and size.',
                     '**read:** the full text of one section by id.',
-                    '**click:** follow a link or button by id and get the new page\'s skeleton.']),
+                    '**click:** follow a link or button by id and get the new page\'s skeleton. The click lands on exactly the element the skeleton numbered.']),
+            ('h2', 'layout', 'Layout and screen sizes'),
+            ('p', 'Ask for `layout` and every element comes with its place on the page: `@x%,y% w%×h%`, where x '
+                  'and the width are shares of the screen width, and y and the height are shares of the full page '
+                  'height. The agent can tell a sidebar from the main column, spot a repeating grid of cards, see '
+                  'that a table runs past the fold, and plan where to read or click before reading anything.'),
+            ('p', 'The agent also chooses the screen: `viewport="390x844"` renders the page as a phone and '
+                  '`"1366x768"` as a laptop, at any size from 240 to 3,840 pixels wide. Below 768 pixels the page '
+                  'is rendered as mobile, so menus collapse and layouts reflow as they do for real visitors. '
+                  'Clicks stay at the same size.'),
+            ('p', 'The same overview page of this site, seen both ways:'),
+            ('ul', ['**Desktop (1920×1080):** the main column starts at 28% of the width and is 43% wide; the Copy button sits beside the connector URL; the page is 3,975 pixels tall.',
+                    '**Phone (390×844):** the main column is the full width, the header menu collapses into a Menu button, the Copy button moves below the URL, and the page grows to 5,167 pixels.']),
             ('h2', 'how', 'How it works'),
             ('p', 'Pages are rendered in headless Chromium through the Chrome DevTools Protocol, so '
                   'content built by JavaScript is included. In typical use, a page that would cost '

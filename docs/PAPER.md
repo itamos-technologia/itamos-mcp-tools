@@ -507,7 +507,7 @@ A shallow clone turns minutes into seconds for large repositories, and most task
 ```mermaid
 flowchart TD
   n0["<b>search</b><br/>find relevant pages"]
-  n1["<b>skeleton</b><br/>rendered page as sections with ids"]
+  n1["<b>skeleton</b><br/>sections with ids, positions and sizes"]
   n2["<b>read a section</b><br/>only the text you need"]
   n3["<b>click</b><br/>follow a link or button by id"]
   n0 --> n1
@@ -537,9 +537,20 @@ flowchart LR
 ### Capabilities
 
 - **search:** search results, each with a title and a one-line summary.
-- **skeleton:** a rendered page as headings, sections, links and form elements, each with a stable id.
+- **skeleton:** a rendered page as headings, sections, links and form elements, each with a stable id; with `layout`, each with its position and size.
 - **read:** the full text of one section by id.
-- **click:** follow a link or button by id and get the new page's skeleton.
+- **click:** follow a link or button by id and get the new page's skeleton. The click lands on exactly the element the skeleton numbered.
+
+### Layout and screen sizes
+
+Ask for `layout` and every element comes with its place on the page: `@x%,y% w%×h%`, where x and the width are shares of the screen width, and y and the height are shares of the full page height. The agent can tell a sidebar from the main column, spot a repeating grid of cards, see that a table runs past the fold, and plan where to read or click before reading anything.
+
+The agent also chooses the screen: `viewport="390x844"` renders the page as a phone and `"1366x768"` as a laptop, at any size from 240 to 3,840 pixels wide. Below 768 pixels the page is rendered as mobile, so menus collapse and layouts reflow as they do for real visitors. Clicks stay at the same size.
+
+The same overview page of this site, seen both ways:
+
+- **Desktop (1920×1080):** the main column starts at 28% of the width and is 43% wide; the Copy button sits beside the connector URL; the page is 3,975 pixels tall.
+- **Phone (390×844):** the main column is the full width, the header menu collapses into a Menu button, the Copy button moves below the URL, and the page grows to 5,167 pixels.
 
 ### How it works
 
