@@ -48,11 +48,13 @@ const SUMMARIZER_MODEL_SKEL = process.env.ITAMOS_SUMMARIZER_MODEL || 'summarizer
 const AI_TITLE_MIN_SUMMARY = 80;
 
 // A short title for a text-heavy section from the summarizer, or null if it is off,
-// unreachable or slow (the section then keeps its own first line). The whole text
-// is sent, never cut: the summarizer's context fits a full section.
+// unreachable or slow (the section then keeps its own first line). Only the start of
+// the section is sent (TITLE_MAX_CHARS, about 2,000 tokens): plenty for a title, and
+// a huge section no longer keeps the GPUs busy while searches wait.
+const TITLE_MAX_CHARS = 8000;
 async function summarizeTitle(text, maxTokens = 50) {
   if (!SUMMARIZER_URL_SKEL) return null;
-  const prompt = `Read the following text and generate a short descriptive title (5-10 words maximum). Output ONLY the title, nothing else.\n\nText:\n${text}\n\nTitle:`;
+  const prompt = `Read the following text and generate a short descriptive title (5-10 words maximum). Output ONLY the title, nothing else.\n\nText:\n${text.slice(0, TITLE_MAX_CHARS)}\n\nTitle:`;
   try {
     const res = await fetch(SUMMARIZER_URL_SKEL + '/v1/chat/completions', {
       method: 'POST',
@@ -118,6 +120,11 @@ const EMBED_PARALLEL = 6;           // requests in flight (the router spreads th
 const MEANING_Z = 2.5;              // standard deviations above the page's average
 const MEANING_SPREAD = 0.1;         // within this of the best match
 const MEANING_MAX = 10;
+// Vector format: 2 = each segment embedded with its section heading as context.
+const EMBED_FORMAT = process.env.WEB_SKELETON_EMBED_CONTEXT === '0' ? 1 : 2;
+// Meaning candidates are checked by the summarizer (one call per search) when it is on.
+const RERANK_ON = process.env.WEB_SKELETON_RERANK !== '0';
+const RERANK_CANDIDATES = 20;
 
 async function _embedPost(path, body, timeout = 60000) {
   const res = await fetch(EMBEDDER_URL_SKEL + path, {
@@ -171,11 +178,15 @@ async function embedElements(data) {
   const t0 = Date.now();
   const els = data.elements || [];
   const unique = new Map();   // same title + text is embedded once (repeated links, menus)
+  let heading = '';           // the section a segment sits in: the last heading before it
   for (let i = 0; i < els.length; i++) {
     const el = els[i];
     const hasChildren = i + 1 < els.length && els[i + 1].depth > el.depth;
     const body = ((hasChildren ? el.summary : (data.sections?.[el.id] || el.summary)) || '').trim();
-    const title = (el.label || '').trim();
+    const label = (el.label || '').trim();
+    if (el.kind === 'heading' && label) heading = label;
+    // With context, a paragraph under "Hallucination" is embedded as part of that section.
+    const title = EMBED_FORMAT === 2 && heading && heading !== label ? [heading, label].filter(Boolean).join(' › ') : label;
     if (!title && !body) continue;
     const key = title + '\u0000' + body;
     if (!unique.has(key)) unique.set(key, { title, body, ids: [] });
@@ -203,15 +214,50 @@ async function embedElements(data) {
         for (const id of batch[k].job.ids) (ids[id] = ids[id] || []).push(packed);
       });
     });
-    return { model: EMBEDDER_MODEL_SKEL, dims: EMBED_DIMS, ms: Date.now() - t0, segments: Object.keys(ids).length, ids };
+    return { model: EMBEDDER_MODEL_SKEL, dims: EMBED_DIMS, format: EMBED_FORMAT, ms: Date.now() - t0, segments: Object.keys(ids).length, ids };
   } catch (e) {
     console.error('[web_skeleton] embedding skipped:', e.message);
     return null;
   }
 }
 
+// The summarizer reads the best candidates and keeps the ones that really answer
+// the search: one call per search, short texts. Returns the kept ids in order,
+// [] when none fits, or null when it is off or fails (then the scores decide).
+async function rerankCandidates(query, candidates, data) {
+  if (!RERANK_ON || !SUMMARIZER_URL_SKEL || !candidates.length) return null;
+  const els = new Map((data?.elements || []).map((e) => [e.id, e]));
+  const list = candidates.map((c, k) => {
+    const el = els.get(c.id) || {};
+    const text = [el.label, data?.sections?.[c.id] || el.summary].filter(Boolean).join(' — ').replace(/\s+/g, ' ').slice(0, 300);
+    return `${k + 1}. ${text || '(no text)'}`;
+  }).join('\n');
+  const prompt = `A user searches a web page for: "${query.slice(0, 300)}"\n\n`
+    + `Passages from the page:\n${list}\n\n`
+    + 'Which passages answer the search or are directly about it? Reply with their numbers only, '
+    + 'best first, separated by commas, or "none".';
+  try {
+    const res = await fetch(SUMMARIZER_URL_SKEL + '/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: SUMMARIZER_MODEL_SKEL, messages: [{ role: 'user', content: prompt }], max_tokens: 40, temperature: 0 }),
+      signal: AbortSignal.timeout(5000),   // busy summarizer: fall back to the scores, don't keep the user waiting
+    });
+    if (!res.ok) return null;
+    const out = ((await res.json()).choices?.[0]?.message?.content || '').toLowerCase();
+    if (/\bnone\b/.test(out) && !/\d/.test(out)) return [];
+    const picked = [];
+    for (const m of out.matchAll(/\d+/g)) {
+      const c = candidates[Number(m[0]) - 1];
+      if (c && !picked.includes(c.id)) picked.push(c.id);
+    }
+    return picked.length ? picked : null;
+  } catch {
+    return null;
+  }
+}
+
 // Segments closest in meaning to the search: [{ id, score }], best first, or null.
-async function meaningMatches(vectors, query) {
+async function meaningMatches(vectors, query, data = null) {
   if (!EMBEDDER_URL_SKEL || !vectors?.ids) return null;
   try {
     const d = await _embedPost('/v1/embeddings', {
@@ -236,6 +282,11 @@ async function meaningMatches(vectors, query) {
     const sd = Math.sqrt(scored.reduce((a, m) => a + (m.score - mean) ** 2, 0) / scored.length) || 1;
     scored.sort((a, b) => b.score - a.score);
     const top = scored[0].score;
+    const kept = await rerankCandidates(query, scored.slice(0, RERANK_CANDIDATES), data);
+    if (kept) {
+      const byId = new Map(scored.map((m) => [m.id, m]));
+      return kept.slice(0, MEANING_MAX).map((id) => ({ ...byId.get(id), checked: true }));
+    }
     return scored
       .map((m) => ({ ...m, z: (m.score - mean) / sd }))
       .filter((m) => m.z >= MEANING_Z && m.score >= top - MEANING_SPREAD)
@@ -1328,7 +1379,7 @@ async function actionSkeleton(url, viewport = DEFAULT_VIEWPORT, context = null, 
 // Cache first — but only a page rendered at THIS size (a different size reflows the page).
 const cached = cacheGetFor(url, viewport);
   if (cached) {
-    if (context && !cached.vectors) {
+    if (context && (cached.vectors?.format || 1) !== EMBED_FORMAT) {
       const vectors = await embedElements({ elements: cached.skeleton, sections: cached.sections });
       if (vectors) { cached.vectors = vectors; cacheSet(url, cached); }
     }
@@ -1341,7 +1392,7 @@ const cached = cacheGetFor(url, viewport);
       elements: cached.skeleton,
       sections: cached.sections,
       rawBytes: cached.rawBytes || 0,
-      meaning: context ? await meaningMatches(cached.vectors, context) : null,
+      meaning: context ? await meaningMatches(cached.vectors, context, { elements: cached.skeleton, sections: cached.sections }) : null,
     }, viewport, context, layout, full);
   }
 
@@ -1425,7 +1476,7 @@ const cached = cacheGetFor(url, viewport);
       vectors,
     });
 
-    if (context) data.meaning = await meaningMatches(vectors, context);
+    if (context) data.meaning = await meaningMatches(vectors, context, data);
     return formatSkeleton(data, viewport, context, layout, full);
   } finally {
     await session.close();
