@@ -28,7 +28,8 @@ import { execFile, spawn } from 'node:child_process';
 import http from 'node:http';
 import net from 'node:net';
 import dns from 'node:dns';
-import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, renameSync } from 'node:fs';
+import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, renameSync, readlinkSync, rmSync } from 'node:fs';
+import { homedir, freemem } from 'node:os';
 import { createHash } from 'node:crypto';
 import { logCost } from '../../mcp_tools/lib/cost_log.js';
 import { join, dirname } from 'node:path';
@@ -82,14 +83,166 @@ async function aiTitleElements(data) {
   );
   if (candidates.length === 0) return;
   const toTitle = candidates.slice(0, 15);
-  for (const el of toTitle) {
+  await Promise.all(toTitle.map(async (el) => {
     const text = data.sections?.[el.id] || el.summary || '';
-    if (text.length < AI_TITLE_MIN_SUMMARY) continue;
+    if (text.length < AI_TITLE_MIN_SUMMARY) return;
     const title = await summarizeTitle(text);
     if (title && title.length > 2 && title.length < 120) {
       el.label = title;
       el.aiTitled = true;
     }
+  }));
+}
+
+// ── Embedder: every segment of the page, searched by meaning ──
+// After titling, the page's segments are embedded (EmbeddingGemma through the
+// Itamos LLM router :8091, or any OpenAI-compatible /v1/embeddings endpoint).
+// An innermost segment (paragraph, item, cell, code block ...) is embedded whole;
+// a segment that contains others is embedded by its label and first line, since
+// its children carry the rest of its text, so every part of the page is embedded
+// once. A text longer than the model's limit (2048 tokens) is cut into pieces by
+// the model's own tokenizer, all pointing back to the same segment.
+// Vectors are kept with the cached page (768 dimensions, 8-bit), so later
+// searches on the page only embed the search itself.
+// Set ITAMOS_EMBEDDER_URL to an empty string to turn this off (search then
+// matches words only).
+const EMBEDDER_URL_SKEL = (process.env.ITAMOS_EMBEDDER_URL ?? 'http://127.0.0.1:8091').replace(/\/$/, '');
+const EMBEDDER_MODEL_SKEL = process.env.ITAMOS_EMBEDDER_MODEL || 'embeddinggemma';
+const EMBED_DIMS = 768;             // all of EmbeddingGemma's dimensions (256 lost real matches)
+const EMBED_PIECE_TOKENS = 1800;    // under the model's 2048, leaving room for the title
+const EMBED_SURE_CHARS = 600;       // a text this short is always under the limit
+const EMBED_BATCH_CHARS = 24000;    // about 6-8k tokens per request
+const EMBED_PARALLEL = 6;           // requests in flight (the router spreads them over the GPUs)
+// A segment is a match when it stands out from the rest of THIS page (each page
+// has its own background similarity) and is close to the best one.
+const MEANING_Z = 2.5;              // standard deviations above the page's average
+const MEANING_SPREAD = 0.1;         // within this of the best match
+const MEANING_MAX = 10;
+
+async function _embedPost(path, body, timeout = 60000) {
+  const res = await fetch(EMBEDDER_URL_SKEL + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(timeout),
+  });
+  if (!res.ok) throw new Error(`embedder ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res.json();
+}
+
+// Run fn over items, at most `n` at a time.
+async function _pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (i < items.length) { const k = i++; await fn(items[k], k); }
+  }));
+}
+
+// A text as pieces under the model's limit: short texts (the usual case) are one
+// piece; a long one is cut by the model's own tokenizer.
+async function _pieces(text) {
+  if (text.length <= EMBED_SURE_CHARS) return [text];
+  const tokens = (await _embedPost('/tokenize', { content: text })).tokens || [];
+  if (tokens.length <= EMBED_PIECE_TOKENS) return [text];
+  const out = [];
+  for (let i = 0; i < tokens.length; i += EMBED_PIECE_TOKENS) {
+    const d = await _embedPost('/detokenize', { tokens: tokens.slice(i, i + EMBED_PIECE_TOKENS) });
+    if (d.content) out.push(d.content);
+  }
+  return out;
+}
+
+// First EMBED_DIMS dimensions, unit length, 8-bit, base64 (compact in the page cache).
+function _packVec(vec) {
+  const v = vec.slice(0, EMBED_DIMS);
+  let n = 0; for (const x of v) n += x * x; n = Math.sqrt(n) || 1;
+  const q = new Int8Array(v.length);
+  for (let i = 0; i < v.length; i++) q[i] = Math.max(-127, Math.min(127, Math.round((v[i] / n) * 127)));
+  return Buffer.from(q.buffer).toString('base64');
+}
+function _unpackVec(s) {
+  const b = Buffer.from(s, 'base64');
+  return new Int8Array(b.buffer, b.byteOffset, b.length);
+}
+
+// Embed every segment of a page: { model, dims, ms, segments, ids: { eN: [vec, ...] } },
+// or null when the embedder is off or fails (the page still renders; search then
+// matches words only).
+async function embedElements(data) {
+  if (!EMBEDDER_URL_SKEL) return null;
+  const t0 = Date.now();
+  const els = data.elements || [];
+  const unique = new Map();   // same title + text is embedded once (repeated links, menus)
+  for (let i = 0; i < els.length; i++) {
+    const el = els[i];
+    const hasChildren = i + 1 < els.length && els[i + 1].depth > el.depth;
+    const body = ((hasChildren ? el.summary : (data.sections?.[el.id] || el.summary)) || '').trim();
+    const title = (el.label || '').trim();
+    if (!title && !body) continue;
+    const key = title + '\u0000' + body;
+    if (!unique.has(key)) unique.set(key, { title, body, ids: [] });
+    unique.get(key).ids.push(el.id);
+  }
+  const jobs = [...unique.values()];
+  try {
+    const inputs = [];          // { job, text }
+    await _pool(jobs, 16, async (job) => {
+      const pieces = job.body ? await _pieces(job.body) : [job.title];
+      for (const p of pieces) inputs.push({ job, text: `title: ${job.title || 'none'} | text: ${p}` });
+    });
+    const batches = [];
+    let cur = [], len = 0;
+    for (const inp of inputs) {
+      if (cur.length && len + inp.text.length > EMBED_BATCH_CHARS) { batches.push(cur); cur = []; len = 0; }
+      cur.push(inp); len += inp.text.length;
+    }
+    if (cur.length) batches.push(cur);
+    const ids = {};
+    await _pool(batches, EMBED_PARALLEL, async (batch) => {
+      const d = await _embedPost('/v1/embeddings', { model: EMBEDDER_MODEL_SKEL, input: batch.map((b) => b.text) });
+      d.data.forEach((row, k) => {
+        const packed = _packVec(row.embedding);
+        for (const id of batch[k].job.ids) (ids[id] = ids[id] || []).push(packed);
+      });
+    });
+    return { model: EMBEDDER_MODEL_SKEL, dims: EMBED_DIMS, ms: Date.now() - t0, segments: Object.keys(ids).length, ids };
+  } catch (e) {
+    console.error('[web_skeleton] embedding skipped:', e.message);
+    return null;
+  }
+}
+
+// Segments closest in meaning to the search: [{ id, score }], best first, or null.
+async function meaningMatches(vectors, query) {
+  if (!EMBEDDER_URL_SKEL || !vectors?.ids) return null;
+  try {
+    const d = await _embedPost('/v1/embeddings', {
+      model: EMBEDDER_MODEL_SKEL, input: `task: search result | query: ${query.slice(0, 1000)}`,
+    }, 15000);
+    const q = d.data[0].embedding.slice(0, vectors.dims || EMBED_DIMS);
+    let qn = 0; for (const x of q) qn += x * x; qn = Math.sqrt(qn) || 1;
+    const scored = [];
+    for (const [id, vecs] of Object.entries(vectors.ids)) {
+      let best = -1;
+      for (const s of vecs) {
+        const v = _unpackVec(s);
+        let dot = 0, vn = 0;
+        for (let i = 0; i < v.length; i++) { dot += q[i] * v[i]; vn += v[i] * v[i]; }
+        const score = dot / (qn * (Math.sqrt(vn) || 1));
+        if (score > best) best = score;
+      }
+      scored.push({ id, score: best });
+    }
+    if (!scored.length) return [];
+    const mean = scored.reduce((a, m) => a + m.score, 0) / scored.length;
+    const sd = Math.sqrt(scored.reduce((a, m) => a + (m.score - mean) ** 2, 0) / scored.length) || 1;
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored[0].score;
+    return scored
+      .map((m) => ({ ...m, z: (m.score - mean) / sd }))
+      .filter((m) => m.z >= MEANING_Z && m.score >= top - MEANING_SPREAD)
+      .slice(0, MEANING_MAX);
+  } catch (e) {
+    console.error('[web_skeleton] meaning search skipped:', e.message);
+    return null;
   }
 }
 // ── URL VALIDATION ──────────────────────────────────────────────────────────
@@ -294,6 +447,47 @@ async function getPageTarget(create) {
     .catch(() => {});
 });
 
+// ── Chrome's own files go to disk, never to RAM ──
+// (/tmp is a RAM disk on many Linux servers.) One profile folder is reused across
+// restarts; if another running Chrome already holds it (Chrome locks its profile),
+// a temporary folder is used and removed when that Chrome exits. Chrome's shared
+// memory files (--disable-dev-shm-usage puts them in TMPDIR) go to a disk folder too.
+const WSK_DATA_DIR = process.env.WEB_SKELETON_DATA_DIR || join(homedir(), '.cache', 'web-skeleton');
+const WSK_PROFILE_DIR = process.env.WEB_SKELETON_PROFILE_DIR || join(WSK_DATA_DIR, 'chrome-profile');
+const WSK_TMP_DIR = process.env.WEB_SKELETON_TMP_DIR || join(WSK_DATA_DIR, 'tmp');
+
+// Is the profile held by a running Chrome? Its lock is a symlink "<host>-<pid>".
+function _profileLocked(dir) {
+  try {
+    const pid = Number(String(readlinkSync(join(dir, 'SingletonLock'))).split('-').pop());
+    if (pid > 0) { try { process.kill(pid, 0); return true; } catch { return false; } }
+  } catch { /* no lock */ }
+  return false;
+}
+
+function _pickProfile() {
+  mkdirSync(WSK_TMP_DIR, { recursive: true });
+  if (!_profileLocked(WSK_PROFILE_DIR)) {
+    mkdirSync(WSK_PROFILE_DIR, { recursive: true });
+    return { dir: WSK_PROFILE_DIR, temp: false };
+  }
+  const dir = join(WSK_DATA_DIR, `chrome-profile-${process.pid}-${_cdpPort}`);
+  mkdirSync(dir, { recursive: true });
+  return { dir, temp: true };
+}
+
+// Images, video and audio are never downloaded: the skeleton reads labels and
+// alt text, not pixels or sound, so they would only cost memory and bandwidth.
+// (Ads are NOT blocked: some pages lock up or refuse to load when they are.)
+async function _blockHeavy(session) {
+  try {
+    session.on('Fetch.requestPaused', (p) => {
+      session.send('Fetch.failRequest', { requestId: p.requestId, errorReason: 'BlockedByClient' }).catch(() => {});
+    });
+    await session.send('Fetch.enable', { patterns: [{ resourceType: 'Image' }, { resourceType: 'Media' }] });
+  } catch { /* the page still renders, just with media */ }
+}
+
 async function ensureChrome() {
   if (_chromeProcess && !_chromeProcess.killed) {
     // Verify it's still responding
@@ -312,6 +506,7 @@ async function ensureChrome() {
        '--force-webrtc-ip-handling-policy', '--webrtc-ip-handling-policy=disable_non_proxied_udp']
     : [];
   const bin = findChrome();
+  const profile = _pickProfile();
   _chromeProcess = spawn(bin, [
     '--headless=new',
     '--no-sandbox',
@@ -327,8 +522,12 @@ async function ensureChrome() {
     '--disable-component-extensions-with-background-pages',
     '--disable-popup-blocking',
     '--disable-background-timer-throttling',
+    '--blink-settings=imagesEnabled=false',
+    '--mute-audio',
+    '--autoplay-policy=user-gesture-required',
+    '--js-flags=--max-old-space-size=512',
     ...proxyArgs,
-    `--user-data-dir=/tmp/web-skeleton-profile-${_cdpPort}`,
+    `--user-data-dir=${profile.dir}`,
     `--remote-debugging-port=${_cdpPort}`,
     '--window-size=1920,1080',
     '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
@@ -337,6 +536,7 @@ async function ensureChrome() {
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: false,
+    env: { ...process.env, TMPDIR: WSK_TMP_DIR },
   });
 
   _chromeProcess.on('error', (err) => {
@@ -347,6 +547,7 @@ async function ensureChrome() {
   _chromeProcess.on('exit', (code) => {
     console.log(`[WebSkeleton] Chrome exited with code ${code}`);
     _chromeProcess = null;
+    if (profile.temp) { try { rmSync(profile.dir, { recursive: true, force: true }); } catch {} }
   });
 
   // Wait for CDP to become available
@@ -578,8 +779,45 @@ const _renderLog = new Map();   // slot -> timestamps of recent renders
 let _activeRenders = 0;
 const _renderWaiters = [];
 
+// A new render starts only while enough RAM is free, so many users on heavy
+// pages queue up instead of exhausting memory. Renders started in the last few
+// seconds have not used their memory yet, so each counts as RENDER_EST_MB more.
+// One render is always allowed, so the queue never stalls.
+const RENDER_MIN_FREE_MB = parseInt(process.env.WEB_SKELETON_MIN_FREE_MB || '3072', 10);
+const RENDER_EST_MB = 400;
+const RENDER_RAMP_MS = 8000;
+const _renderStarts = [];
+let _memCache = { t: 0, mb: Infinity };
+function _freeMemMB() {
+  const now = Date.now();
+  if (now - _memCache.t < 250) return _memCache.mb;
+  let mb;
+  try { mb = Number(readFileSync('/proc/meminfo', 'utf8').match(/MemAvailable:\s+(\d+)/)[1]) / 1024; }
+  catch { mb = freemem() / 1048576; }
+  _memCache = { t: now, mb };
+  return mb;
+}
+function _roomForRender() {
+  if (_activeRenders === 0) return true;
+  if (_activeRenders >= MAX_PARALLEL_RENDERS) return false;
+  const now = Date.now();
+  while (_renderStarts.length && now - _renderStarts[0] > RENDER_RAMP_MS) _renderStarts.shift();
+  return _freeMemMB() - _renderStarts.length * RENDER_EST_MB >= RENDER_MIN_FREE_MB;
+}
+function _startRender() { _activeRenders += 1; _renderStarts.push(Date.now()); }
+let _renderPoll = null;
+function _admitWaiters() {
+  while (_renderWaiters.length && _roomForRender()) { _startRender(); _renderWaiters.shift().resolve(); }
+  if (_renderWaiters.length && !_renderPoll) {
+    // Memory can free up without a render ending (other processes): look again.
+    _renderPoll = setInterval(() => {
+      _admitWaiters();
+      if (!_renderWaiters.length) { clearInterval(_renderPoll); _renderPoll = null; }
+    }, 500);
+  }
+}
 function _acquireRender() {
-  if (_activeRenders < MAX_PARALLEL_RENDERS) { _activeRenders += 1; return Promise.resolve(); }
+  if (!_renderWaiters.length && _roomForRender()) { _startRender(); return Promise.resolve(); }
   return new Promise((resolve, reject) => {
     const w = {};
     const timer = setTimeout(() => {
@@ -589,12 +827,20 @@ function _acquireRender() {
     }, RENDER_WAIT_MS);
     w.resolve = () => { clearTimeout(timer); resolve(); };
     _renderWaiters.push(w);
+    _admitWaiters();
   });
 }
 function _releaseRender() {
-  const w = _renderWaiters.shift();
-  if (w) w.resolve();          // hand the render slot straight to the next waiter
-  else _activeRenders -= 1;
+  _activeRenders -= 1;
+  _admitWaiters();
+}
+
+// Called by a render as soon as it has read the page: closes the tab and lets
+// the next render start, while titling and embedding (no Chrome needed) go on.
+const _earlyRelease = new Map();   // slot -> release()
+function _doneWithChrome() {
+  const slot = _slot();
+  if (slot) _earlyRelease.get(slot)?.();
 }
 function _closeSlotTab(slot) {
   const t = _slotTargets.get(slot);
@@ -623,6 +869,14 @@ async function withRender(fn) {
   };
   if (_recentRenders(slot).length >= RENDER_LIMIT) throw limitError();
   await _acquireRender();
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    _releaseRender();
+    _closeSlotTab(slot);   // close the tab: frees its renderer
+  };
+  _earlyRelease.set(slot, release);
   try {
     const log = _recentRenders(slot);
     if (log.length >= RENDER_LIMIT) throw limitError();   // a parallel call got there first
@@ -633,8 +887,8 @@ async function withRender(fn) {
     if (dropped) out += `\n[Cache holds ${SLOT_CACHE_PAGES} pages per sandbox; dropped ${dropped}. Render it again if you need it.]`;
     return out;
   } finally {
-    _releaseRender();
-    _closeSlotTab(slot);   // close the tab right after rendering: frees its renderer
+    if (_earlyRelease.get(slot) === release) _earlyRelease.delete(slot);
+    release();
   }
 }
 (globalThis.__sandboxForgetHooks ||= []).push((slotDir) => {
@@ -1074,6 +1328,10 @@ async function actionSkeleton(url, viewport = DEFAULT_VIEWPORT, context = null, 
 // Cache first — but only a page rendered at THIS size (a different size reflows the page).
 const cached = cacheGetFor(url, viewport);
   if (cached) {
+    if (context && !cached.vectors) {
+      const vectors = await embedElements({ elements: cached.skeleton, sections: cached.sections });
+      if (vectors) { cached.vectors = vectors; cacheSet(url, cached); }
+    }
     return formatSkeleton({
       title: cached.title || '',
       url: cached.url || url,
@@ -1083,6 +1341,7 @@ const cached = cacheGetFor(url, viewport);
       elements: cached.skeleton,
       sections: cached.sections,
       rawBytes: cached.rawBytes || 0,
+      meaning: context ? await meaningMatches(cached.vectors, context) : null,
     }, viewport, context, layout, full);
   }
 
@@ -1104,6 +1363,7 @@ const cached = cacheGetFor(url, viewport);
     });
 
     await session.send('Page.enable');
+    await _blockHeavy(session);
     await session.send('Page.addScriptToEvaluateOnNewDocument', {
       source: STEALTH_SCRIPT,
     });
@@ -1145,8 +1405,15 @@ const cached = cacheGetFor(url, viewport);
 
     const data = JSON.parse(result.result.value);
     data.rawBytes = rawBytes;
+    _doneWithChrome();   // page read: close the tab now, titling and embedding need no Chrome
 
-    // Cache full skeleton + all sections
+    // AI-title text-heavy sections for better navigation, then embed every
+    // segment (titles included) so the page can be searched by meaning.
+    await aiTitleElements(data);
+    const vectors = await embedElements(data);
+
+    // Cache full skeleton + all sections + vectors (after titling, so the
+    // titles are kept for later reads of the page)
     cacheSet(url, {
       skeleton: data.elements,
       sections: data.sections,
@@ -1155,11 +1422,10 @@ const cached = cacheGetFor(url, viewport);
       pageHeight: data.pageHeight,
       rawBytes,
       viewport: { width: viewport.width, height: viewport.height },
+      vectors,
     });
 
-    // AI-title text-heavy sections for better navigation
-    await aiTitleElements(data);
-
+    if (context) data.meaning = await meaningMatches(vectors, context);
     return formatSkeleton(data, viewport, context, layout, full);
   } finally {
     await session.close();
@@ -1214,6 +1480,7 @@ await ensureChrome();
       if (norm(here?.result?.value) !== norm(url)) {
         validateUrl(url);
         await session.send('Page.enable');
+        await _blockHeavy(session);
         const loaded = new Promise((resolve) => { session.on('Page.loadEventFired', resolve); setTimeout(resolve, 15000); });
         await session.send('Page.navigate', { url });
         await loaded;
@@ -1316,6 +1583,7 @@ async function actionSearch(query) {
 
   try {
     await session.send('Page.enable');
+    await _blockHeavy(session);
     await session.send('Page.addScriptToEvaluateOnNewDocument', { source: STEALTH_SCRIPT });
     await session.send('Page.navigate', { url: searchUrl });
 
@@ -1556,17 +1824,30 @@ function formatSkeleton(data, viewport, context = null, layout = null, full = fa
     // ── Context filter — only expand sections matching search terms ───
     lines.push(`CONTEXT: "${context}"`);
 
-    // Exact phrase first, then all words, then any word — the first that finds
-    // something wins, so a specific search is never drowned by its common words.
+    // Exact phrase first, then all words (or the one word), then meaning, then any
+    // word, then word roots — the first that finds something wins, so a specific
+    // search is never drowned by its common words.
     const q = context.trim().toLowerCase().replace(/\s+/g, ' ');
     const words = q.split(' ').filter(t => t.length > 2);
     const textOf = (el) => [el.label || '', el.summary || '', data.sections?.[el.id] || ''].join(' ').toLowerCase();
     const pick = (pred) => { const set = new Set(); for (const el of elements) if (pred(textOf(el))) set.add(el.id); return set; };
+    const ownText = new Map(elements.map((el, i) => {
+      const hasChildren = i + 1 < elements.length && elements[i + 1].depth > el.depth;
+      return [el.id, hasChildren ? [el.label || '', el.summary || ''].join(' ').toLowerCase() : textOf(el)];
+    }));
+    const pickOwn = (pred) => { const set = new Set(); for (const el of elements) if (pred(ownText.get(el.id))) set.add(el.id); return set; };
     let matchMode = 'any word';
     let matchSet = new Set();
     if (q.includes(' ')) { matchSet = pick(t => t.includes(q)); matchMode = 'exact phrase'; }
-    if (!matchSet.size && words.length >= 2) { matchSet = pick(t => words.every(w => t.includes(w))); matchMode = 'all words'; }
-    if (!matchSet.size && words.length) { matchSet = pick(t => words.some(w => t.includes(w))); matchMode = 'any word'; }
+    if (!matchSet.size && words.length >= 2) { matchSet = pickOwn(t => words.every(w => t.includes(w))); matchMode = 'all words'; }
+    if (!matchSet.size && q && !q.includes(' ')) { matchSet = pick(t => t.includes(q)); matchMode = 'word'; }
+    if (!matchSet.size && data.meaning?.length) { matchSet = new Set(data.meaning.map((m) => m.id)); matchMode = 'meaning'; }
+    if (!matchSet.size && words.length >= 2) { matchSet = pick(t => words.some(w => t.includes(w))); matchMode = 'any word'; }
+    if (!matchSet.size && words.length) {
+      // Word roots: "installation", "installing" and "installed" all match "install".
+      const roots = words.map((w) => w.replace(/(ations?|ments?|ings?|ed|es|s|ly)$/, '')).filter((r) => r.length >= 4);
+      if (roots.length) { matchSet = pick(t => roots.some(r => t.includes(r))); matchMode = 'word root'; }
+    }
     // Most specific only: a container whose content matches inside a child is
     // context (shown as a parent), not a match itself.
     for (let i = 0; i < elements.length; i++) {

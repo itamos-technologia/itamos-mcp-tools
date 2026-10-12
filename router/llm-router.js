@@ -89,17 +89,21 @@ class Pool {
     this.drain();
   }
 
-  maxRequest() {
-    return Math.max(0, ...this.backends.map((b) => Math.min(b.capacity, b.perRequest || b.capacity)));
+  // Largest total any backend can reserve, and the largest single text (one
+  // sequence) any backend takes. fits() checks both on the same backend.
+  maxPool() { return Math.max(0, ...this.backends.map((b) => b.capacity)); }
+  maxText() { return Math.max(0, ...this.backends.map((b) => b.perRequest || b.capacity)); }
+  fits(tokens, largest) {
+    return this.backends.some((b) => b.capacity && largest <= (b.perRequest || b.capacity) && tokens <= b.capacity);
   }
 
   // Least loaded backend (relative to its weight) that has room and a free slot.
-  pick(tokens, exclude = new Set()) {
+  pick(tokens, exclude = new Set(), largest = tokens) {
     const now = Date.now();
     let best = null, bestLoad = Infinity;
     for (const b of this.backends) {
       if (exclude.has(b) || b.downUntil > now || !b.capacity) continue;
-      if (tokens > (b.perRequest || b.capacity)) continue;
+      if (largest > (b.perRequest || b.capacity)) continue;
       if (b.reserved + tokens > b.capacity || b.inflight >= b.slots) continue;
       const load = (b.inflight + 1) / b.weight;
       if (load < bestLoad) { best = b; bestLoad = load; }
@@ -108,11 +112,11 @@ class Pool {
   }
 
   // Reserve room for `tokens`, waiting in line if no backend has it now.
-  acquire(tokens, exclude) {
-    const b = this.queue.length ? null : this.pick(tokens, exclude);
+  acquire(tokens, exclude, largest = tokens) {
+    const b = this.queue.length ? null : this.pick(tokens, exclude, largest);
     if (b) { this.take(b, tokens); return Promise.resolve(b); }
     return new Promise((resolve, reject) => {
-      const item = { tokens, exclude, resolve, reject };
+      const item = { tokens, largest, exclude, resolve, reject };
       item.timer = setTimeout(() => {
         this.queue.splice(this.queue.indexOf(item), 1);
         reject(Object.assign(new Error('timed out waiting for GPU capacity'), { status: 503 }));
@@ -133,7 +137,7 @@ class Pool {
   drain() {
     while (this.queue.length) {
       const item = this.queue[0];
-      const b = this.pick(item.tokens, item.exclude);
+      const b = this.pick(item.tokens, item.exclude, item.largest);
       if (!b) return;
       this.queue.shift();
       clearTimeout(item.timer);
@@ -142,8 +146,26 @@ class Pool {
     }
   }
 
-  // Tokens a request will occupy: its input (counted by the model's own
-  // tokenizer) plus what it may generate.
+  // Tokens in a text, counted by the model's own tokenizer (over-estimate if
+  // no backend answers).
+  async count(text) {
+    let n = Math.ceil(text.length / 2);
+    const live = this.backends.find((b) => b.downUntil <= Date.now() && b.capacity) || this.backends[0];
+    try {
+      const r = await request(live.url, '/tokenize', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: text }), timeout: 5000,
+      });
+      const t = json(r.body)?.tokens;
+      if (r.status === 200 && Array.isArray(t)) n = t.length;
+    } catch { /* keep the over-estimate */ }
+    return n;
+  }
+
+  // Tokens a request will occupy: its input plus what it may generate, as
+  // { tokens, largest }. tokens is reserved against the pool; largest is the
+  // longest single sequence. A batch of embedding texts runs each text as its
+  // own sequence, so largest is its longest text, not the batch.
   async measure(body) {
     const req = json(body) || {};
     let text = '';
@@ -161,17 +183,13 @@ class Pool {
       : req.max_completion_tokens > 0 ? req.max_completion_tokens
       : (req.prompt !== undefined || req.messages) ? DEFAULT_GEN_TOKENS : 0;
 
-    let input = Math.ceil(text.length / 2);          // safe fallback: over-estimate
-    const live = this.backends.find((b) => b.downUntil <= Date.now() && b.capacity) || this.backends[0];
-    try {
-      const r = await request(live.url, '/tokenize', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: text }), timeout: 5000,
-      });
-      const t = json(r.body)?.tokens;
-      if (r.status === 200 && Array.isArray(t)) input = t.length;
-    } catch { /* keep the over-estimate */ }
-    return input + gen + (req.messages ? TEMPLATE_MARGIN : 8);
+    const extra = gen + (req.messages ? TEMPLATE_MARGIN : 8);
+    const tokens = (await this.count(text)) + extra;
+    if (Array.isArray(req.input) && req.input.length > 1) {
+      const longest = req.input.reduce((a, s) => (String(s).length > a.length ? String(s) : a), '');
+      return { tokens: tokens + 2 * req.input.length, largest: (await this.count(longest)) + 8 };
+    }
+    return { tokens, largest: tokens };
   }
 }
 
@@ -209,17 +227,20 @@ async function handle(pool, req, res) {
   // Only generation and embedding requests use the budget; everything else
   // (health, props, models, tokenize ...) goes to any live backend.
   const budgeted = req.method === 'POST' && body && !/\/(tokenize|detokenize|props|slots)/.test(req.url);
-  const tokens = budgeted ? await pool.measure(body) : 0;
-  if (budgeted && tokens > pool.maxRequest()) {
+  const { tokens, largest } = budgeted ? await pool.measure(body) : { tokens: 0, largest: 0 };
+  if (budgeted && !pool.fits(tokens, largest)) {
+    const error = largest > pool.maxText()
+      ? `one text needs ${largest} tokens; the model takes at most ${pool.maxText()} per text`
+      : `request needs ${tokens} tokens; the largest GPU pool holds ${pool.maxPool()}`;
     res.writeHead(413, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ error: `request needs ${tokens} tokens; the largest GPU pool holds ${pool.maxRequest()}` }));
+    return res.end(JSON.stringify({ error }));
   }
 
   const tried = new Set();
   for (let attempt = 0; attempt < 3; attempt++) {
     let b;
     try {
-      if (budgeted) b = await pool.acquire(tokens, tried);
+      if (budgeted) b = await pool.acquire(tokens, tried, largest);
       else {
         b = pool.backends.find((x) => !tried.has(x) && x.downUntil <= Date.now()) || pool.backends[0];
         pool.take(b, 0);
