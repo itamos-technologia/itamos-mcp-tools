@@ -297,7 +297,7 @@ PAGES = [
                     '**Per-call context:** each tool call runs with its own context naming your sandbox, your project map and your edit state, so tools can never mix up two users.']),
             ('h2', 'endpoints', 'Endpoints'),
             ('ul', ['`POST /mcp`: the MCP endpoint.',
-                    '`GET /health`: pool status and queue length (it drives the live spot counter on these pages).',
+                    '`GET /health`: pool status and queue length, for monitoring.',
                     '`/.well-known/*`, `/register`, `/authorize`, `/token`: the sign-in flow.']),
         ],
     },
@@ -766,7 +766,7 @@ PAGE_CSS = """
 
 PAGE_JS = """
 <script>
-// Copy button for the connector URL, and the live spot counter from the sandbox.
+// Copy button for the connector URL.
 (function(){
   var btn = document.getElementById('copy-url');
   var url = document.getElementById('mcp-url');
@@ -776,20 +776,9 @@ PAGE_JS = """
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done, function(){});
     else { var r = document.createRange(); r.selectNodeContents(url); var s = getSelection(); s.removeAllRanges(); s.addRange(r); }
   });
-  var box = document.getElementById('slots');
-  function refresh(){
-    fetch('%s', { cache: 'no-store' })
-      .then(function(r){ if (!r.ok) throw 0; return r.json(); })
-      .then(function(d){ if (!d || !d.slots) throw 0;
-        document.getElementById('slots-used').textContent = d.slots.used;
-        document.getElementById('slots-total').textContent = d.slots.total;
-        box.hidden = false; })
-      .catch(function(){ if (box) box.hidden = true; });
-  }
-  if (box) { refresh(); setInterval(refresh, 30000); }
 })();
 </script>
-""" % HEALTH_URL
+"""
 
 
 def blocks_html(blocks):
@@ -821,8 +810,7 @@ def try_section():
          f'<p>{inline_html(TRY_INTRO)}</p>',
          f'<div class="url-row"><code id="mcp-url">{html.escape(MCP_URL)}</code>'
          '<button type="button" id="copy-url">Copy</button></div>',
-         '<ol>' + ''.join(f'<li>{inline_html(x)}</li>' for x in TRY_STEPS) + '</ol>',
-         '<p class="slots" id="slots" hidden><b id="slots-used">—</b>/<span id="slots-total">500</span> spots in use right now.</p>']
+         '<ol>' + ''.join(f'<li>{inline_html(x)}</li>' for x in TRY_STEPS) + '</ol>']
     if REPO_URL:
         h.append(f'<p>Source code: <a href="{html.escape(REPO_URL)}">{html.escape(REPO_URL)}</a></p>')
     h.append('</section>')

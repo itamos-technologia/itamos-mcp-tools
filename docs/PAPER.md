@@ -162,7 +162,7 @@ Every tool call refreshes the sandbox. A watchdog checks regularly, and a sandbo
 ### Endpoints
 
 - `POST /mcp`: the MCP endpoint.
-- `GET /health`: pool status and queue length (it drives the live spot counter on these pages).
+- `GET /health`: pool status and queue length, for monitoring.
 - `/.well-known/*`, `/register`, `/authorize`, `/token`: the sign-in flow.
 
 <a id="mcp-sandbox"></a>
