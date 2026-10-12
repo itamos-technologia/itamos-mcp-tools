@@ -22,14 +22,46 @@ import re
 
 MCP_URL = 'https://mcp.itamos-technologia.com/mcp'
 HEALTH_URL = 'https://mcp.itamos-technologia.com/health'
-REPO_URL = None   # e.g. 'https://github.com/Itamos-technologia/itamos-mcp-tools'
+REPO_URL = 'https://github.com/itamos-technologia/itamos-mcp-tools'
 CONTACT = 'info@itamos-technologia.com'
 ISSUES_URL = 'https://github.com/Itamos-technologia/itamos-mcp-tools/issues'
 DISCUSSIONS_URL = 'https://github.com/Itamos-technologia/itamos-mcp-tools/discussions'
 LINKEDIN_URL = 'https://www.linkedin.com/in/konstantinos-karamperis-a645b654'
 
 PAGE_KEYWORDS = ('MCP, Model Context Protocol, MCP server, MCP sandbox, AI agent tools, '
-                 'AI coding tools, code navigation, Claude MCP, free MCP sandbox')
+                 'AI coding tools, code navigation, Claude MCP, free MCP sandbox, '
+                 'web browser for AI agents, LLM web browsing')
+
+SITE_URL = 'https://itamos-technologia.com'
+PREVIEW_IMAGE = (f'{SITE_URL}/hero-bg.jpg', 2688, 1536)
+
+# Search titles (<= 60 characters) and descriptions (120-160) per website page.
+SEO = {
+    'mcp-hosting.html': ('Itamos MCP Tools: free MCP sandbox and AI coding tools',
+        'Free MCP sandbox and AI coding tools for Claude and other agents: a codebase map, '
+        'checked edits, and a token-efficient web browser for AI agents. No account.'),
+    'mcp-server.html': ('Free MCP sandbox server, no account needed | Itamos MCP',
+        'How the free Itamos MCP sandbox server works: one-click anonymous sign-in, 500 private '
+        'sandboxes, a waiting queue, path isolation and automatic cleanup.'),
+    'mcp-sandbox.html': ('Private MCP sandbox for AI agents | Itamos MCP Tools',
+        'Your private, temporary MCP sandbox: clone a repository and let your AI agent explore '
+        'and change it with project maps and checked edits. Free, no account.'),
+    'mcp-tool-master-architect.html': ('master_architect: codebase map for AI agents | Itamos MCP',
+        'master_architect indexes a codebase into a graph of files, imports, databases and '
+        'servers, kept current on every save, so AI agents navigate by coordinates.'),
+    'mcp-tool-read-file.html': ('read_file: code editor for AI agents | Itamos MCP Tools',
+        'read_file gives AI agents project structure, file maps and segments by coordinate, '
+        'with read-before-write and checked saves that keep broken code off disk.'),
+    'mcp-tool-write-file.html': ('write_file: safe file creation for AI agents | Itamos MCP',
+        'write_file creates new files for AI agents, never overwrites, and always files them in '
+        'a project the agent names, indexed at once for the codebase map.'),
+    'mcp-tool-git.html': ('Sandboxed git for AI agents: clone, status, commit | Itamos',
+        'A sandboxed git tool for AI agents: shallow clones from remote URLs, scanned into a '
+        'project on arrival, status and commit, and no push. Free in the sandbox.'),
+    'mcp-tool-web-skeleton.html': ('web_skeleton: web browser for AI agents | Itamos MCP Tools',
+        'web_skeleton is a web browser for AI agents: pages become skeletons of sections with '
+        'ids and layout, at any screen size, using far fewer tokens than raw HTML.'),
+}
 
 # ── diagrams: vertical flows. nodes = (title, detail); back = (from, to, label) ──
 DIAGRAMS = {
@@ -843,6 +875,65 @@ def build_html_body(page):
     return '\n'.join(h)
 
 
+def seo_block(page, title, desc):
+    img, w, h = PREVIEW_IMAGE
+    tags = [
+        f'<meta property="og:image" content="{img}">',
+        f'<meta property="og:image:width" content="{w}">',
+        f'<meta property="og:image:height" content="{h}">',
+        '<meta property="og:image:alt" content="Itamos MCP Tools: free MCP sandbox and AI coding tools">',
+        '<meta name="twitter:card" content="summary_large_image">',
+        f'<meta name="twitter:title" content="{html.escape(title)}">',
+        f'<meta name="twitter:description" content="{html.escape(desc)}">',
+        f'<meta name="twitter:image" content="{img}">',
+    ]
+    if page.get('hub'):
+        import json
+        ld = {
+            '@context': 'https://schema.org',
+            '@type': 'SoftwareApplication',
+            'name': 'Itamos MCP Tools',
+            'applicationCategory': 'DeveloperApplication',
+            'operatingSystem': 'Any MCP client (hosted); self-hosted on Linux',
+            'description': desc,
+            'url': f'{SITE_URL}/{page["file"]}',
+            'image': img,
+            'license': 'https://www.gnu.org/licenses/agpl-3.0.html',
+            'isAccessibleForFree': True,
+            'offers': {'@type': 'Offer', 'price': '0', 'priceCurrency': 'EUR'},
+            'author': {'@type': 'Person', 'name': 'Konstantinos Karamperis', 'url': LINKEDIN_URL},
+            'publisher': {'@type': 'Organization', 'name': 'Itamos Technologia', 'url': SITE_URL},
+            'sameAs': [REPO_URL] if REPO_URL else [],
+        }
+        tags.append('<script type="application/ld+json">' + json.dumps(ld, ensure_ascii=False) + '</script>')
+    return '<!-- seo:start -->\n' + '\n'.join(tags) + '\n<!-- seo:end -->\n'
+
+
+def put_seo_block(src, page, title, desc):
+    # Replace the block from an earlier build, or add it before </head>.
+    block = seo_block(page, title, desc)
+    if '<!-- seo:start -->' in src:
+        a = src.index('<!-- seo:start -->')
+        b = src.index('<!-- seo:end -->', a) + len('<!-- seo:end -->\n')
+        return src[:a] + block + src[b:]
+    k = src.index('</head>')
+    return src[:k] + block + src[k:]
+
+
+def update_sitemap(site, files):
+    # Set <lastmod> to today for the pages just rebuilt.
+    import datetime
+    sm = site / 'sitemap.xml'
+    if not sm.exists():
+        return
+    today = datetime.date.today().isoformat()
+    x = sm.read_text()
+    for f in files:
+        x = re.sub(rf'(<loc>{re.escape(SITE_URL)}/{re.escape(f)}</loc>\s*<lastmod>)[^<]*(</lastmod>)',
+                   rf'\g<1>{today}\g<2>', x)
+    sm.write_text(x)
+
+
 def render_page(template, page):
     src = template
     body = build_html_body(page)
@@ -856,6 +947,8 @@ def render_page(template, page):
     src = src[:start] + '\n' + body + '\n' + src[end:]
     title = page.get('page_title') or f'{page["title"]}: Itamos MCP Tools | Itamos Technologia'
     desc = page['desc']
+    if page['file'] in SEO:
+        title, desc = SEO[page['file']]
     src = re.sub(r'<title>.*?</title>', f'<title>{html.escape(title)}</title>', src, count=1, flags=re.S)
     src = re.sub(r'<meta name="description" content="[^"]*"',
                  f'<meta name="description" content="{html.escape(desc)}"', src, count=1)
@@ -869,6 +962,7 @@ def render_page(template, page):
     src = re.sub(r'<meta property="og:type" content="[^"]*"', '<meta property="og:type" content="article"', src, count=1)
     src = re.sub(r'(<link rel="canonical" href="[^"]*/)[^"/]*"', rf'\g<1>{page["file"]}"', src, count=1)
     src = re.sub(r'(<meta property="og:url" content="[^"]*/)[^"/]*"', rf'\g<1>{page["file"]}"', src, count=1)
+    src = put_seo_block(src, page, title, desc)
     marker = '/* ── paper (generated by itamos-mcp-tools'
     if marker in src:
         cs = src.index(marker)
@@ -887,6 +981,7 @@ def build_site(site_dir):
         out = site / page['file']
         out.write_text(render_page(template, page))
         written.append(out)
+    update_sitemap(site, [p['file'] for p in PAGES])
     return written
 
 

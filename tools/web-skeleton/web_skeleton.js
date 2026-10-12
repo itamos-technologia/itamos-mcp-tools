@@ -1271,6 +1271,11 @@ await ensureChrome();
     }
 
     const data = JSON.parse(walkerResult.result.value);
+    // Raw page size, as the skeleton measures it, for the token line.
+    try {
+      const raw = await session.send('Runtime.evaluate', { expression: 'document.documentElement.outerHTML.length', returnByValue: true });
+      data.rawBytes = raw?.result?.value || 0;
+    } catch { data.rawBytes = 0; }
 
     // Update cache with new URL
     cacheSet(newUrl, {
@@ -1279,6 +1284,7 @@ await ensureChrome();
       title: data.title,
       url: newUrl,
       pageHeight: data.pageHeight,
+      rawBytes: data.rawBytes,
       viewport: { width: viewport.width, height: viewport.height },
     });
 
