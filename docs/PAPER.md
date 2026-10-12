@@ -552,6 +552,33 @@ The same overview page of this site, seen both ways:
 - **Desktop (1920×1080):** the main column starts at 28% of the width and is 43% wide; the Copy button sits beside the connector URL; the page is 3,975 pixels tall.
 - **Phone (390×844):** the main column is the full width, the header menu collapses into a Menu button, the Copy button moves below the URL, and the page grows to 5,167 pixels.
 
+### How it compares
+
+The same 10 public pages read five ways on the same day, with the same Chrome at 1920×1080. Tokens are estimated the same way for all of them: characters ÷ 4.
+
+| Page | Raw HTML | Fetch → Markdown | Playwright MCP | Chrome DevTools MCP | web_skeleton, whole page | web_skeleton, default |
+|---|---:|---:|---:|---:|---:|---:|
+| Python docs (json) | 30,282 | 8,944 | 25,251 | 27,375 | 10,430 | 396 |
+| GitHub (pallets/flask) | 85,545 | 411 | 5,769 | 6,530 | 5,155 | 470 |
+| Wikipedia (Large language model) | 339,369 | 41,172 | 125,148 | 131,954 | 84,947 | 1,012 |
+| Hacker News | 8,592 | 2,402 | 12,284 | 9,684 | 6,575 | 2,990 |
+| MDN (HTTP status codes) | 37,738 | 4,857 | 19,261 | 16,566 | 6,438 | 315 |
+| BBC News | 84,627 | 4,443 | 13,134 | 10,856 | 6,221 | 1,454 |
+| PyPI (requests) | 72,935 | 3,779 | 7,202 | 6,592 | 3,415 | 384 |
+| React docs (Learn) | 73,855 | 4,086 | 13,049 | 15,080 | 3,996 | 332 |
+| Stack Overflow (question) | 151,755 | refused (403) | challenge page | challenge page | 26,608 | 1,051 |
+| Itamos MCP Tools overview | 7,380 | 1,397 | 3,086 | 2,273 | 1,403 | 1,403 |
+| Total, the 9 pages all could open | 740,323 | 71,491 | 224,184 | 226,910 | 128,580 | 8,750 |
+
+*Tokens to see the page. Lower costs less. "Default" is web_skeleton's answer without options: the outline of any page over about 3,000 tokens.*
+
+- **Among tools an agent can act with** (click, navigate, find an element again), web_skeleton used about 43% fewer tokens than Playwright MCP and Chrome DevTools MCP for the whole page. By default it answers with an outline of about 1,000 tokens, and the agent zooms in from there.
+- **Fetch → Markdown** (the MCP project's Fetch server) is the smallest for full text. It does a different job: text only, nothing to click, and on application-like pages much of the page is left out (on GitHub, only the start of the README remained).
+- **Stack Overflow:** the other three received a challenge page or a refusal (HTTP 403); web_skeleton rendered the page.
+- **Finding one thing** (one search per page): web_skeleton needed 7,780 tokens in total, Playwright MCP's search 14,773. Playwright MCP was a little leaner on exact single matches.
+
+Measured on 12 October 2026 with Playwright MCP 0.0.83, Chrome DevTools MCP 1.10.1 and mcp-server-fetch 2026.10.10, each with its default output. Results change as the pages and the tools do, so try your own pages.
+
 ### How it works
 
 Pages are rendered in headless Chromium through the Chrome DevTools Protocol, so content built by JavaScript is included. In typical use, a page that would cost 50,000 to 200,000 tokens as raw HTML becomes a skeleton of 500 to 3,000 tokens.
