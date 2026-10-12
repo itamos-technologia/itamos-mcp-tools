@@ -879,51 +879,6 @@ export async function scanProject(rootPath, projectName, opts = {}) {
             const _merged = collectExternalRefs(content, f.detection.language, analysis);
             if (_merged.length) externalRefsByFile.set(fileId, _merged);
           } catch (_e) { /* detection must never break a scan */ }
-          if (false) try {
-            const _ext = detectExternalRefs(content, f.detection.language);
-            // Merge any external refs the PARSER itself produced (e.g. the nginx
-            // parser emits listen/proxy_pass endpoints with role metadata that
-            // generic text detection can't see). Parser refs carry `extra` as an
-            // object; normalize to the JSON-string form the store expects.
-            const _parserExt = (analysis.external_refs || []).map(r => ({
-              kind: r.kind, name: r.name, locator: r.locator, line: r.line,
-              extra: r.extra == null ? null : (typeof r.extra === 'string' ? r.extra : JSON.stringify(r.extra)),
-            }));
-            // Code listeners (app.listen / createServer().listen) become
-            // external refs with role='listen', SAME shape as an nginx `listen`.
-            // locator = host:port (host defaults to 0.0.0.0 when not a literal),
-            // so an nginx upstream pointing at 127.0.0.1:<port> can be matched to
-            // the code file that listens on that port. port=null (env-only, no
-            // literal) is stored honestly with locator host:'?' and no match.
-            for (const L of (analysis.listeners || [])) {
-              const host = L.host || '0.0.0.0';
-              const locator = L.port != null ? `${host}:${L.port}` : `${host}:?`;
-              _parserExt.push({
-                kind: 'server', name: locator, locator, line: L.line,
-                extra: JSON.stringify({ role: 'listen', host, port: L.port, port_expr: L.port_expr, source: 'code' }),
-              });
-            }
-            // The global external_refs table is keyed by (kind, locator), so two
-            // refs with the same kind+locator collapse to one row there — the
-            // richer one must win. Parser-supplied refs (role=listen/upstream,
-            // ssl, etc.) are authoritative over generic text detection, which
-            // produces the same host:port with no role. So we take parser refs
-            // FIRST and only add a generic ref when its kind+locator isn't
-            // already covered by a parser ref.
-            const _merged = [];
-            const _byKL = new Set();          // kind|locator already taken
-            for (const r of _parserExt) {
-              const k = r.kind + '|' + r.locator;
-              if (_byKL.has(k)) continue;     // collapse parser-internal dupes
-              _byKL.add(k); _merged.push(r);
-            }
-            for (const r of (_ext || [])) {
-              const k = r.kind + '|' + r.locator;
-              if (_byKL.has(k)) continue;     // parser already owns this endpoint
-              _byKL.add(k); _merged.push(r);
-            }
-            if (_merged.length) externalRefsByFile.set(fileId, _merged);
-          } catch (_e) { /* detection must never break a scan */ }
           // Drop content immediately — we don't need it anymore.
           content = null;
 
@@ -981,56 +936,10 @@ export async function scanProject(rootPath, projectName, opts = {}) {
     }
 
     // ── Second pass: resolve imports + record db connections ──
-    const insertDatabase = db.prepare(
-      'INSERT INTO databases (project_id, address, name, type, path_or_uri, extra) VALUES (?, ?, ?, ?, ?, ?)'
-    );
-    const insertSqlQuery = db.prepare(
-      'INSERT INTO sql_queries (file_id, line, method, sql, is_dynamic, inferred_database_id) VALUES (?, ?, ?, ?, ?, ?)'
-    );
-    const insertLmdbRef = db.prepare(
-      'INSERT INTO lmdb_subdb_refs (file_id, line, name, inferred_database_id) VALUES (?, ?, ?, ?)'
-    );
-    const insertDbConn = db.prepare(
-      'INSERT INTO db_connections (file_id, database_id, line) VALUES (?, ?, ?)'
-    );
     const insertImport = db.prepare(
       'INSERT INTO imports (file_id, import_path, resolved_file_id, is_external, line, edge_kind) VALUES (?, ?, ?, ?, ?, ?)'
     );
 
-    // Database identity is (project_id, path_or_uri). Because databases are no
-    // longer wiped project-wide, SEED dbByPath from rows that already exist so a
-    // re-parsed file REUSES the existing database row instead of inserting a
-    // duplicate. New paths still get a fresh row. Stale rows (no connections
-    // left after this scan) are GC'd at the end.
-    const dbByPath = new Map();
-    for (const r of db.prepare('SELECT id, path_or_uri FROM databases WHERE project_id = ?').all(projectId)) {
-      if (r.path_or_uri != null) dbByPath.set(r.path_or_uri, r.id);
-    }
-    // dbCounter only feeds the synthetic `99.N` address for NEW databases; start
-    // it past any existing count to avoid address collisions.
-    let dbCounter = db.prepare('SELECT COUNT(*) AS c FROM databases WHERE project_id = ?').get(projectId).c;
-
-    // Prepared statements for external refs (shared nodes, global identity).
-    const upsertExtRef = db.prepare(
-      'INSERT INTO external_refs (kind, name, locator, version, extra) VALUES (?, ?, ?, ?, ?) ' +
-      'ON CONFLICT(kind, locator) DO UPDATE SET ' +
-      '  name  = excluded.name, ' +
-      // Refresh extra when the incoming row carries metadata (e.g. the nginx
-      // parser's role=listen/upstream + ssl). A null/absent incoming extra must
-      // NOT wipe an existing one, so COALESCE keeps the old value in that case.
-      // This lets a richer parser ref upgrade a generic role-less row that was
-      // inserted first (text detection, or another project).
-      '  extra = COALESCE(excluded.extra, external_refs.extra) ' +
-      'WHERE external_refs.name != excluded.name ' +
-      '   OR (excluded.extra IS NOT NULL AND IFNULL(external_refs.extra, \'\') != excluded.extra)'
-    );
-    const getExtRefId = db.prepare('SELECT id FROM external_refs WHERE kind = ? AND locator = ?');
-    const addExtRefProject = db.prepare(
-      'INSERT OR IGNORE INTO external_ref_projects (external_ref_id, project_id) VALUES (?, ?)'
-    );
-    const insertFileExtRef = db.prepare(
-      'INSERT INTO file_external_refs (file_id, external_ref_id, line) VALUES (?, ?, ?)'
-    );
 
     const writeFileFacts = makeFactWriter(db, projectId);   // same rules as reindexFile / L3
     for (const [fileId, pr] of pendingResolution.entries()) {
@@ -1040,44 +949,6 @@ export async function scanProject(rootPath, projectName, opts = {}) {
         lmdb_subdbs: pr.lmdb_subdbs || [],
         external_refs: externalRefsByFile.get(fileId) || [],
       });
-      const handleVarToDbId = new Map(), sqlDbIds = [];   // (kept for the disabled legacy blocks below)
-      if (false) {
-      // External refs first (shared nodes deduped globally by kind+locator).
-      const extRefs = externalRefsByFile.get(fileId);
-      if (extRefs) {
-        for (const er of extRefs) {
-          upsertExtRef.run(er.kind, er.name, er.locator, er.version ?? null, er.extra ?? null);
-          const row = getExtRefId.get(er.kind, er.locator);
-          if (row) {
-            addExtRefProject.run(row.id, projectId);
-            insertFileExtRef.run(fileId, row.id, er.line ?? null);
-          }
-        }
-      }
-      // Databases first. Build, per file, the maps needed to attribute each SQL
-      // query to the SPECIFIC handle it runs against:
-      //   handleVarToDbId : handle variable name  → database id  (exact match key)
-      //   sqlDbIds        : every SQL-shaped db id for this file (sqlite/postgres/mysql/duckdb)
-      // These replace the old "first SQL db wins" (LIMIT 1) attribution, which
-      // mis-linked every query in any file that opens more than one DB handle.
-      const handleVarToDbId = new Map();
-      const sqlDbIds = [];
-      for (const dbDecl of pr.databases) {
-        let dbId = dbByPath.get(dbDecl.path_or_uri);
-        if (!dbId) {
-          dbCounter += 1;
-          const addr = `99.${dbCounter}`;
-          const r = insertDatabase.run(projectId, addr, dbDecl.name, dbDecl.type, dbDecl.path_or_uri, dbDecl.extra ?? null);
-          dbId = r.lastInsertRowid;
-          dbByPath.set(dbDecl.path_or_uri, dbId);
-        }
-        insertDbConn.run(fileId, dbId, dbDecl.line ?? null);
-        // handle_var comes off the parsed decl (added by walkDatabases). It is
-        // the variable the connection was bound to, e.g. `dbPath` / `DB_PATH`.
-        if (dbDecl.handle_var) handleVarToDbId.set(dbDecl.handle_var, dbId);
-        if (['sqlite', 'postgres', 'mysql', 'duckdb'].includes(dbDecl.type)) sqlDbIds.push(dbId);
-      }
-      }   // end disabled legacy external-refs + databases block (now in makeFactWriter)
       // Imports — resolve against project files.
       //
       // is_external = 0 when the import is local by syntax ('.' or '/'),
@@ -1149,45 +1020,6 @@ export async function scanProject(rootPath, projectName, opts = {}) {
         }
       }
 
-      // SQL queries: attribute each query to the RIGHT database handle.
-      //   1. If the query's receiver (the object the SQL method was called on)
-      //      matches a known handle variable → link to that exact db. Correct
-      //      even when the file opens several handles.
-      //   2. Else, if the file has exactly ONE SQL-shaped db → link to it; the
-      //      attribution is unambiguous regardless of receiver text.
-      //   3. Else (receiver unknown AND multiple candidate dbs) → leave NULL.
-      //      We do NOT guess: a wrong link is worse than an honest null, which
-      //      the L3 check surfaces as an unresolved case.
-      if (false) for (const q of (pr.sql_queries || [])) {   // now in makeFactWriter
-        let inferredDbId = null;
-        if (q.receiver && handleVarToDbId.has(q.receiver)) {
-          inferredDbId = handleVarToDbId.get(q.receiver);
-        } else if (sqlDbIds.length === 1) {
-          inferredDbId = sqlDbIds[0];
-        } else {
-          inferredDbId = null;  // ambiguous + unmatched → honest null, no guess
-        }
-        insertSqlQuery.run(
-          fileId,
-          q.line ?? null,
-          q.method ?? null,
-          q.sql,
-          q.dynamic ? 1 : 0,
-          inferredDbId,
-        );
-      }
-
-      // LMDB sub-DB references: link to the file's first lmdb env
-      const fileLmdbDb = db.prepare(`
-        SELECT d.id FROM databases d
-        JOIN db_connections dc ON dc.database_id = d.id
-        WHERE d.project_id = ? AND dc.file_id = ? AND d.type = 'lmdb'
-        LIMIT 1
-      `).get(projectId, fileId);
-      const lmdbDbId = fileLmdbDb?.id ?? null;
-      if (false) for (const ref of (pr.lmdb_subdbs || [])) {   // now in makeFactWriter
-        insertLmdbRef.run(fileId, ref.line ?? null, ref.name, lmdbDbId);
-      }
     }
 
     // ── Re-link unchanged files ──
