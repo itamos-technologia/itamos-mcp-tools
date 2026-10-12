@@ -1070,7 +1070,7 @@ if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
 // ACTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function actionSkeleton(url, viewport = DEFAULT_VIEWPORT, context = null, layout = null) {
+async function actionSkeleton(url, viewport = DEFAULT_VIEWPORT, context = null, layout = null, full = false) {
 // Cache first — but only a page rendered at THIS size (a different size reflows the page).
 const cached = cacheGetFor(url, viewport);
   if (cached) {
@@ -1083,7 +1083,7 @@ const cached = cacheGetFor(url, viewport);
       elements: cached.skeleton,
       sections: cached.sections,
       rawBytes: cached.rawBytes || 0,
-    }, viewport, context, layout);
+    }, viewport, context, layout, full);
   }
 
   // No cache — need to fetch the page
@@ -1160,7 +1160,7 @@ const cached = cacheGetFor(url, viewport);
     // AI-title text-heavy sections for better navigation
     await aiTitleElements(data);
 
-    return formatSkeleton(data, viewport, context, layout);
+    return formatSkeleton(data, viewport, context, layout, full);
   } finally {
     await session.close();
   }
@@ -1398,7 +1398,49 @@ async function actionSearch(query) {
 // FORMAT HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-function formatSkeleton(data, viewport, context = null, layout = null) {
+// Same rule as read_file: a skeleton over ~3000 tokens without context is not
+// dumped; the agent gets the page's outline and how to narrow it.
+const WEB_TOKEN_LIMIT = 3000;
+const OUTLINE_KINDS = new Set(['main', 'navigation', 'nav', 'sidebar', 'aside', 'region', 'header', 'footer', 'section', 'article', 'form']);
+function buildOutline(data, viewport, layout, fullTokens) {
+  const out = [
+    `PAGE: ${data.title}`,
+    `URL: ${data.url}`,
+    `VIEWPORT: ${viewport.width}x${viewport.height} scrollH:${data.pageHeight}`,
+    `TOO LARGE: the full skeleton is ~${fullTokens.toLocaleString()} tokens (${data.elements.length} elements). Outline: landmarks and headings.`,
+    'NEXT: skeleton with context="<words to look for>", read [id] for one section, or full_skeleton=true for everything.',
+    '---',
+  ];
+  let budget = WEB_TOKEN_LIMIT * 4 - out.join('\n').length - 200;
+  let omitted = 0, shown = 0;
+  for (const el of data.elements) {
+    if (!(el.kind === 'heading' || (OUTLINE_KINDS.has(el.kind) && el.depth <= 2))) continue;
+    let line = `${'  '.repeat(Math.min(el.depth, 6))}[${el.id}] ${el.kind}${el.label ? ` "${el.label}"` : ''}`;
+    if (layout === 'all' || layout === el.id) line += posTag(el);
+    if (line.length + 1 > budget) { omitted++; continue; }
+    budget -= line.length + 1;
+    out.push(line);
+    shown++;
+  }
+  if (omitted) out.push(`(${omitted} more headings and landmarks not shown — narrow with context)`);
+  // Pages without headings (link lists, tables): show their first links instead.
+  if (shown < 5) {
+    out.push('Few headings on this page; its first links:');
+    let more = 0;
+    for (const el of data.elements) {
+      if (!el.clickable || !el.label) continue;
+      let line = `  [${el.id}] ${el.kind} "${el.label}"${el.dest ? ` → ${el.dest}` : ''}`;
+      if (layout === 'all' || layout === el.id) line += posTag(el);
+      if (line.length + 1 > budget) { more++; continue; }
+      budget -= line.length + 1;
+      out.push(line);
+    }
+    if (more) out.push(`(${more} more links — narrow with context)`);
+  }
+  return out.join('\n');
+}
+
+function formatSkeleton(data, viewport, context = null, layout = null, full = false) {
   const lines = [];
   lines.push(`PAGE: ${data.title}`);
   lines.push(`URL: ${data.url}`);
@@ -1512,19 +1554,26 @@ function formatSkeleton(data, viewport, context = null, layout = null) {
 
   } else {
     // ── Context filter — only expand sections matching search terms ───
-    const terms = context.toLowerCase().split(/\s+/).filter(t => t.length > 2);
     lines.push(`CONTEXT: "${context}"`);
 
-    const matchSet = new Set();
-    for (const el of elements) {
-      const haystack = [
-        el.label || '',
-        el.summary || '',
-        data.sections?.[el.id] || '',
-      ].join(' ').toLowerCase();
-
-      const hits = terms.filter(t => haystack.includes(t)).length;
-      if (hits > 0) matchSet.add(el.id);
+    // Exact phrase first, then all words, then any word — the first that finds
+    // something wins, so a specific search is never drowned by its common words.
+    const q = context.trim().toLowerCase().replace(/\s+/g, ' ');
+    const words = q.split(' ').filter(t => t.length > 2);
+    const textOf = (el) => [el.label || '', el.summary || '', data.sections?.[el.id] || ''].join(' ').toLowerCase();
+    const pick = (pred) => { const set = new Set(); for (const el of elements) if (pred(textOf(el))) set.add(el.id); return set; };
+    let matchMode = 'any word';
+    let matchSet = new Set();
+    if (q.includes(' ')) { matchSet = pick(t => t.includes(q)); matchMode = 'exact phrase'; }
+    if (!matchSet.size && words.length >= 2) { matchSet = pick(t => words.every(w => t.includes(w))); matchMode = 'all words'; }
+    if (!matchSet.size && words.length) { matchSet = pick(t => words.some(w => t.includes(w))); matchMode = 'any word'; }
+    // Most specific only: a container whose content matches inside a child is
+    // context (shown as a parent), not a match itself.
+    for (let i = 0; i < elements.length; i++) {
+      if (!matchSet.has(elements[i].id)) continue;
+      for (let j = i + 1; j < elements.length && elements[j].depth > elements[i].depth; j++) {
+        if (matchSet.has(elements[j].id)) { matchSet.delete(elements[i].id); break; }
+      }
     }
 
     const parentIds = new Set();
@@ -1540,7 +1589,7 @@ function formatSkeleton(data, viewport, context = null, layout = null) {
       }
     }
 
-    lines.push(`MATCHES: ${matchSet.size} of ${data.elementCount} elements`);
+    lines.push(`MATCHES: ${matchSet.size} of ${data.elementCount ?? elements.length} elements (${matchMode})`);
     lines.push('---');
 
     for (const el of elements) {
@@ -1574,7 +1623,10 @@ function formatSkeleton(data, viewport, context = null, layout = null) {
   }
 
   // Token stats footer
-  const output = lines.join('\n');
+  let output = lines.join('\n');
+  if (!context && !full && output.length / 4 > WEB_TOKEN_LIMIT) {
+    output = buildOutline(data, viewport, layout, Math.round(output.length / 4));
+  }
   const rawTokens = Math.round((data.rawBytes || 0) / 4);
   const skelTokens = Math.round(output.length / 4);
   const savings = rawTokens > 0 ? Math.round((1 - skelTokens / rawTokens) * 100) : 0;
@@ -1611,6 +1663,7 @@ export default {
     element: z.string().optional().describe('Element id to click (from skeleton output, e.g. "e12")'),
     query: z.string().optional().describe('Search query (for action=search)'),
     layout: z.string().optional().describe('Show element positions. "all" = every element, or an element id like "e5" for just that subtree. Omit for no positions (default). Format @x%,y% w%×h%: x and w are % of the viewport width, y and h are % of the full page height.'),
+    full_skeleton: z.boolean().optional().describe('Show the whole skeleton even when it is very large (above ~3000 tokens a skeleton without context returns the page outline instead).'),
     viewport: z.string().optional().describe('Screen size to render at, "WIDTHxHEIGHT" in pixels, e.g. "390x844" (phone), "1366x768" (laptop). Default 1920x1080. Below 768 px wide the page is rendered as mobile. For skeleton and click; read uses the size of the last skeleton.'),
   },
   async handler(args, ctx) {
@@ -1622,9 +1675,10 @@ export default {
           if (!args.url) throw new Error('url required for skeleton action');
           validateUrl(args.url);
           const vp = parseViewport(args.viewport) || DEFAULT_VIEWPORT;
+          const full = !!args.full_skeleton;
           result = cacheGetFor(args.url, vp)
-            ? await actionSkeleton(args.url, vp, args.context || null, args.layout || null)
-            : await withRender(() => actionSkeleton(args.url, vp, args.context || null, args.layout || null));
+            ? await actionSkeleton(args.url, vp, args.context || null, args.layout || null, full)
+            : await withRender(() => actionSkeleton(args.url, vp, args.context || null, args.layout || null, full));
           break;
         }
 
