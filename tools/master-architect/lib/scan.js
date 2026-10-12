@@ -21,7 +21,7 @@ import fs from 'fs';
 import { createHash } from 'crypto';
 import path from 'path';
 import {
-  detectLanguage, isIgnoredDir, isIgnoredFile, getParser,
+  detectLanguage, isIgnoredDir, isIgnoredFile, getParser, isVenvInternal, venvRootFor, sandboxCeiling,
 } from './registry.js';
 import { getDb, estimateTokens, initialVerificationStatus, PARSER_VERSION } from './db.js';
 import { parseTree } from './segmenter.js';
@@ -522,7 +522,7 @@ function walk(rootAbs) {
 
   function recurse(absDir, relDir, parentRelDir) {
     const dirName = relDir === '' ? path.basename(rootAbs) : path.basename(relDir);
-    if (relDir !== '' && isIgnoredDir(dirName, absDir)) return;
+    if (relDir !== '' && (isIgnoredDir(dirName, absDir) || isVenvInternal(dirName, path.dirname(absDir)))) return;
     directories.push({ absPath: absDir, relPath: relDir, parentRelPath: parentRelDir, name: dirName });
 
     let entries;
@@ -581,6 +581,8 @@ export async function scanProject(rootPath, projectName, opts = {}) {
   if (!fs.existsSync(rootPath) || !fs.statSync(rootPath).isDirectory()) {
     throw new Error(`Not a directory: ${rootPath}`);
   }
+  // A folder inside a Python venv belongs to that venv: the venv is the project root.
+  rootPath = venvRootFor(rootPath, sandboxCeiling()) || rootPath;
   const nameGiven = !!projectName;
   projectName = projectName || path.basename(rootPath);
 

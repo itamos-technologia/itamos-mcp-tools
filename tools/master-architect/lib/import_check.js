@@ -20,6 +20,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { createRequire, isBuiltin } from 'module';
 import { analyzeContent } from './scan.js';
+import { detectEnvironment } from './probe.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -64,10 +65,39 @@ export async function checkImportsInContent(absPath, content, projectRoot) {
   // Not a project file → must be an installed package, or it goes nowhere.
   const missing = await findMissingPackages(language, externals, absPath, root);
   for (const m of missing) {
-    unresolved.push({ import_path: m.import_path, line: m.line, reason: 'not a project file and not an installed package' });
+    unresolved.push({ import_path: m.import_path, line: m.line,
+      reason: `not a project file and not installed${m.env ? ` in ${m.env}` : ''}` });
   }
 
   return { ok: unresolved.length === 0, checked, external_imports: externals.length, unresolved };
+}
+
+// The Python environment a file runs in: its project's venv (pyvenv.cfg, found
+// the way probe.js finds it: this folder, a direct subfolder, then upwards to
+// the project root), else the server's own python3. Read-only: we only list
+// the venv's site-packages folders and read its pyvenv.cfg.
+export function pythonEnvFor(absPath) {
+  const env = detectEnvironment(absPath);
+  if (env.kind !== 'venv') {
+    return { kind: 'system', label: 'the server Python', sitePackages: [], includeSystem: true };
+  }
+  const sitePackages = [];
+  for (const lib of ['lib', 'lib64']) {
+    let vers = [];
+    try { vers = fs.readdirSync(path.join(env.env_path, lib)); } catch {}
+    for (const v of vers) {
+      const sp = path.join(env.env_path, lib, v, 'site-packages');
+      if (/^python\d/.test(v) && fs.existsSync(sp) && !sitePackages.includes(sp)) sitePackages.push(sp);
+    }
+  }
+  let includeSystem = false, version = null;
+  try {
+    const cfg = fs.readFileSync(path.join(env.env_path, 'pyvenv.cfg'), 'utf8');
+    includeSystem = /^\s*include-system-site-packages\s*=\s*true\s*$/mi.test(cfg);
+    version = (cfg.match(/^\s*(?:version|version_info)\s*=\s*([\d.]+)/mi) || [])[1] || null;
+  } catch {}
+  return { kind: 'venv', path: env.env_path, version, sitePackages, includeSystem,
+           label: `the venv ${env.env_path}${version ? ` (Python ${version})` : ''}` };
 }
 
 async function findMissingPackages(language, externals, absPath, root) {
@@ -75,10 +105,20 @@ async function findMissingPackages(language, externals, absPath, root) {
 
   if (language === 'python') {
     const tops = [...new Set(externals.map(e => e.import_path.split('.')[0]).filter(Boolean))];
+    const env = pythonEnvFor(absPath);
+    // SAFETY: nothing from the user's folder is ever executed. The server's own
+    // python3 runs isolated (-I: no cwd on sys.path, no PYTHON* env, no user
+    // site; -S: no site.py, so no .pth/sitecustomize) from cwd '/'. The venv is
+    // imitated by adding its site-packages to sys.path, and find_spec only
+    // LOOKS packages up — it does not import them.
     const script = [
       'import importlib.util, json, sys',
       'names = json.loads(sys.argv[1])',
-      'sys.path[:0] = json.loads(sys.argv[2])',
+      'extra = json.loads(sys.argv[2])',
+      'if sys.argv[3] == "1":',
+      '    import site',
+      '    sys.path.extend(site.getsitepackages())',
+      'sys.path.extend(extra)',
       'missing = []',
       'for n in names:',
       '    try:',
@@ -89,10 +129,12 @@ async function findMissingPackages(language, externals, absPath, root) {
     ].join('\n');
     try {
       const { stdout } = await execFileAsync('python3',
-        ['-c', script, JSON.stringify(tops), JSON.stringify([path.dirname(absPath), root])],
-        { timeout: 10000, cwd: path.dirname(absPath) });
+        ['-I', '-S', '-c', script, JSON.stringify(tops),
+         JSON.stringify([...env.sitePackages, path.dirname(absPath), root]), env.includeSystem ? '1' : '0'],
+        { timeout: 10000, cwd: '/' });
       const gone = new Set(JSON.parse(stdout.trim() || '[]'));
-      return externals.filter(e => gone.has(e.import_path.split('.')[0]));
+      return externals.filter(e => gone.has(e.import_path.split('.')[0]))
+        .map(e => ({ ...e, env: env.label }));
     } catch {
       return [];   // can't ask Python → don't invent failures
     }

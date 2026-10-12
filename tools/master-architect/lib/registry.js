@@ -16,7 +16,7 @@
  *   3. Marker file presence (e.g., a directory containing `pyvenv.cfg` is a venv)
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -101,6 +101,48 @@ export function isIgnoredDir(dirName, dirPath = null) {
     }
   }
   return false;
+}
+
+// ── Python virtual environments ─────────────────────────────────────────────
+// A venv's own machinery, skipped when the folder holding it is a venv root
+// (has pyvenv.cfg). Recognised by content, not just name, so a project's own
+// lib/ or bin/ code at a venv root is still scanned.
+function _hasEntry(dir, test) {
+  try { return readdirSync(dir).some(test); } catch { return false; }
+}
+export function isVenvInternal(dirName, parentAbsDir) {
+  if (!existsSync(path.join(parentAbsDir, 'pyvenv.cfg'))) return false;
+  const abs = path.join(parentAbsDir, dirName);
+  switch (dirName) {
+    case 'bin': case 'Scripts':
+      return _hasEntry(abs, n => n === 'activate' || n === 'activate.bat' || n === 'Activate.ps1');
+    case 'lib': case 'lib64': case 'Lib':
+      return _hasEntry(abs, n => /^python\d/.test(n) || n === 'site-packages');
+    case 'include': case 'Include': case 'share': case 'local':
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Nearest venv folder at or above `dir` (the folder holding pyvenv.cfg), or
+// null. Never looks above `ceiling` (in the sandbox: the user's slot).
+export function venvRootFor(dir, ceiling = null) {
+  let d = path.resolve(dir);
+  const stop = ceiling ? path.resolve(ceiling) : null;
+  for (let i = 0; i < 64; i++) {
+    if (existsSync(path.join(d, 'pyvenv.cfg'))) return d;
+    if (stop && d === stop) return null;
+    const up = path.dirname(d);
+    if (up === d) return null;
+    d = up;
+  }
+  return null;
+}
+
+// In the sandbox, the ceiling for venvRootFor is the caller's slot.
+export function sandboxCeiling() {
+  return globalThis.__sandboxCtx?.getStore?.()?.slotDir || null;
 }
 
 export function isIgnoredFile(fileName) {

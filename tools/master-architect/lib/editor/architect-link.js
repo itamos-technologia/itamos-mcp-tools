@@ -51,6 +51,7 @@ function sha256OfFile(absPath) {
 // (two .. up from this file)
 const _THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 import { getDb as ensureArchitectDb } from '../db.js';   // creates the DB + schema when missing
+import { venvRootFor, sandboxCeiling } from '../registry.js';
 const DEFAULT_ARCHITECT_DB = path.join(_THIS_DIR, '..', '..', 'master-architect.db');
 
 const ROOTS_REFRESH_MS = 60 * 1000;   // refresh project-roots cache every 60s
@@ -1796,10 +1797,12 @@ export function listProjects() {
  * Returns { ok, project_id } or { ok:false, error }.
  */
 export function createProject(name, rootPath) {
-  try { ensureArchitectDb(); } catch (err) { return { ok: false, error: err.message }; }
-  const db = getWriteDb();
-  if (!db) return { ok: false, error: 'architect DB unavailable' };
-  rootPath = path.resolve(rootPath);
+try { ensureArchitectDb(); } catch (err) { return { ok: false, error: err.message }; }
+const db = getWriteDb();
+if (!db) return { ok: false, error: 'architect DB unavailable' };
+rootPath = path.resolve(rootPath);
+// A folder inside a Python venv belongs to that venv: the venv is the project root.
+rootPath = venvRootFor(rootPath, sandboxCeiling()) || rootPath;
   const byName = db.prepare('SELECT id FROM projects WHERE name = ?').get(name);
   if (byName) return { ok: false, error: `a project named '${name}' already exists` };
   const byRoot = db.prepare('SELECT name FROM projects WHERE root_path = ?').get(rootPath);

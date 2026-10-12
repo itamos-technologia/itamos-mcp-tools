@@ -17,6 +17,8 @@ import { getDb } from './db.js';
 import { scanProject } from './scan.js';
 import { estimateScan } from './estimate.js';
 import { getTopology } from './query.js';
+import { pythonEnvFor } from './import_check.js';
+import { venvRootFor, sandboxCeiling } from './registry.js';
 
 const TOKEN_LIMIT = 3000;          // same rule as a file skeleton
 const FOREGROUND_SCAN_MS = 20000;  // estimated longer than this → background scan
@@ -69,6 +71,18 @@ export function resolveProjectTarget(p) {
     if (byName) return { kind: 'project', project: byName, subRel: '' };
   }
   return null;   // a file (normal read_file path) or nothing at all
+}
+
+// The project's Python environment, for the structure view: its venv as the
+// project root, or a venv folder inside the project. null when there is none.
+function describeEnvironment(rootPath) {
+  const env = pythonEnvFor(path.join(rootPath, '__env_probe__.py'));
+  if (env.kind !== 'venv') return null;
+  const where = env.path === rootPath ? 'project root'
+    : env.path.startsWith(rootPath + path.sep) ? env.path.slice(rootPath.length + 1) + '/'
+    : env.path;
+  return `Python venv: ${where}${env.version ? ` (Python ${env.version})` : ''}`
+    + (env.includeSystem ? ', system packages included' : '');
 }
 
 // ── Structure view ──────────────────────────────────────────────────────────
@@ -146,9 +160,11 @@ export function projectStructure(project, { search = null, full = false, subRel 
     WHERE f.project_id = ? AND i.is_external = 0 AND i.resolved_file_id IS NULL
       AND (? = '' OR substr(f.rel_path, 1, length(?) + 1) = ? || '/')`).get(project.id, subRel, subRel, subRel).c;
 
+  const environment = describeEnvironment(project.root_path);
   const head = {
     project: project.name,
     folder: project.root_path + (subRel ? '/' + subRel : ''),
+    ...(environment ? { environment } : {}),
     files: entries.filter(e => !e.dir).length,
     folders: entries.filter(e => e.dir).length,
     ...(search ? { search } : {}),
@@ -233,7 +249,8 @@ export function projectDataFlow(project) {
 // Small folders: scanned now, then shown. Big ones: background scan, the agent
 // calls again. touch() keeps a sandbox alive while a background scan runs.
 export async function scanForView(dir, touch) {
-  const key = `${dbKey()}|${dir}`;
+dir = venvRootFor(dir, sandboxCeiling()) || dir;   // inside a venv → the venv is the project
+const key = `${dbKey()}|${dir}`;
   const job = _scans.get(key);
   if (job) {
     if (job.error) { _scans.delete(key); return { scanned: false, error: `scan failed: ${job.error}` }; }

@@ -14,7 +14,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { detectLanguage, isIgnoredDir, isIgnoredFile } from './registry.js';
+import { detectLanguage, isIgnoredDir, isIgnoredFile, isVenvInternal, venvRootFor, sandboxCeiling } from './registry.js';
 
 const TIMING_MS = {
   supported:     30,
@@ -27,7 +27,8 @@ const LARGE_THRESHOLD = 1000;   // files
 const HUGE_THRESHOLD  = 5000;
 
 export function estimateScan(rootPath) {
-  rootPath = path.resolve(rootPath);
+rootPath = path.resolve(rootPath);
+rootPath = venvRootFor(rootPath, sandboxCeiling()) || rootPath;   // same root as scanProject
   if (!fs.existsSync(rootPath) || !fs.statSync(rootPath).isDirectory()) {
     throw new Error(`Not a directory: ${rootPath}`);
   }
@@ -42,7 +43,7 @@ export function estimateScan(rootPath) {
   function recurse(absDir, isRoot = false) {
     if (!isRoot) {
       const dirName = path.basename(absDir);
-      if (isIgnoredDir(dirName, absDir)) {
+      if (isIgnoredDir(dirName, absDir) || isVenvInternal(dirName, path.dirname(absDir))) {
         counts.skipped_ignored_dir += 1;
         return;
       }
