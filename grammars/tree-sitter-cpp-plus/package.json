@@ -1,0 +1,10 @@
+{
+  "name": "tree-sitter-cpp-plus",
+  "version": "0.1.0",
+  "description": "cpp_plus: tree-sitter-cpp grammar plus the sandbox's extra C++ rules",
+  "license": "MIT",
+  "main": "bindings/node",
+  "types": "bindings/node",
+  "dependencies": { "node-addon-api": "^8.5.0", "node-gyp-build": "^4.8.4" },
+  "peerDependencies": { "tree-sitter": "^0.25.0" }
+}

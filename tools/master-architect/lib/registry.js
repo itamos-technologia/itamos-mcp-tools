@@ -19,6 +19,7 @@
 import { readFileSync, existsSync, readdirSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { cHeaderLanguage } from './c_header.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REGISTRY_PATH = path.join(__dirname, '_languages.json');
@@ -46,7 +47,7 @@ function loadRegistry() {
   return _registry;
 }
 
-export function detectLanguage(filePath) {
+export function detectLanguage(filePath, content) {
   const reg = loadRegistry();
   // Location-based nginx detection FIRST. nginx vhosts in sites-enabled/
   // sites-available/ conf.d/ are conventionally extensionless (e.g. "mcp2"),
@@ -64,6 +65,11 @@ export function detectLanguage(filePath) {
   }
 
   const ext = path.extname(filePath).toLowerCase();
+  // .h: C or C++ by content (lib/c_header.js); content optional, read from disk otherwise
+  if (ext === '.h' && cHeaderLanguage(filePath, content) === 'cpp') {
+    const cppEntry = reg.byExt['.hpp'];
+    if (cppEntry && cppEntry.parser) return { kind: 'supported', language: cppEntry.language, parserFile: cppEntry.parser };
+  }
   const entry = reg.byExt[ext];
   if (!entry) return { kind: 'unrecognized' };
 

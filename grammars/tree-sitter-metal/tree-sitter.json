@@ -1,0 +1,5 @@
+{
+  "grammars": [{ "name": "metal", "camelcase": "Metal", "title": "Metal", "scope": "source.metal",
+                 "path": ".", "file-types": ["metal"] }],
+  "metadata": { "version": "0.1.0", "license": "MIT", "description": "Metal Shading Language grammar" }
+}

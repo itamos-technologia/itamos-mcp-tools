@@ -1,0 +1,10 @@
+{
+  "name": "tree-sitter-metal",
+  "version": "0.1.0",
+  "description": "Metal Shading Language grammar for tree-sitter (extends tree-sitter-cpp)",
+  "license": "MIT",
+  "main": "bindings/node",
+  "types": "bindings/node",
+  "dependencies": { "node-addon-api": "^8.5.0", "node-gyp-build": "^4.8.4" },
+  "peerDependencies": { "tree-sitter": "^0.25.0" }
+}

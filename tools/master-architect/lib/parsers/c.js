@@ -10,6 +10,7 @@
  */
 
 import Parser from 'tree-sitter';
+import { walkObjc } from './objc.js';
 import C from 'tree-sitter-c';
 
 let _parser = null;
@@ -46,9 +47,25 @@ function funcName(node) {
   return findIdent(decl) || '(anonymous)';
 }
 
+// Walks a scope: the file, an extern "C" block, or a preprocessor block (#ifndef
+// guards, #if/#else), whose members would otherwise be invisible. Objective-C
+// containers (.m files) via walkObjc.
 function walkTopLevel(root, analysis) {
   for (const node of root.namedChildren) {
+    if (walkObjc(node, analysis)) continue;
     switch (node.type) {
+      case 'preproc_ifdef':
+      case 'preproc_if':
+      case 'preproc_else':
+      case 'preproc_elif':
+        walkTopLevel(node, analysis);
+        break;
+      case 'linkage_specification': {
+        const body = node.childForFieldName?.('body');
+        if (body && body.type === 'declaration_list') walkTopLevel(body, analysis);
+        else if (body) walkTopLevel({ namedChildren: [body] }, analysis);
+        break;
+      }
       case 'function_definition': {
         analysis.modules.push({
           kind: 'function',
@@ -111,7 +128,8 @@ function walkTopLevel(root, analysis) {
 }
 
 function walkIncludes(root, analysis) {
-  for (const node of root.namedChildren) {
+  // anywhere in the tree: inside #ifndef guards, #ifdef blocks, extern "C", namespaces
+  for (const node of root.descendantsOfType('preproc_include')) {
     if (node.type === 'preproc_include') {
       const pathNode = node.childForFieldName?.('path') || node.namedChildren?.[0];
       if (pathNode) {

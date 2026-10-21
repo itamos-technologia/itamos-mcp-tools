@@ -78,6 +78,10 @@ import { matchProjectRoot } from './lib/editor/architect-link.js';
 import { getProjectInfoForFile, markFileVerified, markFileUnverified, checkAndHandleDrift, checkImportResolution, discoverAndFileByLinks, storeFileContent, getStoredSkeleton, refreshFileModules, updateExternalSpecs } from './lib/editor/architect-link.js';
 import { detectExternalRefs, gatherSpecs } from './lib/external_detect.js';
 import { segmentFile as workerSegmentFile } from './lib/segmenter.js';
+import { dialectParser, dialectInfo, grammarParser } from './lib/dialect_grammars.js';
+import { cHeaderLanguage } from './lib/c_header.js';
+import { parseCFamily } from './lib/macro_mask.js';
+import { checkMetal, newMetalErrors, metalCheckAvailable } from './lib/metal_check.js';
 import { runAdapters } from './lib/adapters/_dispatcher.js';
 import { fileURLToPath as _fileURLToPath } from 'url';
 
@@ -176,6 +180,13 @@ const EXT_TO_LANGUAGE = {
   '.cpp':  'cpp',
   '.hpp':  'cpp',
   '.cc':   'cpp',
+  // GPU / Apple (C++-based dialects parsed with the C++ grammar)
+  '.metal':'cpp',   // Metal Shading Language (C++14-based)
+  '.cu':   'cpp',   // CUDA C/C++
+  '.cuh':  'cpp',
+  '.hip':  'cpp',   // AMD HIP
+  '.m':    'c',     // Objective-C (approximation: C grammar)
+  '.mm':   'cpp',   // Objective-C++ (approximation: C++ grammar)
   // JVM / mobile
   '.java': 'java',
   '.cs':   'csharp',
@@ -317,6 +328,8 @@ const _parsers = new Map();
 
 function detectLanguage(filePath) {
   const ext = path.extname(filePath).toLowerCase();
+  // .h: C or C++ by its content (lib/c_header.js) — decides gcc -x c vs g++ -x c++ and the grammar
+  if (ext === '.h') return cHeaderLanguage(filePath) || 'c';
   // Known extension -> its language. Unknown/extensionless text files (e.g.
   // .sql, .sh, Dockerfile) fall back to 'plaintext', which segmentFile routes
   // through segmentPlainText — full read/edit/verify/commit/undo, just without
@@ -966,8 +979,66 @@ async function verifyL1(filePath, content, language) {
     // No syntax checking for plain text formats
     return { level: 1, ok: true, messages: ['L1: OK (plain text, no syntax check)'] };
   }
-  const parser = getParser(language);
-  if (parser) {
+  // GPU / Apple dialects (Metal, CUDA, HIP, Objective-C/C++) are parsed with their own
+  // grammars (lib/dialect_grammars.js); g++ cannot compile them. Pass when the edit adds no
+  // NEW parse errors compared with the file on disk (macro-heavy real code can carry a few
+  // the grammar cannot resolve); skip the compiler.
+  const DIALECT_EXTS = ['.metal', '.cu', '.cuh', '.hip', '.m', '.mm'];
+  const dExt = path.extname(filePath).toLowerCase();
+  if ((DIALECT_EXTS.includes(dExt) || dialectInfo(filePath, content)) && (dialectParser(filePath) || getParser(language))) {
+    // the dialect's own grammar (CUDA / Metal / Objective-C, also Objective-C .h headers);
+    // C/C++ grammar if it did not load. Macro-aware parse (lib/macro_mask.js).
+    const dInfo = dialectInfo(filePath, content);
+    const dp = (dInfo && dialectParser(filePath)) || getParser(language);
+    const countErrors = (src) => parseCFamily(dp, src).errorsAfter;
+    let disk = null;
+    try { disk = await fs.readFile(filePath, 'utf8'); } catch {}
+    const before = disk === null ? null : countErrors(disk);
+    const after = countErrors(content);
+    const how = dInfo ? `${dExt} via the ${dInfo.label} grammar`
+      : `${dExt} via the ${language === 'c' ? 'C' : 'C++'} grammar`;
+    if (before !== null && after > before) {
+      return { level: 1, ok: false, messages: [`L1 tree-sitter (${how}): this edit adds ${after - before} parse error(s) ${firstParseError(parseCFamily(dp, content).tree.rootNode, content)}`] };
+    }
+    const tsMsg = `L1 tree-sitter (${how}): OK, no new parse errors` + (after ? ` (${after} parse warning(s), unchanged)` : '');
+    // Metal: clang++ -fsyntax-only against the Metal stand-in library (lib/metal_check.js).
+    // Blocks only errors this edit adds compared with the file on disk; a new file must check clean.
+    if (dExt === '.metal' && metalCheckAvailable()) {
+      const [mAfter, mBefore] = await Promise.all([
+        checkMetal(filePath, content),
+        disk === null ? null : (disk === content ? 'same' : checkMetal(filePath, disk)),
+      ]);
+      if (mAfter.available) {
+        const base = mBefore === 'same' ? mAfter.errors : (mBefore ? mBefore.errors : []);
+        const fresh = newMetalErrors(base, mAfter.errors);
+        const fmt = (e) => `${path.basename(e.file)}:${e.line}:${e.col}: ${e.msg}`;
+        if (fresh.length) {
+          return { level: 1, ok: false, messages: [tsMsg,
+            `L1 Metal check (clang + Metal stand-in library): this edit adds ${fresh.length} error(s)`,
+            ...fresh.slice(0, 5).map(fmt)] };
+        }
+        return { level: 1, ok: true, messages: [tsMsg, 'L1 Metal check (clang + Metal stand-in library): OK' +
+          (mAfter.errors.length ? ` (${mAfter.errors.length} error(s) already in the file on disk, unchanged)` : '')] };
+      }
+    }
+    return { level: 1, ok: true, messages: [tsMsg + '; no compiler check for this dialect'] };
+  }
+  // C++: the plus C++ grammar when built (lib/dialect_grammars.js), else the stock one
+  const parser = ((language === 'c' || language === 'cpp') && grammarParser(filePath, language, content)) || getParser(language);
+  let cFamilyNote = null;   // C / C++: parse errors the grammar cannot resolve, already in the file on disk
+  if (parser && (language === 'c' || language === 'cpp')) {
+    // macro-aware parse (lib/macro_mask.js); errors that remain and were already in the file on
+    // disk do not block: the compiler check below (gcc / g++ in the project's context) decides
+    const r = parseCFamily(parser, content);
+    if (r.errorsAfter) {
+      let before = null;
+      try { before = parseCFamily(parser, await fs.readFile(filePath, 'utf8')).errorsAfter; } catch {}
+      if (before === null || r.errorsAfter > before) {
+        return { level: 1, ok: false, messages: [`L1 tree-sitter: parse error ${firstParseError(r.tree.rootNode, content)}`] };
+      }
+      cFamilyNote = `L1 tree-sitter: ${r.errorsAfter} parse warning(s) the grammar cannot resolve, unchanged by this edit`;
+    }
+  } else if (parser) {
     const tree = parser.parse(content);
     if (tree.rootNode.hasError) {
       return { level: 1, ok: false, messages: [`L1 tree-sitter: parse error ${firstParseError(tree.rootNode, content)}`] };
@@ -1026,7 +1097,11 @@ async function verifyL1(filePath, content, language) {
       }
     } else if (language === 'c' || language === 'cpp') {
       // Checked in the context of its project (include paths, defines), not alone.
-      return { level: 1, ...(await checkCFamilyInContext(filePath, tmp, content, language)) };
+      const cr = await checkCFamilyInContext(filePath, tmp, content, language);
+      if (cFamilyNote && Array.isArray(cr.messages)) {
+        cr.messages = [cFamilyNote, ...cr.messages.filter(m => m !== 'L1 tree-sitter: OK')];
+      }
+      return { level: 1, ...cr };
     } else if (language === 'php') {
       try {
         await execAsync(`php -l "${tmp}" 2>&1`, { timeout: 10000 });

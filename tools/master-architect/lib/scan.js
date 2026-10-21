@@ -362,14 +362,14 @@ export async function reindexFile(absPath, content) {
 // parser and shared-parse path as scanProject. Returns { language, parser,
 // analysis } or null for files that have no parser.
 export async function analyzeContent(absPath, content) {
-  const det = detectLanguage(absPath);
+  const det = detectLanguage(absPath, content);          // content: a .h being saved decides C / C++
   if (!det || det.kind !== 'supported') return null;
   const parser = await getParser(det.language, det.parserFile);
   if (!parser) return null;
   const sharedFn = SHARED_PARSERS[det.language];
   let analysis;
   if (sharedFn) {
-    const { rootNode } = parseTree(content, det.language);
+    const { rootNode } = parseTree(content, det.language, absPath);   // absPath: dialect grammar (.cu .metal .m ...)
     analysis = sharedFn(rootNode, content);
   } else {
     analysis = parser.parseFile(content);
@@ -869,7 +869,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
           let analysis;
           const sharedFn = SHARED_PARSERS[f.detection.language];
           if (sharedFn) {
-            const { rootNode } = parseTree(content, f.detection.language);
+            const { rootNode } = parseTree(content, f.detection.language, f.absPath);   // dialect grammar by extension
             analysis = sharedFn(rootNode, content);
           } else {
             analysis = parser.parseFile(content);

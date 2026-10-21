@@ -34,6 +34,9 @@ import Bash from 'tree-sitter-bash';
 import Swift from 'tree-sitter-swift';
 import Kotlin from 'tree-sitter-kotlin';
 import { detectConfigFlavor, segmentConfig } from './config_segmenter.js';
+import { grammarParser } from './dialect_grammars.js';
+import { parseCFamily } from './macro_mask.js';
+const C_FAMILY_LANGS = new Set(['c', 'cpp']);   // .c .h .cpp .hpp .cu .cuh .hip .metal .m .mm
 
 const TypeScript = TypeScriptModule.typescript;
 const CSharp = CSharpModule;
@@ -72,6 +75,240 @@ function getParser(language) {
 let _segId = 0;
 function freshId() { return `seg_${String(++_segId).padStart(4, '0')}`; }
 
+
+
+// ── C family (C, C++, CUDA/HIP, Metal, Objective-C) ──
+// C has no 'name' field on functions: the name sits at the end of the declarator chain
+// (function_declarator -> identifier / qualified_identifier / field_identifier /
+// operator_name / destructor_name). Containers (namespace, class/struct bodies,
+// extern "C", #ifdef blocks, @interface/@implementation) are split into children by
+// cFamilyBody, used by both walkers.
+const C_NAME_LEAVES = new Set([
+  'identifier', 'field_identifier', 'type_identifier', 'destructor_name', 'operator_name',
+  'qualified_identifier', 'template_function', 'template_method', 'operator_cast',
+  'namespace_identifier',
+]);
+const C_SPECIFIERS = new Set(['class_specifier', 'struct_specifier', 'union_specifier', 'enum_specifier']);
+const C_BODY_TYPES = new Set(['declaration_list', 'field_declaration_list']);
+const C_KERNEL_QUALIFIERS = new Set(['__global__', '__device__', '__host__', 'kernel', 'vertex', 'fragment']);
+const OBJC_CONTAINERS = new Set([
+  'class_interface', 'class_implementation', 'protocol_declaration',
+  'category_interface', 'category_implementation',
+]);
+const C_PREPROC_BLOCKS = new Set(['preproc_ifdef', 'preproc_if', 'preproc_else', 'preproc_elif']);
+
+function cDeclaratorName(d) {
+  let n = d;
+  for (let guard = 0; n && guard < 20; guard++) {
+    if (C_NAME_LEAVES.has(n.type)) {
+      const nm = n.text.replace(/\s*::\s*/g, '::').replace(/\s+/g, ' ');
+      return nm.length > 60 ? nm.slice(0, 57) + '...' : nm;   // macro-confused parses can be long
+    }
+    const inner = n.childForFieldName('declarator');
+    if (inner) { n = inner; continue; }
+    n = n.namedChildren.find(k => k.type.endsWith('declarator') || C_NAME_LEAVES.has(k.type)) || null;
+  }
+  return null;
+}
+
+function cDeclNames(node) {
+  const names = [];
+  for (let i = 0; i < node.childCount; i++) {
+    if (node.fieldNameForChild(i) !== 'declarator') continue;
+    const nm = cDeclaratorName(node.child(i));
+    if (nm) names.push(nm);
+  }
+  return names;
+}
+
+function cSpecifierName(n) {
+  if (!n || !C_SPECIFIERS.has(n.type)) return null;
+  const nm = n.childForFieldName('name');
+  return `${n.type.replace('_specifier', '')} ${nm ? nm.text : '(anonymous)'}`;
+}
+
+function objcSelector(node) {
+  // -greet:times:  (sign, then each keyword identifier, ':' per parameter)
+  let sign = '';
+  let sel = '';
+  for (let i = 0; i < node.childCount; i++) {
+    const k = node.child(i);
+    if (!k.isNamed && (k.type === '-' || k.type === '+') && !sel) sign = k.type;
+    else if (k.type === 'identifier') sel += k.text;
+    else if (k.type === 'method_parameter') sel += ':';
+  }
+  return sel ? sign + sel : null;
+}
+
+function cFamilyName(node) {
+  const t = node.type;
+  const field = (f) => node.childForFieldName(f);
+  const firstIdent = () => node.namedChildren.find(k => k.type === 'identifier');
+  switch (t) {
+    case 'function_definition': {
+      const nm = cDeclaratorName(field('declarator'));
+      if (!nm) return null;
+      const quals = [];
+      for (let i = 0; i < node.childCount; i++) {
+        const k = node.child(i);
+        if (!k.isNamed && C_KERNEL_QUALIFIERS.has(k.type)) quals.push(k.type);
+      }
+      return quals.length ? `${quals.join(' ')} ${nm}` : nm;
+    }
+    case 'declaration':
+    case 'field_declaration': {
+      const ty = field('type');
+      const spec = ty && C_SPECIFIERS.has(ty.type) && ty.childForFieldName('body') ? cSpecifierName(ty) : null;
+      const names = cDeclNames(node);
+      if (spec) return names.length ? `${spec} ${names.join(', ')}` : spec;
+      return names.length ? names.join(', ') : null;
+    }
+    case 'class_specifier':
+    case 'struct_specifier':
+    case 'union_specifier':
+    case 'enum_specifier':
+      return cSpecifierName(node);
+    case 'type_definition': {
+      const names = cDeclNames(node);
+      return names.length ? `typedef ${names.join(', ')}` : 'typedef';
+    }
+    case 'namespace_definition': {
+      const nm = field('name');
+      return `namespace ${nm ? nm.text : '(anonymous)'}`;
+    }
+    case 'template_declaration': {
+      const inner = node.namedChildren.find(k => k.type !== 'template_parameter_list' && k.type !== 'comment');
+      const nm = inner ? extractName(inner) : null;
+      return nm && !nm.startsWith('(') ? `template ${nm}` : 'template';
+    }
+    case 'linkage_specification': {
+      const v = field('value');
+      return v ? `extern ${v.text}` : 'extern';
+    }
+    case 'preproc_include': {
+      const p = field('path');
+      return `${node.child(0).type} ${p ? p.text : ''}`.trim();
+    }
+    case 'preproc_def':
+    case 'preproc_function_def': {
+      const nm = field('name');
+      return `#define ${nm ? nm.text : ''}${t === 'preproc_function_def' ? '()' : ''}`.trim();
+    }
+    case 'preproc_ifdef': {
+      const nm = field('name');
+      return `${node.child(0).type} ${nm ? nm.text : ''}`.trim();
+    }
+    case 'preproc_if':
+    case 'preproc_elif': {
+      const cond = field('condition');
+      const ct = cond ? cond.text.replace(/\s+/g, ' ').slice(0, 40) : '';
+      return `${t === 'preproc_if' ? '#if' : '#elif'} ${ct}`.trim();
+    }
+    case 'preproc_else':
+      return '#else';
+    case 'preproc_call': {
+      const line = node.text.split('\n')[0].trim();
+      return line.length > 50 ? line.slice(0, 47) + '...' : line;
+    }
+    case 'alias_declaration': {
+      const nm = field('name');
+      return nm ? `using ${nm.text}` : 'using';
+    }
+    case 'using_declaration':
+      return node.text.replace(/;\s*$/, '').replace(/\s+/g, ' ').slice(0, 60);
+    case 'concept_definition': {
+      const nm = field('name');
+      return nm ? `concept ${nm.text}` : 'concept';
+    }
+    case 'class_interface':
+    case 'class_implementation':
+    case 'protocol_declaration':
+    case 'category_interface':
+    case 'category_implementation': {
+      const kw = t === 'protocol_declaration' ? '@protocol'
+        : (t.endsWith('interface') ? '@interface' : '@implementation');
+      const id = firstIdent();
+      const cat = field('category');
+      return `${kw} ${id ? id.text : ''}${cat ? ` (${cat.text})` : ''}`.trim();
+    }
+    case 'method_definition':
+    case 'method_declaration': {
+      const nf = field('name');                 // Java / C# / PHP methods have a name field
+      if (nf) return nf.text;
+      return objcSelector(node);
+    }
+    case 'property_declaration': {
+      const sd = node.descendantsOfType('struct_declarator')[0];
+      const nm = sd ? cDeclaratorName(sd) : null;
+      return nm ? `@property ${nm}` : null;
+    }
+    case 'implementation_definition': {
+      const inner = node.namedChildren[0];
+      return inner ? extractName(inner) : null;
+    }
+  }
+  if (t === 'access_specifier') return `${node.text.trim()}:`;   // public: / private: / protected:
+  return null;
+}
+
+// The node whose children become this segment's children, or null. Returns a real
+// body node or a light stand-in { namedChildren, startIndex, endIndex } (all that
+// walkClassBody reads) when the members sit directly in the container.
+function cFamilyBody(c, largeThreshold) {
+  const t = c.type;
+  const bodyOf = (n) => {
+    const b = n ? n.childForFieldName('body') : null;
+    return b && C_BODY_TYPES.has(b.type) ? b : null;
+  };
+  const span = (n) => (n.endPosition.row - n.startPosition.row) + 1;
+  const standIn = (kids) => kids.length === 0 ? null : {
+    namedChildren: kids,
+    startIndex: kids[0].startIndex,
+    endIndex: kids[kids.length - 1].endIndex,
+  };
+  // one- and two-line containers (struct Node { int v; };) stay a single segment
+  if (span(c) < 3) return null;
+  if (t === 'namespace_definition' || t === 'linkage_specification' || C_SPECIFIERS.has(t)) return bodyOf(c);
+  if (t === 'declaration' || t === 'type_definition' || t === 'field_declaration') {
+    const ty = c.childForFieldName('type');
+    return ty && C_SPECIFIERS.has(ty.type) ? bodyOf(ty) : null;
+  }
+  if (t === 'template_declaration') {
+    const inner = c.namedChildren.find(k => k.type !== 'template_parameter_list' && k.type !== 'comment');
+    if (!inner) return null;
+    if (inner.type === 'function_definition') {
+      const b = inner.childForFieldName('body');
+      return b && span(inner) > largeThreshold ? b : null;
+    }
+    return cFamilyBody(inner, largeThreshold);
+  }
+  if (t === 'method_definition' && !c.childForFieldName('body') && span(c) > largeThreshold) {
+    return c.namedChildren.find(k => k.type === 'compound_statement') || null;   // Objective-C
+  }
+  if (C_PREPROC_BLOCKS.has(t)) {
+    const kids = [];
+    for (let i = 0; i < c.childCount; i++) {
+      const k = c.child(i);
+      const f = c.fieldNameForChild(i);
+      if (k.isNamed && f !== 'name' && f !== 'condition') kids.push(k);
+    }
+    return kids.length >= 2 ? standIn(kids) : null;
+  }
+  if (OBJC_CONTAINERS.has(t)) {
+    const kids = [];
+    for (let i = 0; i < c.childCount; i++) {
+      const k = c.child(i);
+      const f = c.fieldNameForChild(i);
+      if (!k.isNamed || f === 'superclass' || f === 'category') continue;
+      if (k.type === 'identifier' || k.type === 'parameterized_arguments' ||
+          k.type === 'protocol_qualifiers' || k.type === 'superclass_reference') continue;
+      // @implementation wraps each method in implementation_definition: use the method itself
+      kids.push(k.type === 'implementation_definition' && k.namedChildCount === 1 ? k.namedChildren[0] : k);
+    }
+    return standIn(kids);
+  }
+  return null;
+}
 function extractName(node) {
   const t = node.type;
   // ── Python / JavaScript / TypeScript ──
@@ -162,6 +399,9 @@ function extractName(node) {
     const txt = node.text.slice(0, 60);
     return txt.includes('{') ? txt.slice(0, txt.indexOf('{')).trim() : txt;
   }
+  // ── C family (and Java/C#/PHP methods) ──
+  const cName = cFamilyName(node);
+  if (cName) return cName;
   return `(${t})`;
 }
 
@@ -373,7 +613,9 @@ function walkSegments(rootNode, source) {
       startByte: leadStart,
       endByte: c.endIndex,
       startLine: leadStartLine,
-      endLine: c.endPosition.row + 1,
+      // a node that ends with its newline (C preprocessor lines) ends on the line before
+      endLine: (c.endPosition.column === 0 && c.endPosition.row > c.startPosition.row)
+        ? c.endPosition.row : c.endPosition.row + 1,
     };
     // Parse the inline JS body of an HTML <script> node and return JS segments
     // with byte/line offsets shifted to the script's position in the file.
@@ -584,6 +826,15 @@ function walkSegments(rootNode, source) {
         }
       }
     }
+    // C family containers (namespace, class/struct, extern "C", #ifdef, @implementation)
+    // and large Objective-C methods -> children (walkClassBody recurses further)
+    if (!seg.children) {
+      const cb = cFamilyBody(c, LARGE_FN_THRESHOLD);
+      if (cb) {
+        const kidsC = walkClassBody(cb, source);
+        if (kidsC.length > 0) seg.children = kidsC;
+      }
+    }
     out.push(seg);
     cursor = c.endIndex;
   }
@@ -702,7 +953,9 @@ function walkClassBody(bodyNode, source) {
       startByte: leadStart,
       endByte: c.endIndex,
       startLine: leadStartLine,
-      endLine: c.endPosition.row + 1,
+      // a node that ends with its newline (C preprocessor lines) ends on the line before
+      endLine: (c.endPosition.column === 0 && c.endPosition.row > c.startPosition.row)
+        ? c.endPosition.row : c.endPosition.row + 1,
     };
     // Large methods inside class bodies → recurse into their bodies too
     const LARGE_METHOD_THRESHOLD = 40;
@@ -741,11 +994,12 @@ function walkClassBody(bodyNode, source) {
     // -> sub-segment their block body so a file wholly wrapped in a single
     // `if(!loaded){...}` / loop / try doesn't collapse to one giant segment.
     // 40-line threshold keeps small wrappers atomic.
+    // C family: blocks are compound_statement, C++ adds for_range_loop.
     if (!innerSeg.children) {
       const WRAPPER_TYPES = new Set([
         'if_statement', 'for_statement', 'for_in_statement', 'while_statement',
         'do_statement', 'try_statement', 'switch_statement',
-        'lexical_declaration', 'variable_declaration',
+        'lexical_declaration', 'variable_declaration', 'for_range_loop',
       ]);
       if (WRAPPER_TYPES.has(c.type)) {
         const wLineSpan = (c.endPosition.row - c.startPosition.row) + 1;
@@ -753,7 +1007,7 @@ function walkClassBody(bodyNode, source) {
           const meaningfulW = (blk) => (blk.namedChildren || []).filter(k => k.type !== 'comment').length;
           const collectBlocksW = (node, depth, acc) => {
             if (!node || depth > 10) return acc;
-            if (node.type === 'statement_block') acc.push(node);
+            if (node.type === 'statement_block' || node.type === 'compound_statement') acc.push(node);
             for (const k of (node.namedChildren || [])) collectBlocksW(k, depth + 1, acc);
             return acc;
           };
@@ -765,6 +1019,15 @@ function walkClassBody(bodyNode, source) {
             if (kidsW && kidsW.length >= 2) innerSeg.children = kidsW;
           }
         }
+      }
+    }
+    // C family containers (namespace, class/struct, extern "C", #ifdef, @implementation)
+    // and large Objective-C methods -> children, recursively
+    if (!innerSeg.children) {
+      const cb = cFamilyBody(c, LARGE_METHOD_THRESHOLD);
+      if (cb) {
+        const kidsC = walkClassBody(cb, source);
+        if (kidsC.length > 0) innerSeg.children = kidsC;
       }
     }
     out.push(innerSeg);
@@ -993,13 +1256,15 @@ async function segmentFile(filePath, content, language, aiTitle) {
   if (['plaintext', 'markdown', 'json', 'yaml', 'toml', 'ini', 'env'].includes(language)) {
     return await segmentPlainText(content, language, aiTitle);
   }
-  const parser = getParser(language);
+  // CUDA / HIP / Metal / Objective-C files parse with their own grammar (language stays c/cpp)
+  const parser = grammarParser(filePath, language) || getParser(language);
   if (!parser) {
     // Code language with no tree-sitter parser — not supported for editing.
     // Throw so the caller surfaces a clear error rather than silently mangling the file.
     throw new Error(`No tree-sitter parser available for language: ${language}. Read-only access via raw file path instead.`);
   }
-  const tree = parser.parse(content);
+  // C family: macro-aware parse (lib/macro_mask.js); offsets are those of the original text
+  const tree = C_FAMILY_LANGS.has(language) ? parseCFamily(parser, content).tree : parser.parse(content);
   const flat = walkSegments(tree.rootNode, content);
   const segs = promoteBannerSections(flat, content);
   return { segments: segs, hasParseErrors: tree.rootNode.hasError };
@@ -1012,16 +1277,18 @@ async function segmentFile(filePath, content, language, aiTitle) {
 // architect scan) can run its own analysis walkers (walkTopLevel/walkImports/
 // etc.) over this rootNode instead of parsing the file a second time. Returns
 // { tree, rootNode, hasParseErrors } or { tree:null, ... } for plaintext langs
-// (which have no tree-sitter parser).
-function parseTree(content, language) {
+// (which have no tree-sitter parser). filePath (optional) picks a dialect grammar
+// for CUDA / HIP / Metal / Objective-C files, as segmentFile does; C-family code is
+// parsed macro-aware (lib/macro_mask.js), also as segmentFile does.
+function parseTree(content, language, filePath) {
   if (['plaintext', 'markdown', 'json', 'yaml', 'toml', 'ini', 'env'].includes(language)) {
     return { tree: null, rootNode: null, hasParseErrors: false, plaintext: true };
   }
-  const parser = getParser(language);
+  const parser = grammarParser(filePath, language) || getParser(language);
   if (!parser) {
     throw new Error(`No tree-sitter parser available for language: ${language}.`);
   }
-  const tree = parser.parse(content);
+  const tree = C_FAMILY_LANGS.has(language) ? parseCFamily(parser, content).tree : parser.parse(content);
   return { tree, rootNode: tree.rootNode, hasParseErrors: tree.rootNode.hasError };
 }
 

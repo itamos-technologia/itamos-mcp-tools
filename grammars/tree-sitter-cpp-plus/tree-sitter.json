@@ -1,0 +1,5 @@
+{
+  "grammars": [{ "name": "cpp_plus", "camelcase": "cpp_plus", "title": "cpp_plus", "scope": "source.cpp_plus",
+                 "path": ".", "file-types": [] }],
+  "metadata": { "version": "0.1.0", "license": "MIT", "description": "cpp_plus grammar" }
+}

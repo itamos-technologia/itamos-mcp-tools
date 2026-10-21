@@ -940,7 +940,7 @@ export function refreshFileModules(absPath, content, language) {
 
   let analysis;
   try {
-    const { rootNode } = parseTree(content, language);
+    const { rootNode } = parseTree(content, language, absPath);   // dialect grammar by extension
     analysis = sharedFn(rootNode, content);
   } catch (err) {
     return { refreshed: false, reason: "parse error: " + err.message };

@@ -80,6 +80,30 @@
     "language": "cpp",
     "parser": "cpp.js"
   },
+  ".cu": {
+    "language": "cpp",
+    "parser": "cpp.js"
+  },
+  ".cuh": {
+    "language": "cpp",
+    "parser": "cpp.js"
+  },
+  ".hip": {
+    "language": "cpp",
+    "parser": "cpp.js"
+  },
+  ".metal": {
+    "language": "cpp",
+    "parser": "cpp.js"
+  },
+  ".m": {
+    "language": "c",
+    "parser": "c.js"
+  },
+  ".mm": {
+    "language": "cpp",
+    "parser": "cpp.js"
+  },
   ".cs": {
     "language": "csharp",
     "parser": "csharp.js"

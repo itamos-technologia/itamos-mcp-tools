@@ -1,0 +1,5 @@
+{
+  "grammars": [{ "name": "cuda_plus", "camelcase": "cuda_plus", "title": "cuda_plus", "scope": "source.cuda_plus",
+                 "path": ".", "file-types": [] }],
+  "metadata": { "version": "0.1.0", "license": "MIT", "description": "cuda_plus grammar" }
+}

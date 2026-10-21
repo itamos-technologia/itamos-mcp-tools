@@ -7,6 +7,7 @@
  */
 
 import Parser from 'tree-sitter';
+import { walkObjc } from './objc.js';
 import Cpp from 'tree-sitter-cpp';
 
 let _parser = null;
@@ -22,7 +23,8 @@ function nodeLineEnd(node) { return node.endPosition.row + 1; }
 
 function findIdent(n) {
   if (!n) return null;
-  if (n.type === 'identifier' || n.type === 'destructor_name') return n.text;
+  if (n.type === 'identifier' || n.type === 'destructor_name' || n.type === 'field_identifier' ||
+      n.type === 'operator_name' || n.type === 'template_function' || n.type === 'operator_cast') return n.text;
   if (n.type === 'qualified_identifier') return n.text; // Foo::bar
   if (n.type === 'function_declarator' || n.type === 'pointer_declarator' || n.type === 'reference_declarator') {
     return findIdent(n.childForFieldName?.('declarator'));
@@ -39,13 +41,29 @@ function funcName(node) {
   return findIdent(decl) || '(anonymous)';
 }
 
-function walkTopLevel(root, analysis) {
+// Walks a scope: the file, a namespace body (names get the namespace prefix, e.g.
+// demo::add), an extern "C" block, or a preprocessor block (#ifndef guards, #if/#else),
+// whose members would otherwise be invisible. Objective-C++ containers via walkObjc.
+function walkTopLevel(root, analysis, scope = '') {
   for (const node of root.namedChildren) {
+    if (walkObjc(node, analysis)) continue;
     switch (node.type) {
+      case 'preproc_ifdef':
+      case 'preproc_if':
+      case 'preproc_else':
+      case 'preproc_elif':
+        walkTopLevel(node, analysis, scope);
+        break;
+      case 'linkage_specification': {
+        const body = node.childForFieldName?.('body');
+        if (body && body.type === 'declaration_list') walkTopLevel(body, analysis, scope);
+        else if (body) walkTopLevel({ namedChildren: [body] }, analysis, scope);
+        break;
+      }
       case 'function_definition': {
         analysis.modules.push({
           kind: 'function',
-          name: funcName(node),
+          name: scope + funcName(node),
           line: nodeLine(node),
           line_end: nodeLineEnd(node),
         });
@@ -54,7 +72,7 @@ function walkTopLevel(root, analysis) {
       case 'class_specifier':
       case 'struct_specifier': {
         const nameNode = node.childForFieldName?.('name');
-        const className = nameNode ? nameNode.text : '(anonymous)';
+        const className = scope + (nameNode ? nameNode.text : '(anonymous)');
         analysis.modules.push({
           kind: node.type === 'class_specifier' ? 'class' : 'struct',
           name: className,
@@ -79,18 +97,21 @@ function walkTopLevel(root, analysis) {
       }
       case 'namespace_definition': {
         const nameNode = node.childForFieldName?.('name');
+        const nsName = nameNode ? nameNode.text : '(anonymous)';
         analysis.modules.push({
           kind: 'namespace',
-          name: nameNode ? nameNode.text : '(anonymous)',
+          name: scope + nsName,
           line: nodeLine(node),
           line_end: nodeLineEnd(node),
         });
+        const nsBody = node.childForFieldName?.('body');
+        if (nsBody) walkTopLevel(nsBody, analysis, nameNode ? `${scope}${nsName}::` : scope);
         break;
       }
       case 'template_declaration': {
         // template<...> function or class
         const inner = node.namedChildren?.find(c =>
-          c.type === 'function_definition' || c.type === 'class_specifier'
+          c.type === 'function_definition' || c.type === 'class_specifier' || c.type === 'struct_specifier'
         );
         if (inner) {
           const name = inner.type === 'function_definition'
@@ -98,7 +119,7 @@ function walkTopLevel(root, analysis) {
             : inner.childForFieldName?.('name')?.text || '(template)';
           analysis.modules.push({
             kind: 'template',
-            name,
+            name: scope + name,
             line: nodeLine(node),
             line_end: nodeLineEnd(node),
           });
@@ -110,7 +131,7 @@ function walkTopLevel(root, analysis) {
         if (nameNode) {
           analysis.modules.push({
             kind: 'enum',
-            name: nameNode.text,
+            name: scope + nameNode.text,
             line: nodeLine(node),
             line_end: nodeLineEnd(node),
           });
@@ -122,7 +143,8 @@ function walkTopLevel(root, analysis) {
 }
 
 function walkIncludes(root, analysis) {
-  for (const node of root.namedChildren) {
+  // anywhere in the tree: inside #ifndef guards, #ifdef blocks, extern "C", namespaces
+  for (const node of root.descendantsOfType('preproc_include')) {
     if (node.type === 'preproc_include') {
       const pathNode = node.childForFieldName?.('path') || node.namedChildren?.[0];
       if (pathNode) {

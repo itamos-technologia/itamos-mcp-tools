@@ -1,0 +1,2 @@
+// stand-in for <metal_compute>: the checker's own declarations
+#include "../metal_shim.h"

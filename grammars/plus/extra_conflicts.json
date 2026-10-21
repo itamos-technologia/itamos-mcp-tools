@@ -1,0 +1,1 @@
+[["type_specifier", "typename_value_expression"], ["qualified_type_identifier", "abstract_member_pointer_declarator"], ["qualified_identifier", "abstract_member_pointer_declarator"], ["qualified_identifier", "qualified_type_identifier", "abstract_member_pointer_declarator"], ["storage_class_specifier", "template_instantiation"]]

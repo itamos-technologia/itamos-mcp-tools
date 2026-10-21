@@ -1,0 +1,1 @@
+{"name":"itamos-grammars","private":true,"dependencies":{"tree-sitter":"^0.25.0","tree-sitter-cuda":"^0.21.2","tree-sitter-objc":"^3.0.2"}}
