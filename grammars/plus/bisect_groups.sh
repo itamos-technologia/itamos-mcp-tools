@@ -2,7 +2,7 @@
 # Build cpp_plus with one rule group at a time (E1..E4) and compare each with the stock
 # C++ grammar on the corpus, to see which group changes trees of code that already parsed.
 set -u
-G=/tank/projects/mcp-sandbox-public/grammars
+G="$(cd "$(dirname "$0")/.." && pwd)"
 CPP=/tank/projects/mcp-sandbox-server/node_modules/tree-sitter-cpp
 cd $G/plus
 for g in ${PLUS_GROUPS:-E1 E2 E3 E4}; do      # (not GROUPS: bash's own variable)

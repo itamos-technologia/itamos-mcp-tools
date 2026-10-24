@@ -3,7 +3,7 @@
 # the live ones are not touched until the node_modules link switches) and check each
 # against its stock grammar on the corpus.
 set -u
-G=/tank/projects/mcp-sandbox-public/grammars
+G="$(cd "$(dirname "$0")/.." && pwd)"
 CPP=/tank/projects/mcp-sandbox-server/node_modules/tree-sitter-cpp
 CU=$G/node_modules/tree-sitter-cuda
 ME=$G/tree-sitter-metal

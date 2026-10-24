@@ -2,7 +2,7 @@
 # Build the three plus grammars (rules E1-E3 by default) and check each against its stock
 # grammar on the corpus: every file the stock grammar parses must keep the identical tree.
 set -u
-G=/tank/projects/mcp-sandbox-public/grammars
+G="$(cd "$(dirname "$0")/.." && pwd)"
 CPP=/tank/projects/mcp-sandbox-server/node_modules/tree-sitter-cpp
 CU=$G/node_modules/tree-sitter-cuda
 ME=$G/tree-sitter-metal

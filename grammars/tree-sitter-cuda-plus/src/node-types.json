@@ -598,6 +598,62 @@
     }
   },
   {
+    "type": "abstract_member_pointer_declarator",
+    "named": true,
+    "fields": {
+      "declarator": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "_abstract_declarator",
+            "named": true
+          }
+        ]
+      },
+      "scope": {
+        "multiple": true,
+        "required": false,
+        "types": [
+          {
+            "type": "decltype",
+            "named": true
+          },
+          {
+            "type": "dependent_name",
+            "named": true
+          },
+          {
+            "type": "namespace_identifier",
+            "named": true
+          },
+          {
+            "type": "splice_expression",
+            "named": true
+          },
+          {
+            "type": "splice_type_specifier",
+            "named": true
+          },
+          {
+            "type": "template_type",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "type_qualifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "abstract_parenthesized_declarator",
     "named": true,
     "fields": {},
@@ -607,6 +663,10 @@
       "types": [
         {
           "type": "_abstract_declarator",
+          "named": true
+        },
+        {
+          "type": "abstract_member_pointer_declarator",
           "named": true
         },
         {
@@ -1636,6 +1696,10 @@
         "required": true,
         "types": [
           {
+            "type": "decltype",
+            "named": true
+          },
+          {
             "type": "primitive_type",
             "named": true
           },
@@ -2348,6 +2412,10 @@
       "types": [
         {
           "type": "auto",
+          "named": true
+        },
+        {
+          "type": "comma_expression",
           "named": true
         },
         {

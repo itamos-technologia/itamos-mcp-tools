@@ -2,14 +2,17 @@
 # Build a "plus" grammar: an existing C++-based grammar (BASE grammar.js) extended with
 # plus/plus_rules.js (and plus/extra_conflicts.json when present), generated with
 # tree-sitter-cli 0.25 (ABI 15, the sandbox runtime) and compiled with node-gyp.
-#   build_plus.sh NAME BASE_GRAMMAR_JS BASE_SCANNER_C
-#   e.g. build_plus.sh cpp_plus /tank/projects/mcp-sandbox-server/node_modules/tree-sitter-cpp/grammar.js \
-#                               /tank/projects/mcp-sandbox-server/node_modules/tree-sitter-cpp/src/scanner.c
-# Output: grammars/tree-sitter-<name with dashes>/, requirable from the grammars folder.
+#   build_plus.sh NAME BASE_GRAMMAR_JS BASE_SCANNER_C        (run from anywhere; needs `npm install` in grammars/)
+#   e.g. grammars/plus/build_plus.sh cuda_plus grammars/node_modules/tree-sitter-cuda/grammar.js \
+#                                              grammars/node_modules/tree-sitter-cuda/src/scanner.c
+#   cpp_plus is built on npm tree-sitter-cpp@0.23.4 (its grammar.js and src/scanner.c).
+# Work happens in grammars/builds/<name>-<date>/; the result is published to
+# grammars/tree-sitter-<name with dashes>/, the drop-in package the sandbox loads.
 set -euo pipefail
-G=/tank/projects/mcp-sandbox-public/grammars
+G="$(cd "$(dirname "$0")/.." && pwd)"
 NAME=$1; BASE=$2; SCAN=$3
 DASH=${NAME//_/-}
+BASE=$(realpath "$BASE"); SCAN=$(realpath "$SCAN")   # the build runs in another folder
 # each build goes to its own folder (a loaded .node is never overwritten under a running
 # process); node_modules/tree-sitter-<name> is switched to it at the end
 D=$G/builds/tree-sitter-$DASH-$(date +%Y%m%d-%H%M%S)
@@ -59,5 +62,26 @@ cd $D
 NODE_PATH=$G/node_modules npx --yes tree-sitter-cli@0.25.10 generate --abi 15
 sed -E "s/tree_sitter_[a-z_]+_external_scanner/tree_sitter_${NAME}_external_scanner/g" $SCAN > src/scanner.c
 NODE_PATH=$G/node_modules npx --yes node-gyp rebuild > build.log 2>&1 || { tail -30 build.log; exit 1; }
+# publish: grammars/tree-sitter-<name>/ is the drop-in package the sandbox loads (sources, the
+# generated parser, and the binary as prebuilds/<platform>-<arch>/<pkg>.node, which
+# node-gyp-build picks up). The binary is replaced by rename, so a process that already loaded
+# the old one keeps its copy. The published grammar.js gets portable requires: a base inside
+# some node_modules becomes '<pkg>/grammar', anything else a path relative to the package.
+T=$G/tree-sitter-$DASH
+PLAT=$(node -p "process.platform + '-' + process.arch")
+case "$BASE" in
+  */node_modules/*/grammar.js) BASE_REQ=$(echo "$BASE" | sed -E 's#.*/node_modules/([^/]+)/grammar\.js$#\1/grammar#') ;;
+  *) BASE_REQ=$(realpath --relative-to="$T" "$BASE"); case "$BASE_REQ" in .*) ;; *) BASE_REQ="./$BASE_REQ" ;; esac ;;
+esac
+mkdir -p $T/src $T/bindings/node $T/prebuilds/$PLAT
+cp -r src/. $T/src/
+cp binding.gyp package.json tree-sitter.json $T/
+cp bindings/node/* $T/bindings/node/
+sed -e "s#require('$BASE')#require('$BASE_REQ')#; s#base: $BASE #base: $BASE_REQ #; s#$G/plus/#../plus/#g" grammar.js > $T/grammar.js
+# a local build/ inside the package would win over prebuilds/ (node-gyp-build checks it first)
+if [ -d $T/build ]; then mv $T/build $D/replaced-build; fi
+cp build/Release/tree_sitter_${NAME}_binding.node $T/prebuilds/$PLAT/.tree-sitter-$DASH.node.tmp
+mv -f $T/prebuilds/$PLAT/.tree-sitter-$DASH.node.tmp $T/prebuilds/$PLAT/tree-sitter-$DASH.node
+# the comparison scripts (build_all*.sh, bisect_groups.sh) load this exact build by name
 ln -sfn $D $G/node_modules/tree-sitter-$DASH
 echo "built $NAME: $(ls build/Release/*.node)"

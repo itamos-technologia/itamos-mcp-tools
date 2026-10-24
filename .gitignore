@@ -31,3 +31,9 @@ __pycache__/
 
 # built packages
 dist/
+
+# grammar build scratch (published packages live in grammars/tree-sitter-*/ with prebuilds/)
+grammars/builds/
+grammars/**/build/
+grammars/**/*.log
+grammars/plus/*.log

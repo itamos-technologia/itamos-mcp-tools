@@ -4,15 +4,19 @@
 //   .cu .cuh  -> CUDA grammar          .hip -> CUDA grammar (HIP is CUDA-style C++)
 //   .metal    -> Metal grammar (C++ grammar + kernel/vertex/fragment, address spaces)
 //   .m .mm    -> Objective-C grammar   .h with @interface / @protocol -> Objective-C too
-//   other C++ (.cpp .cc .hpp, C++ .h) -> tree-sitter-cpp-plus when built
+//   other C++ (.cpp .cc .hpp, C++ .h) -> tree-sitter-cpp-plus when present
 // The "plus" builds (grammars/plus/: stock grammar + extra C++ rules, checked to give the
 // same tree wherever the stock grammar already parses) are preferred when present; the
-// stock grammar is the fallback. The grammars are installed apart from the shared
-// node_modules, in /tank/projects/mcp-sandbox-public/grammars, and loaded from there with
-// createRequire. Only the PARSE uses them: the language name stays 'c' / 'cpp' everywhere
-// else (checks, import resolution, project map). A grammar that is missing or fails to load
-// returns null, and callers fall back to the plain C / C++ grammar, as before.
+// stock grammar is the fallback. The grammars live apart from the tools' node_modules, in
+// the repo's grammars/ folder (or SANDBOX_GRAMMARS_DIR). Each grammars/tree-sitter-* folder
+// is a self-contained drop-in package: prebuilt binary in prebuilds/<platform>-<arch>/, or
+// its own build/Release after `npx node-gyp rebuild`. Stock packages (tree-sitter-cuda,
+// tree-sitter-objc) come from grammars/node_modules. Only the PARSE uses them: the language
+// name stays 'c' / 'cpp' everywhere else (checks, import resolution, project map). A grammar
+// that is missing or fails to load returns null, and callers fall back to the plain C / C++
+// grammar, as before.
 import { createRequire } from 'module';
+import fs from 'fs';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -44,9 +48,18 @@ const _parsers = new Map();    // dialect -> Parser
 // So each grammar package is first loaded and used once in a short child process; only when
 // that succeeds is it loaded here. Done once per package per process start.
 const TREE_SITTER_PATH = createRequire(import.meta.url).resolve('tree-sitter');
-function loadsSafely(pkg) {
+// Where a grammar package lives: its own folder in grammars/ (drop-in: copy the folder in and
+// it is found, no npm install or symlink needed), else grammars/node_modules (npm-installed
+// stock grammars such as tree-sitter-cuda / tree-sitter-objc). null when neither exists.
+function locate(pkg) {
+  const dir = path.join(GRAMMARS_DIR, pkg);
+  if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+  try { req.resolve(pkg); return pkg; } catch { return null; }
+}
+
+function loadsSafely(target) {
   const probe = `const r = require('module').createRequire(${JSON.stringify(path.join(GRAMMARS_DIR, 'package.json'))});
-    const P = require(${JSON.stringify(TREE_SITTER_PATH)}); const m = r(${JSON.stringify(pkg)});
+    const P = require(${JSON.stringify(TREE_SITTER_PATH)}); const m = r(${JSON.stringify(target)});
     const p = new P(); p.setLanguage(m.default || m); p.parse('int main(void) { return 0; }');`;
   const r = spawnSync(process.execPath, ['-e', probe], { timeout: 20000, stdio: 'ignore' });
   return r.status === 0;
@@ -57,9 +70,10 @@ function loadGrammar(name, pkgs) {
   let found = null;
   for (const pkg of pkgs) {
     try {
-      req.resolve(pkg);                      // not installed -> next, without spawning
-      if (!loadsSafely(pkg)) continue;
-      const m = req(pkg);
+      const target = locate(pkg);
+      if (!target) continue;                 // not present -> next, without spawning
+      if (!loadsSafely(target)) continue;
+      const m = req(target);
       const g = m.default || m;
       new Parser().setLanguage(g);           // fails here if the binary does not match the runtime
       found = { grammar: g, pkg };

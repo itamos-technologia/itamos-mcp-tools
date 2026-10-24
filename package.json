@@ -6,7 +6,7 @@
   "main": "server-sandbox.js",
   "scripts": {
     "start": "node server-sandbox.js",
-    "postinstall": "npm --prefix tools/master-architect ci"
+    "postinstall": "npm --prefix tools/master-architect ci && (npm --prefix grammars ci || (echo \"grammars: a stock grammar could not be compiled here; installing without compiling (the prebuilt parsers in grammars/ still work)\" && npm --prefix grammars ci --ignore-scripts))"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

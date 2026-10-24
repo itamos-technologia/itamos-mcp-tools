@@ -111,6 +111,28 @@ One `npm install` sets up everything, including the tools folder.
 
 **On Ubuntu 26.04** you can install the package from [Releases](https://github.com/itamos-technologia/itamos-mcp-tools/releases) instead: `sudo apt install ./itamos-mcp-tools_1.1.0_all.deb`. It sets up a service user, a systemd service, settings in `/etc/itamos-mcp-tools/env` and the command `itamos-mcp-create-slots`, then tells you the next two steps.
 
+### Extra language parsers
+
+Besides the standard tree-sitter grammars (installed by `npm install`), `read_file` and the segmenter use extra parsers from the `grammars/` folder:
+
+| Files | Parser | Falls back to |
+|---|---|---|
+| `.cu` `.cuh` `.hip` | `tree-sitter-cuda-plus` | stock `tree-sitter-cuda`, then C++ |
+| `.metal` | `tree-sitter-metal-plus` | `tree-sitter-metal`, then C++ |
+| `.cpp` `.cc` `.hpp`, C++ `.h` | `tree-sitter-cpp-plus` | stock `tree-sitter-cpp` |
+| `.m` `.mm`, `.h` with `@interface` | `tree-sitter-objc` | C / C++ |
+
+The "plus" parsers are the stock grammar plus extra C++ rules, checked to give the identical tree wherever the stock grammar already parses. A parser that is missing or fails to load is skipped, never fatal.
+
+- **Linux x64: nothing to do.** The parsers ship prebuilt in `grammars/tree-sitter-*/prebuilds/linux-x64/` (Node-API, any Node 18+, glibc 2.14+), and `npm install` sets up the rest.
+- **Other platforms** (macOS, Windows, ARM): compile each parser once. This needs Python and a C/C++ compiler:
+  ```sh
+  cd grammars/tree-sitter-cuda-plus && npx node-gyp rebuild   # same for tree-sitter-cpp-plus, -metal-plus, -metal
+  ```
+- **Drop-in:** every `grammars/tree-sitter-*` folder is a self-contained package. Copy one in and the sandbox finds it by name, with no install or symlink. To keep the grammars somewhere else, set `SANDBOX_GRAMMARS_DIR`.
+- **Regenerating** (only after changing the rules in `grammars/plus/`): `grammars/plus/build_plus.sh` generates with tree-sitter-cli 0.25.10 (ABI 15), compiles, and publishes into the matching `tree-sitter-*` folder. Its header shows the arguments.
+
+
 ### Create the sandbox slots
 
 ```sh
