@@ -3,19 +3,22 @@
  *
  * Gives eyeless LLMs structured perception of web pages.
  * Uses headless Chromium via Chrome DevTools Protocol (CDP).
- * Zero npm dependencies — only Node.js built-ins.
+ * Zero npm dependencies — only Node.js built-ins (code maps reuse the
+ * master-architect segmenter, see code_view.js).
  *
- * Actions:
- *   search  {query}              → search results with title + one-line summary
- *   skeleton {url}               → structural skeleton of a page (headings, sections, links, forms)
- *                                  each element has: id, tag, label, action, position (% of viewport)
- *   read    {url, section}       → full text content of a specific section by id
- *   click   {url, element_id}    → simulate click / follow link, return new skeleton
+ * Actions (the tool remembers the current page per sandbox; read, click and
+ * skeleton use it when no url is given):
+ *   search   {query}            → results r1, r2 ...; click r3 opens result 3
+ *   skeleton {url?, context?}   → map of the page: element ids (e5 ...), ● clickable, ○ content
+ *   read     {section}          → text of one element; a code block (e12) gives its parts,
+ *                                 a part (e12.3) its code, like read_file
+ *   click    {element}          → click e12 on the current page, or open search result r3
+ *   home                        → close the current page; next step is search or skeleton
  *
  * Design principles (same as Chain Reader):
  *   - Locality: act on the piece you need, don't ingest the whole page
  *   - Skeletonize everything: skeleton + segments + originals always preserved
- *   - Token efficiency: 97% reduction vs raw HTML
+ *   - Token efficiency: a map instead of raw HTML
  *
  * Chromium binary: expects portable Chromium at ../web-skeleton/chromium/chrome
  * Falls back to system chrome if portable not found.
@@ -34,6 +37,7 @@ import { createHash } from 'node:crypto';
 import { logCost } from '../../mcp_tools/lib/cost_log.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { annotateCode, parseCodeAddress, readCode } from './code_view.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -998,11 +1002,16 @@ const DOM_WALKER_SCRIPT = `
     if (/^H[1-6]$/.test(tag) || tag === 'A' || tag === 'BUTTON' || tag === 'SUMMARY'
         || tag === 'LI' || tag === 'TH' || tag === 'TD' || tag === 'DT') {
       const txt = el.textContent || '';
-      const clean = txt.replace(/\\\\s+/g, ' ').trim();
-      return clean.length > 120 ? clean.slice(0, 117) + '...' : clean;
+      const clean = txt.replace(/\\s+/g, ' ').trim();
+      return clean.length > 80 ? clean.slice(0, 79) + '…' : clean;
     }
     if (tag === 'IMG') return el.alt || '[image]';
     return '';
+  }
+
+  function shortLabel(t) {
+    const clean = String(t || '').replace(/\\s+/g, ' ').trim();
+    return clean.length > 80 ? clean.slice(0, 79) + '…' : clean;
   }
 
   function getKind(el) {
@@ -1096,7 +1105,7 @@ const DOM_WALKER_SCRIPT = `
       const val = walker.currentNode.textContent.trim();
       if (val) text += (text ? ' ' : '') + val;
     }
-    text = text.replace(/\\\\s+/g, ' ').trim();
+    text = text.replace(/\\s+/g, ' ').trim();
     return text.length > 150 ? text.slice(0, 147) + '...' : text;
   }
 
@@ -1107,17 +1116,43 @@ const DOM_WALKER_SCRIPT = `
     for (const tr of trList) {
       const cells = [];
       for (const cell of tr.querySelectorAll('th, td')) {
-        const t = (cell.textContent || '').replace(/\\\\s+/g, ' ').trim();
+        const t = (cell.textContent || '').replace(/\\s+/g, ' ').trim();
         if (t) cells.push(t);
       }
       if (cells.length > 0) rows.push(cells.join(' | '));
     }
-    return rows.join('\\\\n');
+    return rows.join('\\n');
   }
 
   // Extract <pre>/<code> blocks as-is
   function getPreText(el) {
     return (el.textContent || '').trim();
+  }
+
+  // Code blocks: <pre>, and code drawn as a table (GitHub file views and
+  // embedded snippets: td.blob-code cells, table.highlight). Each is ONE
+  // element; its lines are not walked.
+  function isCodeTable(el) {
+    if (el.tagName !== 'TABLE') return false;
+    return el.classList.contains('highlight')
+      || !!el.querySelector('td.blob-code, td.blob-code-inner, td.js-file-line');
+  }
+  function isCodeBlock(el) { return el.tagName === 'PRE' || isCodeTable(el); }
+  // Language hint from the block's classes or its wrappers' (language-py, hljs js, highlight-source-c++).
+  function codeLang(el) {
+    let cls = String(el.className || '') + ' ' + String((el.querySelector('code') || {}).className || '');
+    for (let p = el.parentElement, i = 0; p && i < 3; p = p.parentElement, i++) cls += ' ' + String(p.className || '');
+    const m = cls.match(/(?:language-|lang-|highlight-source-|highlight-(?!source)|hljs\\s+)([\\w+#-]+)/);
+    return m ? m[1].toLowerCase() : '';
+  }
+  function codeText(el) {
+    if (el.tagName === 'PRE') return (el.textContent || '').replace(/\\s+$/, '');
+    const out = [];
+    for (const tr of el.querySelectorAll('tr')) {
+      const cell = tr.querySelector('td.blob-code, td.blob-code-inner, td.js-file-line') || tr.querySelector('td:last-child');
+      out.push(cell ? (cell.textContent || '').replace(/\\s+$/, '') : '');
+    }
+    return out.join('\\n');
   }
 
   function getFullText(el) {
@@ -1145,7 +1180,7 @@ const DOM_WALKER_SCRIPT = `
 
           // Tables — use table extractor
           if (ctag === 'TABLE') {
-            const tt = getTableText(child);
+            const tt = isCodeTable(child) ? codeText(child) : getTableText(child);
             if (tt) lines.push(tt);
             continue;
           }
@@ -1174,7 +1209,7 @@ const DOM_WALKER_SCRIPT = `
             else if (ctag === 'TR') {
               const cells = [];
               for (const c of child.querySelectorAll('th, td')) {
-                const ct = (c.textContent || '').replace(/\\\\s+/g, ' ').trim();
+                const ct = (c.textContent || '').replace(/\\s+/g, ' ').trim();
                 if (ct) cells.push(ct);
               }
               if (cells.length > 0) lines.push(cells.join(' | '));
@@ -1185,7 +1220,7 @@ const DOM_WALKER_SCRIPT = `
       }
     }
     recurse(el);
-    return lines.join('\\\\n');
+    return lines.join('\\n');
   }
 
   function walk(el, depth) {
@@ -1212,6 +1247,16 @@ const DOM_WALKER_SCRIPT = `
       }
     }
 
+    if (isCodeBlock(el)) {
+      const eid = 'e' + (nextId++);
+      try { el.setAttribute('data-wsk', eid); } catch (e) {}
+      const pos = getPosition(el);
+      if (pos.w === 0 && pos.h === 0) return;
+      elements.push({ id: eid, kind: 'code', depth, label: codeLang(el), summary: '', pos, clickable: false });
+      sections[eid] = codeText(el);
+      return;
+    }
+
     if (isContent || (tag === 'DIV')) {
       const eid = 'e' + (nextId++);
       try { el.setAttribute('data-wsk', eid); } catch (e) {}
@@ -1221,7 +1266,7 @@ const DOM_WALKER_SCRIPT = `
         for (const child of el.children) walk(child, depth);
         return;
       }
-      const label = getLabel(el);
+      const label = shortLabel(getLabel(el));
       const kind = getKind(el);
       const clickable = isClickable(el);
       const dest = clickable ? getDestination(el) : null;
@@ -1371,6 +1416,34 @@ if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
   };
 }
 `;
+
+
+// ── CURRENT PAGE (per sandbox) ──────────────────────────────────────────────
+// The browser tab is closed as soon as a page has been read; what stays is the
+// address of the page the model is on (or the last search's results), so read
+// and click need only an element id. 'home' forgets it. Page data itself stays
+// in the disk cache, so going back to a page is instant.
+const _current = new Map();   // sandbox key → { url, viewport } or { query, results: [url...] }
+const _curKey = () => _slot() || 'local';
+function currentPage() { return _current.get(_curKey()) || null; }
+function setCurrentPage(url, viewport = null) { _current.set(_curKey(), { url, viewport }); }
+function setSearchResults(query, urls) { _current.set(_curKey(), { query, results: urls }); }
+function goHome() {
+  _current.delete(_curKey());
+  const slot = _slot();
+  if (slot) _closeSlotTab(slot);
+}
+const NO_PAGE = 'No page open. Next: search with a query, or skeleton with a url.';
+
+// "example.com/x" → "https://example.com/x": addresses are often shown without
+// a scheme (search results, links in text), and the model copies what it sees.
+function normalizeUrl(u) {
+  let s = String(u || '').trim();
+  if (!s) return s;
+  if (s.startsWith('//')) s = 'https:' + s;
+  else if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'https://' + s;
+  return s;
+}
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTIONS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1461,6 +1534,8 @@ const cached = cacheGetFor(url, viewport);
     // AI-title text-heavy sections for better navigation, then embed every
     // segment (titles included) so the page can be searched by meaning.
     await aiTitleElements(data);
+    // Code blocks: language, size and a title (first definition), kept with the page.
+    await annotateCode(data);
     const vectors = await embedElements(data);
 
     // Cache full skeleton + all sections + vectors (after titling, so the
@@ -1483,20 +1558,32 @@ const cached = cacheGetFor(url, viewport);
   }
 }
 
+// Page text without layout noise: lines trimmed, runs of blank lines folded.
+function tidyText(text) {
+  return String(text || '').split('\n').map((l) => l.trim()).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 async function actionRead(url, sectionId) {
-  const cached = cacheGet(url);
+  let cached = cacheGet(url);
   if (!cached) {
     // Need to skeleton first
     await actionSkeleton(url);
-    const cached2 = cacheGet(url);
-    if (!cached2) throw new Error('Failed to cache page');
-    if (!(sectionId in cached2.sections)) return `Section ${sectionId} not found. Available: ${Object.keys(cached2.sections).join(', ')}`;
-    const text = cached2.sections[sectionId];
-    return text || `[Section ${sectionId} exists but has no extractable text content]`;
+    cached = cacheGet(url);
+    if (!cached) throw new Error('Failed to cache page');
   }
-  if (!(sectionId in cached.sections)) return `Section ${sectionId} not found. Available: ${Object.keys(cached.sections).join(', ')}`;
-  const text = cached.sections[sectionId];
-  return text || `[Section ${sectionId} exists but has no extractable text content]`;
+  // "e12" is an element; "e12.3" / "e12.3.1" are parts of a code block.
+  const addr = parseCodeAddress(sectionId);
+  const id = addr ? addr.elementId : String(sectionId || '').trim();
+  if (!(id in cached.sections)) {
+    const ids = Object.keys(cached.sections);
+    return `[WebSkeleton Error] There is no ${id} on this page; its ids are e1 ... ${ids[ids.length - 1] || 'e1'}.`;
+  }
+  const el = (cached.skeleton || []).find((e) => e.id === id);
+  const text = cached.sections[id];
+  if (el && el.kind === 'code') return readCode(id, addr ? addr.path : [], text || '', el.lang || el.label || '');
+  if (addr && addr.path.length) return `[WebSkeleton Error] ${id} is not code, so it has no parts; read it as "${id}".`;
+  if (!text) return `[${id} has no text of its own; read the elements inside it]`;
+  return tidyText(text);
 }
 
 async function actionClick(url, elementId, viewport = null) {
@@ -1595,6 +1682,8 @@ await ensureChrome();
       data.rawBytes = raw?.result?.value || 0;
     } catch { data.rawBytes = 0; }
 
+    // Code blocks: language, size and a title, kept with the page.
+    await annotateCode(data);
     // Update cache with new URL
     cacheSet(newUrl, {
       skeleton: data.elements,
@@ -1605,6 +1694,8 @@ await ensureChrome();
       rawBytes: data.rawBytes,
       viewport: { width: viewport.width, height: viewport.height },
     });
+    // The model is now on the page the click led to (same page if it did not navigate).
+    setCurrentPage(newUrl, viewport);
 
     // Format with click context
     const header = [];
@@ -1686,11 +1777,14 @@ async function actionSearch(query) {
 
     for (let i = 0; i < searchResults.length; i++) {
       const r = searchResults[i];
-      lines.push(`[${i + 1}] ${r.title}`);
+      lines.push(`[r${i + 1}] ${r.title}`);
       lines.push(`    ${r.displayUrl || r.url}`);
       if (r.snippet) lines.push(`    ${r.snippet}`);
       lines.push('');
     }
+    // Remember the results: "click r3" opens result 3, no address to copy.
+    setSearchResults(query, searchResults.map((r) => r.url));
+    if (searchResults.length) lines.push(`Open a result: click with element "r1" ... "r${searchResults.length}".`);
 
     // Token stats
     const rawResult = await session.send('Runtime.evaluate', {
@@ -1801,21 +1895,19 @@ function formatSkeleton(data, viewport, context = null, layout = null, full = fa
       }
     }
 
-    // ── Code block collapse: PRE elements with >3 lines ─────────────
+    // ── Code blocks: always one line (title, language, size); read gives their map ──
     for (let i = 0; i < elements.length; i++) {
       if (collapseMap.has(i)) continue;
       const el = elements[i];
       if (el.kind !== 'code' && !/^\d+ lines$/.test(el.label || '')) continue;
       const text = data.sections?.[el.id] || '';
-      const lineCount = text.split('\n').length;
-      if (lineCount > 3) {
-        let codeEnd = i;
-        for (let j = i + 1; j < elements.length; j++) {
-          if (elements[j].depth <= el.depth) break;
-          codeEnd = j;
-        }
-        collapseMap.set(i, { type: 'code', items: lineCount, links: 0, endIdx: codeEnd });
+      const lineCount = el.lines || text.split('\n').length;
+      let codeEnd = i;
+      for (let j = i + 1; j < elements.length; j++) {
+        if (elements[j].depth <= el.depth) break;
+        codeEnd = j;
       }
+      collapseMap.set(i, { type: 'code', items: lineCount, links: 0, endIdx: codeEnd });
     }
 
     // ── Render pass ──────────────────────────────────────────────────
@@ -1823,6 +1915,7 @@ function formatSkeleton(data, viewport, context = null, layout = null, full = fa
     let collapsed = 0;
 
     lines.push(`ELEMENTS: ${elements.length}`);
+    lines.push('KEY: ● can be clicked (click its id) · ○ content (read its id)');
     lines.push('---');
 
     for (let i = 0; i < elements.length; i++) {
@@ -1841,14 +1934,14 @@ function formatSkeleton(data, viewport, context = null, layout = null, full = fa
                     : info.type === 'dropdown' ? 'items'
                     : 'links';
         const posStr = (layout === 'all' || layout === el.id) ? posTag(el) : '';
-        let labelStr;
         if (info.type === 'code') {
-          const lang = (el.label && !/^\d+ lines$/.test(el.label)) ? el.label : '';
-          labelStr = lang ? ` "${lang}"` : '';
+          // One line per code block: language, title (its first definition), size.
+          const lang = el.lang || ((el.label && !/^\d+ lines$/.test(el.label)) ? el.label : '');
+          const title = el.codeTitle ? ` "${el.codeTitle}"` : '';
+          lines.push(`${indent}○ [${el.id}] code${lang && lang !== 'plaintext' ? ' ' + lang : ''}${title} (${count} ${unit})${posStr} — read [${el.id}] for its parts`);
         } else {
-          labelStr = ` "${el.label || el.kind}"`;
+          lines.push(`${indent}${click} [${el.id}] ${info.type} "${el.label || el.kind}" (${count} ${unit})${posStr} — read [${el.id}] to expand`);
         }
-        lines.push(`${indent}${click} [${el.id}] ${info.type}${labelStr} (${count} ${unit})${posStr} — read [${el.id}] to expand`);
         skipUntil = info.endIdx;
         collapsed += (info.endIdx - i);
         continue;
@@ -1861,6 +1954,10 @@ function formatSkeleton(data, viewport, context = null, layout = null, full = fa
       if (layout === 'all' || layout === el.id) line += posTag(el);
       // Summary only for leaf elements — parents' children show the content
       const hasChildren = (i + 1 < elements.length && elements[i + 1].depth > el.depth);
+      // Nothing to show or do: no label, no destination, no text, no children
+      // (empty wrappers, unlabeled images and icon buttons). Ids stay as they are.
+      if (!hasChildren && !el.dest && (!el.label || el.label === '[image]')
+          && !(el.summary && el.summary.length > 5)) continue;
       if (!hasChildren && el.summary && el.summary !== el.label && el.summary.length > 5) {
         line += `\n${indent}  └ ${el.summary}`;
       }
@@ -1929,6 +2026,13 @@ function formatSkeleton(data, viewport, context = null, layout = null, full = fa
       const isParent = parentIds.has(el.id);
       const indent = '  '.repeat(el.depth);
       const click = el.clickable ? '●' : '○';
+      if (el.kind === 'code' && (isMatch || isParent)) {
+        const lang = el.lang && el.lang !== 'plaintext' ? ' ' + el.lang : '';
+        const title = el.codeTitle ? ` "${el.codeTitle}"` : '';
+        const size = el.lines ? ` (${el.lines} lines)` : '';
+        lines.push(`${indent}○ [${el.id}] code${lang}${title}${size}${isMatch ? ' ★' : ''}`);
+        continue;
+      }
 
       if (isMatch) {
         let line = `${indent}${click} [${el.id}] ${el.kind}`;
@@ -1979,61 +2083,92 @@ function formatSkeleton(data, viewport, context = null, layout = null, full = fa
 
 export default {
   name: 'web_skeleton',
-  description: 'Web page skeletonizer — LLM-first web perception. '
-    + 'Actions: skeleton (parse page structure, optional context to filter), read (get section text), click (interact with element), search (web search via skeleton). '
-    + '97% token reduction vs raw HTML.',
+  description: 'Browse the web as a map instead of raw HTML. '
+    + 'search(query) lists results r1, r2 ...; click r3 opens result 3. skeleton(url) opens a page and shows its map with element ids (e5, e12 ...). '
+    + 'The tool remembers the page you are on: read(section="e5") shows that part, click(element="e12") follows a link or presses a button; no url needed. '
+    + 'In maps, ● = can be clicked, ○ = content to read. home closes the page and starts fresh.',
   schema: {
-    action: z.enum(['skeleton', 'read', 'click', 'search']).describe(
-      'skeleton: parse a URL into structural skeleton with element positions. Use context to filter for relevant sections only. '
-      + 'read: get full text of a section by id (requires prior skeleton). '
-      + 'click: click an element by id, triggers navigation/action, returns new skeleton. '
-      + 'search: perform web search, return results as skeleton.'
+    action: z.enum(['search', 'skeleton', 'read', 'click', 'home']).describe(
+      'search: web search, results get ids r1, r2 ... '
+      + 'skeleton: open a page (url) and show its map. Optional context keeps only the parts about it. '
+      + 'read: show the full content of one element of the current page (section). '
+      + 'click: click an element of the current page (e12), or open a search result (r3); returns the new map. '
+      + 'home: close the current page; next step is search or skeleton.'
     ),
-    url: z.string().optional().describe('URL to skeletonize or read from'),
-    context: z.string().optional().describe('Search context to filter skeleton — only sections matching these terms are expanded, rest collapsed to headings'),
-    section: z.string().optional().describe('Section id to read (from skeleton output, e.g. "e5")'),
-    element: z.string().optional().describe('Element id to click (from skeleton output, e.g. "e12")'),
-    query: z.string().optional().describe('Search query (for action=search)'),
+    url: z.string().optional().describe('Page address for skeleton ("example.com/page" works). Left out, skeleton, read and click use the current page.'),
+    context: z.string().optional().describe('Words about what you are looking for: only matching parts of the page are expanded, the rest collapsed to headings'),
+    section: z.string().optional().describe('Element id to read, from the map, e.g. "e5"'),
+    element: z.string().optional().describe('Element id to click, e.g. "e12", or a search result id, e.g. "r3"'),
+    query: z.string().optional().describe('Search words (for search)'),
     layout: z.string().optional().describe('Show element positions. "all" = every element, or an element id like "e5" for just that subtree. Omit for no positions (default). Format @x%,y% w%×h%: x and w are % of the viewport width, y and h are % of the full page height.'),
-    full_skeleton: z.boolean().optional().describe('Show the whole skeleton even when it is very large (above ~3000 tokens a skeleton without context returns the page outline instead).'),
+    full_skeleton: z.boolean().optional().describe('Show the whole map even when it is very large (above ~3000 tokens a map without context returns the page outline instead).'),
     viewport: z.string().optional().describe('Screen size to render at, "WIDTHxHEIGHT" in pixels, e.g. "390x844" (phone), "1366x768" (laptop). Default 1920x1080. Below 768 px wide the page is rendered as mobile. For skeleton and click; read uses the size of the last skeleton.'),
   },
   async handler(args, ctx) {
     try {
       let result;
+      const cur = currentPage();
+      // The page to act on: an explicit url, else the page the model is on.
+      const pageUrl = () => (args.url ? normalizeUrl(args.url) : (cur && cur.url) || null);
+      const openPage = async (url, vp) => {
+        const full = !!args.full_skeleton;
+        const out = cacheGetFor(url, vp)
+          ? await actionSkeleton(url, vp, args.context || null, args.layout || null, full)
+          : await withRender(() => actionSkeleton(url, vp, args.context || null, args.layout || null, full));
+        setCurrentPage(url, vp);
+        return out;
+      };
 
       switch (args.action) {
         case 'skeleton': {
-          if (!args.url) throw new Error('url required for skeleton action');
-          validateUrl(args.url);
-          const vp = parseViewport(args.viewport) || DEFAULT_VIEWPORT;
-          const full = !!args.full_skeleton;
-          result = cacheGetFor(args.url, vp)
-            ? await actionSkeleton(args.url, vp, args.context || null, args.layout || null, full)
-            : await withRender(() => actionSkeleton(args.url, vp, args.context || null, args.layout || null, full));
+          // No url: the current page again (with context, full_skeleton or another size).
+          const url = pageUrl();
+          if (!url) throw new Error('url required for skeleton (or search, then click a result like "r1")');
+          validateUrl(url);
+          result = await openPage(url, parseViewport(args.viewport) || (!args.url && cur && cur.viewport) || DEFAULT_VIEWPORT);
           break;
         }
 
-        case 'read':
-          if (!args.url) throw new Error('url required for read action');
-          if (!args.section) throw new Error('section required for read action');
-          validateUrl(args.url);
-          result = cacheGet(args.url)
-            ? await actionRead(args.url, args.section)
-            : await withRender(() => actionRead(args.url, args.section));
+        case 'read': {
+          if (!args.section) throw new Error('section required for read, an element id from the map like "e5"');
+          const url = pageUrl();
+          if (!url) throw new Error(NO_PAGE);
+          validateUrl(url);
+          result = cacheGet(url)
+            ? await actionRead(url, args.section)
+            : await withRender(() => actionRead(url, args.section));
+          if (args.url) setCurrentPage(url, (cur && cur.viewport) || null);
           break;
+        }
 
-        case 'click':
-          if (!args.url) throw new Error('url required for click action');
-          if (!args.element) throw new Error('element required for click action');
-          validateUrl(args.url);
+        case 'click': {
+          if (!args.element) throw new Error('element required for click, like "e12" (or "r3" for a search result)');
+          const rm = /^r(\d+)$/i.exec(String(args.element).trim());
+          if (rm && !args.url) {
+            if (!cur || !cur.results) throw new Error('No search results open: r-ids come from a search. Run search first.');
+            const target = cur.results[Number(rm[1]) - 1];
+            if (!target) throw new Error(`There is no result r${rm[1]}; this search has r1 ... r${cur.results.length}.`);
+            const url = normalizeUrl(target);
+            validateUrl(url);
+            result = await openPage(url, parseViewport(args.viewport) || DEFAULT_VIEWPORT);
+            break;
+          }
+          const url = pageUrl();
+          if (!url) throw new Error(NO_PAGE);
+          validateUrl(url);
           const clickVp = parseViewport(args.viewport);   // null → the size the page was browsed at
-          result = await withRender(() => actionClick(args.url, args.element, clickVp));
+          result = await withRender(() => actionClick(url, args.element, clickVp));
           break;
+        }
 
         case 'search':
-          if (!args.query) throw new Error('query required for search action');
+          if (!args.query) throw new Error('query required for search');
           result = await withRender(() => actionSearch(args.query, ctx));
+          break;
+
+        case 'home':
+          goHome();
+          result = 'Home: no page open. Next: search with a query, or skeleton with a url.';
           break;
 
         default:

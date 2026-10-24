@@ -80,7 +80,7 @@ import { detectExternalRefs, gatherSpecs } from './lib/external_detect.js';
 import { segmentFile as workerSegmentFile } from './lib/segmenter.js';
 import { dialectParser, dialectInfo, grammarParser } from './lib/dialect_grammars.js';
 import { cHeaderLanguage } from './lib/c_header.js';
-import { parseCFamily } from './lib/macro_mask.js';
+import { parseCFamilyAsync } from './lib/macro_mask.js';
 import { checkMetal, newMetalErrors, metalCheckAvailable } from './lib/metal_check.js';
 import { runAdapters } from './lib/adapters/_dispatcher.js';
 import { fileURLToPath as _fileURLToPath } from 'url';
@@ -361,10 +361,12 @@ function getParser(language) {
   return p;
 }
 
-// Per-language comment markers for comment_out/uncomment operations.
+// Per-language line-comment markers for deactivate/activate (comment_out/uncomment).
 function commentMarker(language) {
-  if (language === 'python') return '#';
-  if (language === 'javascript' || language === 'typescript') return '//';
+  if (['python', 'ruby', 'shell', 'bash', 'perl', 'r', 'elixir', 'powershell'].includes(language)) return '#';
+  if (['javascript', 'typescript', 'tsx', 'c', 'cpp', 'csharp', 'java', 'go', 'rust',
+       'swift', 'kotlin', 'scala', 'php', 'dart', 'objc', 'cuda', 'metal'].includes(language)) return '//';
+  if (['sql', 'lua', 'haskell'].includes(language)) return '--';
   if (language === 'css') return null; // CSS uses /* */ only, no line comments
   if (language === 'html') return null; // HTML uses <!-- --> only, no line comments
   return null;
@@ -742,6 +744,16 @@ function _pair() {
 }
 
 async function loadFresh(filePath, readonly) {
+  // A large file that is queued, being indexed, or failed to index is never
+  // loaded: report its status instead (see LARGE FILE INDEXER in lib/scan.js).
+  // The error carries no stack: it is a status message for the caller, not a fault.
+  const { largeFileStatus } = await import('./lib/scan.js');
+  const largeStatus = largeFileStatus(path.resolve(filePath));
+  if (largeStatus) {
+    const statusErr = new Error(largeStatus.message);
+    statusErr.stack = '';
+    throw statusErr;
+  }
   let lang = detectLanguage(filePath);
   let content = null;
   if (!lang) {
@@ -987,19 +999,33 @@ async function verifyL1(filePath, content, language) {
   const dExt = path.extname(filePath).toLowerCase();
   if ((DIALECT_EXTS.includes(dExt) || dialectInfo(filePath, content)) && (dialectParser(filePath) || getParser(language))) {
     // the dialect's own grammar (CUDA / Metal / Objective-C, also Objective-C .h headers);
-    // C/C++ grammar if it did not load. Macro-aware parse (lib/macro_mask.js).
+    // C/C++ grammar if it did not load. Macro-aware parse (lib/macro_mask.js), async so
+    // discarded trees are freed between re-parses.
     const dInfo = dialectInfo(filePath, content);
     const dp = (dInfo && dialectParser(filePath)) || getParser(language);
-    const countErrors = (src) => parseCFamily(dp, src).errorsAfter;
     let disk = null;
     try { disk = await fs.readFile(filePath, 'utf8'); } catch {}
-    const before = disk === null ? null : countErrors(disk);
-    const after = countErrors(content);
+    let rNow = await parseCFamilyAsync(dp, content);
+    const after = rNow.errorsAfter;
+    // Unchanged file (always the case when validating): same text, same count;
+    // do not run the whole macro-aware parse a second time.
+    let before = null;
+    if (disk !== null) {
+      if (disk === content) before = after;
+      else {
+        const keepFirst = after > 0 ? firstParseError(rNow.tree.rootNode, content) : '';
+        rNow = null;                                   // release this tree before the disk parse
+        before = (await parseCFamilyAsync(dp, disk)).errorsAfter;
+        rNow = { firstError: keepFirst };
+      }
+    }
     const how = dInfo ? `${dExt} via the ${dInfo.label} grammar`
       : `${dExt} via the ${language === 'c' ? 'C' : 'C++'} grammar`;
     if (before !== null && after > before) {
-      return { level: 1, ok: false, messages: [`L1 tree-sitter (${how}): this edit adds ${after - before} parse error(s) ${firstParseError(parseCFamily(dp, content).tree.rootNode, content)}`] };
+      const where = rNow.firstError !== undefined ? rNow.firstError : firstParseError(rNow.tree.rootNode, content);
+      return { level: 1, ok: false, messages: [`L1 tree-sitter (${how}): this edit adds ${after - before} parse error(s) ${where}`] };
     }
+    rNow = null;
     const tsMsg = `L1 tree-sitter (${how}): OK, no new parse errors` + (after ? ` (${after} parse warning(s), unchanged)` : '');
     // Metal: clang++ -fsyntax-only against the Metal stand-in library (lib/metal_check.js).
     // Blocks only errors this edit adds compared with the file on disk; a new file must check clean.
@@ -1027,17 +1053,27 @@ async function verifyL1(filePath, content, language) {
   const parser = ((language === 'c' || language === 'cpp') && grammarParser(filePath, language, content)) || getParser(language);
   let cFamilyNote = null;   // C / C++: parse errors the grammar cannot resolve, already in the file on disk
   if (parser && (language === 'c' || language === 'cpp')) {
-    // macro-aware parse (lib/macro_mask.js); errors that remain and were already in the file on
-    // disk do not block: the compiler check below (gcc / g++ in the project's context) decides
-    const r = parseCFamily(parser, content);
-    if (r.errorsAfter) {
+    // macro-aware parse (lib/macro_mask.js), async so discarded trees are freed between
+    // re-parses; errors that remain and were already in the file on disk do not block:
+    // the compiler check below (gcc / g++ in the project's context) decides
+    let r = await parseCFamilyAsync(parser, content);
+    const errorsNow = r.errorsAfter;
+    if (errorsNow) {
+      const firstError = firstParseError(r.tree.rootNode, content);
+      r = null;                                        // release the tree before any second parse
       let before = null;
-      try { before = parseCFamily(parser, await fs.readFile(filePath, 'utf8')).errorsAfter; } catch {}
-      if (before === null || r.errorsAfter > before) {
-        return { level: 1, ok: false, messages: [`L1 tree-sitter: parse error ${firstParseError(r.tree.rootNode, content)}`] };
+      try {
+        const disk = await fs.readFile(filePath, 'utf8');
+        // Unchanged file (always the case when validating): the same text gives
+        // the same count, so do not run the whole macro-aware parse a second time.
+        before = disk === content ? errorsNow : (await parseCFamilyAsync(parser, disk)).errorsAfter;
+      } catch {}
+      if (before === null || errorsNow > before) {
+        return { level: 1, ok: false, messages: [`L1 tree-sitter: parse error ${firstError}`] };
       }
-      cFamilyNote = `L1 tree-sitter: ${r.errorsAfter} parse warning(s) the grammar cannot resolve, unchanged by this edit`;
+      cFamilyNote = `L1 tree-sitter: ${errorsNow} parse warning(s) the grammar cannot resolve, unchanged by this edit`;
     }
+    r = null;
   } else if (parser) {
     const tree = parser.parse(content);
     if (tree.rootNode.hasError) {
@@ -1589,34 +1625,38 @@ function opReadSegment(buffer, address) {
   const seg = buffer.findSegment(address);
   if (!seg) return { error: `No segment at address "${address}"` };
 
-  // Assemble the FULL text of a segment subtree: prefix + children (recursive) + suffix.
-  // Mirrors Buffer.assembleText's emit() but rooted at one segment, so reading a
-  // container returns its complete editable code, not just the stored prefix stub.
-  const assembleSeg = (s) => {
-    if (s.children && s.children.length > 0) {
-      let out = buffer.segmentText.get(s.id) || '';
-      for (const child of s.children) out += assembleSeg(child);
-      out += buffer.parentSuffix.get(s.id) || '';
-      return out;
-    }
-    return buffer.segmentText.get(s.id) || '';
-  };
+  // A gap read directly must look like the <gap> markers in the skeleton:
+  // no id and editable:false. Returning it like a normal segment (with an id
+  // and kind "whitespace") invited edits that are then refused as a <gap>.
+  if (seg.kind === 'whitespace' || seg.kind === 'gap') {
+    return {
+      address, kind: 'gap', name: '<gap>',
+      lines: `${seg.startLine}-${seg.endLine}`,
+      text: buffer.segmentText.get(seg.id) || '',
+      editable: false,
+      note: 'Separator between segments; it cannot be edited directly. Spacing is handled for you: insert, delete and move keep the neighbours\' spacing. To change blank lines, replace a neighbouring segment.',
+    };
+  }
 
-  // Recursive title tree (titles + addresses + line ranges, no bodies) so the
-  // caller sees every nested segment under the parent and can drill to any of them.
+  // A container never returns its assembled body, only its own opening
+  // line(s). Its children are listed one level deep and read individually.
+  // Only leaves return code, so what is shown is exactly what replace changes.
+  const assembleSeg = (s) => buffer.segmentText.get(s.id) || '';
+
+  // One-level child map (titles + addresses + line ranges, no bodies). A child
+  // that is itself a container shows how many children it has; read it to
+  // drill down. Deliberately NOT named "tree": markRead walks a tree and would
+  // mark children as read although their code was never shown.
   const HIDDEN = new Set(['whitespace', 'gap']);
-  const buildTree = (s, addr) => {
-    const kids = (s.children || [])
-      .map((c, i) => ({ c, n: i + 1 }))
-      .filter(({ c }) => !HIDDEN.has(c.kind))
-      .map(({ c, n }) => {
-        const childAddr = `${addr}.${n}`;
-        const node = { address: childAddr, id: c.id, kind: c.kind, name: c.name, lines: `${c.startLine}-${c.endLine}` };
-        if (c.children && c.children.length > 0) node.children = buildTree(c, childAddr);
-        return node;
-      });
-    return kids;
-  };
+  const childMap = (s, addr) => (s.children || [])
+    .map((c, i) => ({ c, n: i + 1 }))
+    .filter(({ c }) => !HIDDEN.has(c.kind))
+    .map(({ c, n }) => {
+      const node = { address: `${addr}.${n}`, id: c.id, kind: c.kind, name: c.name, lines: `${c.startLine}-${c.endLine}` };
+      const sub = (c.children || []).filter((k) => !HIDDEN.has(k.kind)).length;
+      if (sub) node.children = sub;
+      return node;
+    });
 
   const _txt = assembleSeg(seg);
   try { const _r=Math.ceil((buffer.source||'').length/4), _a=Math.ceil((_txt||'').length/4); logCost("read_file", _r, _a); } catch{}
@@ -1628,8 +1668,8 @@ function opReadSegment(buffer, address) {
   };
   if (seg.children && seg.children.length > 0) {
     result.container = true;
-    result.tree = buildTree(seg, address);
-    result.note = `Container segment: 'text' above is the FULL assembled code (prefix + all nested children + suffix) and is editable as a whole. 'tree' lists every nested segment with its address (e.g. "${address}.1") so you can read or edit any child independently. Editing this parent address via replace currently overwrites only the parent's prefix line(s); to change a child's body, edit the child's own address.`;
+    result.children = childMap(seg, address);
+    result.note = `Container: 'text' is only its opening line(s), not its body. Read a child (segment="${address}.<n>") to see its code. Replace on this address changes only those opening line(s).`;
   }
   return result;
 }
@@ -1666,10 +1706,34 @@ function opDelete(buffer, addresses) {
   }
   for (const seg of targets) {
     const idx = buffer.segments.indexOf(seg);
+    // Separator ownership: separators live in gap segments, so removing a
+    // segment from between two gaps would leave both of them (two newlines →
+    // an empty line where the deleted line was). Take ONE adjacent gap with it:
+    // the one before when there is one and the segment is last or also
+    // followed by a gap; the one after when the segment is first in its list.
+    // A segment with no gap before it (a fresh insert carries its own leading
+    // separator) keeps its neighbours untouched. The removed gap is recorded
+    // so undo restores it.
+    const orphanGap = (list, i) => {
+      const isGapSeg = (s) => !!s && (s.kind === 'whitespace' || s.kind === 'gap');
+      const before = list[i - 1], after = list[i + 1];
+      let gi = -1;
+      if (isGapSeg(before) && (isGapSeg(after) || i === list.length - 1)) gi = i - 1;
+      else if (i === 0 && isGapSeg(after)) gi = i + 1;
+      if (gi === -1) return null;
+      return { index: gi, segment: list[gi], text: buffer.segmentText.get(list[gi].id) || '' };
+    };
+    const dropGap = (list, gap) => {
+      if (!gap) return;
+      const gIdx = list.indexOf(gap.segment);
+      if (gIdx !== -1) list.splice(gIdx, 1);
+      buffer.segmentText.delete(gap.segment.id);
+    };
     if (idx !== -1) {
       // Top-level segment — delete directly
       const prevChildren = new Map();
       if (seg.children) for (const ch of seg.children) prevChildren.set(ch.id, buffer.segmentText.get(ch.id));
+      const removedGap = orphanGap(buffer.segments, idx);
       buffer.pushUndoEntry({
         kind: 'delete',
         segId: seg.id,
@@ -1677,54 +1741,34 @@ function opDelete(buffer, addresses) {
         segment: seg,
         prevText: buffer.segmentText.get(seg.id),
         prevChildren,
+        removedGap,
       });
       buffer.segments.splice(idx, 1);
       buffer.segmentText.delete(seg.id);
+      dropGap(buffer.segments, removedGap);
     } else {
-      // Nested segment — find parent and remove child from it
+      // Nested segment — remove it from its parent's children, exactly like the
+      // top-level case removes it from buffer.segments. The parent's own text
+      // (its opening line) is never touched: assembleText emits children
+      // separately, so removing the child from the list IS the delete.
       const found = findParentOf(buffer.segments, seg);
       if (!found) return { error: `Segment "${seg.id}" not found in buffer` };
       const { parent, childIndex } = found;
-
-      // Get the child's text
-      const childText = buffer.segmentText.get(seg.id) || '';
-
-      // Remove the child's text from the parent's assembled text
-      const parentText = buffer.segmentText.get(parent.id) || '';
-      // The child text appears within the parent text — find and remove it
-      const childStartInParent = parentText.indexOf(childText);
-      let newParentText;
-      if (childStartInParent !== -1) {
-        // Remove the child text and any trailing newline
-        const before = parentText.slice(0, childStartInParent);
-        let after = parentText.slice(childStartInParent + childText.length);
-        // Clean up: remove the extra newline left by deletion
-        if (after.startsWith('\\n')) after = after.slice(1);
-        newParentText = before + after;
-      } else {
-        // Fallback: can't find exact text, just remove the child from children array
-        newParentText = parentText;
-      }
-
-      // Store undo entry for nested delete
+      const removedGap = orphanGap(parent.children, childIndex);
       buffer.pushUndoEntry({
         kind: 'nested_delete',
         segId: seg.id,
         parentId: parent.id,
         childIndex,
         segment: seg,
-        prevText: childText,
-        prevParentText: parentText,
+        prevText: buffer.segmentText.get(seg.id) || '',
+        prevParentText: buffer.segmentText.get(parent.id) || '',
+        removedGap,
       });
-
-      // Remove child from parent's children array
       parent.children.splice(childIndex, 1);
+      dropGap(parent.children, removedGap);
       // If parent has no more children, remove the children array
       if (parent.children.length === 0) delete parent.children;
-
-      // Update parent text
-      buffer.segmentText.set(parent.id, newParentText);
-      // Remove child text entry
       buffer.segmentText.delete(seg.id);
       // Also remove any grandchildren text entries
       if (seg.children) {
@@ -1734,8 +1778,8 @@ function opDelete(buffer, addresses) {
   }
   buffer.invalidateVerify('delete');
   return {
-    deleted: targets.map(t => ({ id: t.id, name: t.name })),
-    remaining: buffer.segments.length,
+    deleted: targets.map((t, i) => ({ address: String(addresses[i]), id: t.id, name: t.name })),
+    note: 'Saving re-segments the file, so read again after saving to get the final coordinates.',
     dirty: buffer.isDirty(),
   };
 }
@@ -1821,14 +1865,46 @@ function opInsert(buffer, betweenA, betweenB, content) {
       return { error: `Segments ${betweenA} and ${betweenB} are not adjacent. They must bracket the gap directly.` };
     }
   }
+  // Gap anchors: the agent may name a <gap> as one side of the insert (e.g.
+  // between "9" and the gap "10"). The separator logic below needs real
+  // neighbours: with a gap as anchor it finds no gap to copy and falls back to
+  // the language default ("\n\n\n" for Python), which produced the 4-line
+  // insert (2 blank lines before, 1 after). Step each side off any gap to the
+  // nearest real segment, so the gaps sit between A and B exactly as when the
+  // agent names the real neighbours.
+  {
+    const anchorList = parentSeg ? (parentSeg.children || []) : buffer.segments;
+    const isGapAnchor = (s) => !!s && (s.kind === 'whitespace' || s.kind === 'gap');
+    while (aIdx >= 0 && isGapAnchor(anchorList[aIdx])) aIdx--;
+    while (bIdx < anchorList.length && isGapAnchor(anchorList[bIdx])) bIdx++;
+  }
 
   // Separator normalization (top-level): assembleText() joins segments with '',
   // all separators live in gap segments — and a fresh insert has no gaps around
   // it, so raw content would glue onto the preceding segment. Detach it.
+  // Spacing follows the neighbours: the new segment lands right after A, before
+  // the existing gap(s) between A and B, so it gets a copy of that same gap in
+  // front of it — two imports stay tight, two functions keep their blank lines.
+  // Only where there is no gap to copy (start of file, end of file) does the
+  // language default apply.
   if (!parentSeg) {
     const sep = buffer.language === 'python' ? '\n\n\n' : '\n\n';
-    if (!content.startsWith('\n')) content = sep + content;
-    if (!content.endsWith('\n')) content += '\n';
+    const isGapSeg = (s) => !!s && (s.kind === 'whitespace' || s.kind === 'gap');
+    let between = '';
+    for (let i = aIdx + 1; i < bIdx; i++) {
+      const s = buffer.segments[i];
+      if (isGapSeg(s)) between += buffer.segmentText.get(s.id) || '';
+    }
+    const body = content.replace(/^\n+/, '').replace(/\n+$/, '');
+    if (aIdx === -1) {
+      // top of file: content first, then the default separator before B
+      content = body + (bIdx < buffer.segments.length ? sep : '\n');
+    } else if (between) {
+      content = between + body;
+    } else {
+      if (!content.startsWith('\n')) content = sep + content;
+      if (!content.endsWith('\n')) content += '\n';
+    }
   }
   let name = '(inserted)', kind = 'inserted';
   // Segment naming parse removed: the architect names segments at commit.
@@ -1845,26 +1921,24 @@ function opInsert(buffer, betweenA, betweenB, content) {
     const insertAt = aIdx + 1;
     if (!parentSeg.children) parentSeg.children = [];
     parentSeg.children.splice(insertAt, 0, newSeg);
+    // Spacing: existing gaps stay byte-identical (same rule as reorderBetweenGaps).
+    // The new child gets a copy of the gap that follows it (the one between its
+    // two neighbours), so it is spaced and indented exactly like its siblings.
+    const isGapSeg = (s) => !!s && (s.kind === 'whitespace' || s.kind === 'gap');
+    const sepGap = parentSeg.children.slice(insertAt + 1).find(isGapSeg)
+      || parentSeg.children.slice(0, insertAt).reverse().find(isGapSeg);
+    const sepText = sepGap ? (buffer.segmentText.get(sepGap.id) || '\n') : '\n';
+    if (!content.startsWith(sepText)) content = sepText + content;
     buffer.segmentText.set(newSeg.id, content);
 
-    // Update parent text — insert content at the right position
-    const parentText = buffer.segmentText.get(parentSeg.id) || '';
-    // Find insertion point: after child A's text, before child B's text
-    let insertionByte;
-    if (aIdx >= 0) {
-      const childA = parentSeg.children[aIdx];
-      const childAText = buffer.segmentText.get(childA.id) || '';
-      const childAPos = parentText.indexOf(childAText);
-      insertionByte = childAPos + childAText.length;
-    } else {
-      // Insert at start of parent body
-      insertionByte = 0;
-    }
-    const newParentText = parentText.slice(0, insertionByte) + '\n' + content + parentText.slice(insertionByte);
-    buffer.segmentText.set(parentSeg.id, newParentText);
+    
+    
+    
+    
+    
 
     buffer.originalText.set(newSeg.id, '');
-    buffer.pushUndoEntry({ kind: 'nested_insert', segId: newSeg.id, parentId: parentSeg.id, childIndex: insertAt, prevParentText: parentText });
+    buffer.pushUndoEntry({ kind: 'nested_insert', segId: newSeg.id, parentId: parentSeg.id, childIndex: insertAt, prevParentText: buffer.segmentText.get(parentSeg.id) || '' });
     buffer.invalidateVerify('insert');
 
     return {
@@ -1974,9 +2048,10 @@ function opMove(buffer, segAddress, anchor) {
     });
     buffer.invalidateVerify('move');
 
+    const parentAddr = String(segAddress).split('.').slice(0, -1).join('.');
     return {
-      moved: { id: seg.id, name: seg.name, from_position: fromChildIdx + 1, to_position: adjusted + 1, parent: parent.id },
-      total_segments: buffer.segments.length,
+      moved: { id: seg.id, name: seg.name, from: String(segAddress), to: `${parentAddr}.${adjusted + 1}`, parent: parentAddr },
+      note: 'Coordinates are for this buffer. Saving re-segments the file, so read again after saving to get the final coordinates.',
       dirty: buffer.isDirty(),
     };
   }
@@ -2038,8 +2113,8 @@ function opMove(buffer, segAddress, anchor) {
   buffer.invalidateVerify('move');
 
   return {
-    moved: { id: seg.id, name: seg.name, from_position: fromIdx + 1, to_position: adjustedDest + 1 },
-    total_segments: buffer.segments.length,
+    moved: { id: seg.id, name: seg.name, from: String(segAddress), to: String(adjustedDest + 1) },
+    note: 'Coordinates are for this buffer. Saving re-segments the file, so read again after saving to get the final coordinates.',
     dirty: buffer.isDirty(),
   };
 }
@@ -2051,42 +2126,65 @@ function opMove(buffer, segAddress, anchor) {
 // uncomment: strip a uniform line-comment prefix
 // Both routed through opReplace so they get a regular replace undo entry.
 
+// deactivate: switch code off. Each line gets "<marker> [off] " after its
+// indentation, so the code stays readable and activate removes exactly what
+// was added. A container is switched off as a whole (its own text is only its
+// opening line, so marking just that would break the code).
 function opCommentOut(buffer, address) {
   if (buffer.readonly) throw new Error('read buffer is not editable — edits go to the edit buffer (open the segment for edit first)');
   const seg = buffer.findSegment(address);
   if (!seg) return { error: `No segment at address "${address}"` };
+  if (seg.kind === 'whitespace' || seg.kind === 'gap') return { error: `Address "${address}" is a <gap> and cannot be deactivated.` };
+  if (seg.kind === 'deactivated') return { changed: false, message: 'This code is already deactivated.' };
+  if (seg.kind === 'comment_block') return { error: 'This is a comment, not code: there is nothing to deactivate.' };
   const marker = commentMarker(buffer.language);
-  if (!marker) return { error: `comment_out not supported for language: ${buffer.language}` };
-  const cur = buffer.segmentText.get(seg.id);
-  const wrapped = cur.split('\n').map(line => {
-    if (line.length === 0) return line;
-    return `${marker} ${line}`;
-  }).join('\n');
-  if (cur === wrapped) return { changed: false, message: 'segment already in commented form (or empty)' };
-  return opReplace(buffer, address, wrapped);
+  if (!marker) return { error: `deactivate is not supported for ${buffer.language} files (no line-comment syntax).` };
+  const fullText = (s) => ((s.children && s.children.length)
+    ? (buffer.segmentText.get(s.id) || '') + s.children.map(fullText).join('') + (buffer.parentSuffix.get(s.id) || '')
+    : (buffer.segmentText.get(s.id) || ''));
+  const cur = fullText(seg);
+  const off = `${marker} [off] `;
+  const wrapped = cur.split('\n').map((line) => (line.trim() ? line.replace(/^(\s*)/, `$1${off}`) : line)).join('\n');
+  if (cur === wrapped) return { changed: false, message: 'The segment is empty.' };
+  if (!(seg.children && seg.children.length)) return opReplace(buffer, address, wrapped);
+  // Container: it becomes one deactivated leaf holding its whole text.
+  const prevText = buffer.segmentText.get(seg.id);
+  for (const ch of allSegmentsFlat(seg.children)) buffer.segmentText.delete(ch.id);
+  delete seg.children;
+  buffer.parentSuffix.delete(seg.id);
+  buffer.segmentText.set(seg.id, wrapped);
+  buffer.pushUndoEntry({ kind: 'replace', segId: seg.id, prevText });
+  buffer.invalidateVerify('replace');
+  return { replaced: address, id: seg.id, bytes_before: cur.length, bytes_after: wrapped.length, dirty: buffer.isDirty() };
 }
 
+// activate: switch deactivated code back on. Only switched-off code qualifies
+// (lines carrying the [off] marker, or a segment the segmenter recognised as
+// deactivated code commented out by hand). A normal comment is refused, so
+// prose can never be turned into broken code.
 function opUncomment(buffer, address) {
   if (buffer.readonly) throw new Error('read buffer is not editable — edits go to the edit buffer (open the segment for edit first)');
   const seg = buffer.findSegment(address);
   if (!seg) return { error: `No segment at address "${address}"` };
   const marker = commentMarker(buffer.language);
-  if (!marker) return { error: `uncomment not supported for language: ${buffer.language}` };
-  const cur = buffer.segmentText.get(seg.id);
+  if (!marker) return { error: `activate is not supported for ${buffer.language} files (no line-comment syntax).` };
+  const cur = buffer.segmentText.get(seg.id) || '';
   const lines = cur.split('\n');
-  // Lenient detection: skip blank lines, require all non-blank to start with marker
-  // (after optional leading whitespace).
-  const markerEsc = marker.replace(/[.*+?^${}()|[\]\\]/g, '\$&');
-  const re = new RegExp(`^(\\s*)${markerEsc}\\s?`);
-  const hasMarker = (l) => l.length === 0 || re.test(l);
-  if (!lines.every(hasMarker)) {
-    return { error: `Segment is not uniformly commented with "${marker}". Inspect with read first.` };
+  const m = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const offRe = new RegExp(`^(\\s*)${m} \\[off\\] ?`);
+  const plainRe = new RegExp(`^(\\s*)${m} ?`);
+  const isBlank = (l) => !l.trim();
+  const allOff = lines.every((l) => isBlank(l) || offRe.test(l));
+  if (!allOff && seg.kind !== 'deactivated') {
+    return { error: 'This is a comment, not switched-off code: there is nothing to activate.' };
   }
-  const stripped = lines.map(l => {
-    if (l.length === 0) return l;
-    return l.replace(re, '$1');
-  }).join('\n');
-  if (cur === stripped) return { changed: false, message: 'segment had no comment markers to strip' };
+  if (!lines.every((l) => isBlank(l) || plainRe.test(l))) {
+    return { error: `Only code commented out with "${marker}" line comments can be activated.` };
+  }
+  // Remove exactly the [off] marker where it is present, otherwise the plain
+  // comment marker (code commented out by hand).
+  const stripped = lines.map((l) => (isBlank(l) ? l : (offRe.test(l) ? l.replace(offRe, '$1') : l.replace(plainRe, '$1')))).join('\n');
+  if (cur === stripped) return { changed: false, message: 'Nothing to activate.' };
   return opReplace(buffer, address, stripped);
 }
 
@@ -2100,9 +2198,15 @@ function applyInverse(buffer, entry) {
     return;
   }
   if (entry.kind === 'delete') {
-    const pos = Math.min(entry.position, buffer.segments.length);
-    buffer.segments.splice(pos, 0, entry.segment);
-    buffer.segmentText.set(entry.segId, entry.prevText);
+    // Re-insert the segment and the gap that was taken with it (if any) in
+    // ascending original index order, so both land exactly where they were.
+    const items = [{ index: entry.position, segment: entry.segment, id: entry.segId, text: entry.prevText }];
+    if (entry.removedGap) items.push({ index: entry.removedGap.index, segment: entry.removedGap.segment, id: entry.removedGap.segment.id, text: entry.removedGap.text });
+    items.sort((x, y) => x.index - y.index);
+    for (const it of items) {
+      buffer.segments.splice(Math.min(it.index, buffer.segments.length), 0, it.segment);
+      buffer.segmentText.set(it.id, it.text);
+    }
     if (entry.prevChildren) {
       for (const [id, text] of entry.prevChildren) buffer.segmentText.set(id, text);
     }
@@ -2136,13 +2240,18 @@ function applyInverse(buffer, entry) {
     return;
   }
   if (entry.kind === 'nested_delete') {
-    // Restore child into parent's children array
+    // Restore child (and the gap taken with it, if any) into the parent's
+    // children array, in ascending original index order.
     const parent = allSegmentsFlat(buffer.segments).find(s => s.id === entry.parentId);
     if (!parent) throw new Error(`undo nested_delete: parent ${entry.parentId} not found`);
     if (!parent.children) parent.children = [];
-    const pos = Math.min(entry.childIndex, parent.children.length);
-    parent.children.splice(pos, 0, entry.segment);
-    buffer.segmentText.set(entry.segId, entry.prevText);
+    const items = [{ index: entry.childIndex, segment: entry.segment, id: entry.segId, text: entry.prevText }];
+    if (entry.removedGap) items.push({ index: entry.removedGap.index, segment: entry.removedGap.segment, id: entry.removedGap.segment.id, text: entry.removedGap.text });
+    items.sort((x, y) => x.index - y.index);
+    for (const it of items) {
+      parent.children.splice(Math.min(it.index, parent.children.length), 0, it.segment);
+      buffer.segmentText.set(it.id, it.text);
+    }
     buffer.segmentText.set(entry.parentId, entry.prevParentText);
     return;
   }
@@ -2269,8 +2378,27 @@ function opDiff(buffer) {
       lines.push(`  + ${cur.slice(0, 200)}${cur.length > 200 ? '...' : ''}`);
     }
   }
+  // Moves change order, not text, so the comparison above cannot see them.
+  // Report each pending move from the edit history (position = index among
+  // the parent's children, gaps included, as used in coordinates).
+  const flat = allSegmentsFlat(buffer.segments);
+  for (const e of (buffer.editStack || [])) {
+    if (e.kind !== 'move' && e.kind !== 'nested_move') continue;
+    const seg = flat.find((s) => s.id === e.segId);
+    if (!seg) continue;
+    let from, to;
+    if (e.kind === 'nested_move') {
+      const parent = flat.find((s) => s.id === e.parentId);
+      from = e.prevChildIndex + 1;
+      to = parent && parent.children ? parent.children.indexOf(seg) + 1 : '?';
+    } else {
+      from = e.prevPosition + 1;
+      to = buffer.segments.indexOf(seg) + 1;
+    }
+    lines.push(`~ MOVED segment ${seg.id} (${seg.name}): position ${from} → ${to}`);
+  }
   // Detect deleted segments (original IDs missing from current segments)
-  const liveIds = new Set(allSegmentsFlat(buffer.segments).map(s => s.id));
+  const liveIds = new Set(flat.map(s => s.id));
   for (const [id, origText] of buffer.originalText) {
     if (origText === '') continue;
     if (!liveIds.has(id)) {
@@ -2446,24 +2574,65 @@ async function opCommit(buffer) {
   // L3 failure never blocks the save (a new project's first files import
   // files that don't exist yet) — but it is reported, with the call that
   // lists exactly what is still unresolved.
-  const l3Issues = l3msgs.filter(m => !/^L[12]\b/.test(m) && !/OK\b|resolve correctly|no DB references/.test(m)
-    && !/^Note: file CAN still be committed/.test(m));
+  //
+  // L3 results come in two kinds. Real problems the caller should fix: a local
+  // import that leads nowhere, SQL that does not match a known schema. And
+  // items that simply could not be checked here: external packages that are
+  // not installed in this environment, or SQL whose database is chosen at
+  // runtime. Only the first kind is presented as something to fix; the second
+  // is summarised under not_checked, worded as information.
+  const splitL3 = (msgs) => {
+    const issues = [];
+    let externalNotInstalled = 0, dbUnknown = 0;
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i];
+      const imp = m.match(/^L3 import resolution: \d+ import\(s\) lead nowhere: ([\s\S]*)$/);
+      if (imp) {
+        const items = imp[1].split(/, (?=')/);
+        const local = items.filter((it) => /^'[./]/.test(it) || !/not installed/.test(it));
+        externalNotInstalled += items.length - local.length;
+        if (local.length) issues.push(`L3 import resolution: ${local.length} local import(s) lead nowhere: ${local.join(', ')}`);
+        continue;
+      }
+      if (/^L3 \w+ check: \d+ of \d+ failed verification:?$/.test(m)) continue;   // header; the details follow
+      if (/no database inferred|database file does not exist at dynamic:/.test(m)) {
+        dbUnknown += 1;
+        if (/^\s+SQL:/.test(msgs[i + 1] || '')) i += 1;   // its SQL line goes with it
+        continue;
+      }
+      issues.push(m);
+    }
+    const unchecked = [];
+    if (externalNotInstalled) unchecked.push(`${externalNotInstalled} external package import(s) are not installed in this environment, so they could not be resolved here. No action needed.`);
+    if (dbUnknown) unchecked.push(`${dbUnknown} SQL quer${dbUnknown === 1 ? 'y targets a database' : 'ies target databases'} chosen at runtime, so the schema could not be checked. No action needed.`);
+    return { issues, unchecked };
+  };
+  const { issues: l3Issues, unchecked: l3Unchecked } = splitL3(l3msgs.filter(m => !/^L[12]\b/.test(m) && !/OK\b|resolve correctly|no DB references/.test(m)
+    && !/^Note: file CAN still be committed/.test(m)));
   const check = _l1Ceiling
     ? 'pass L1 (plain text: syntax only)'
-    : (verifiedLevel >= 3 ? 'pass L3' : 'saved — L3 incomplete');
+    : (verifiedLevel >= 3 ? 'pass L3'
+      : (l3Issues.length ? 'saved — L3 incomplete' : 'saved — passed every check that could run here'));
+  // Only real problems are listed as incomplete; items that could not be
+  // checked here go under not_checked, and the status hint only asks for a fix
+  // when there is something to fix.
+  const statusUpdate = (projectStatusUpdate && projectStatusUpdate.status === 'unverified' && !l3Issues.length)
+    ? { ...projectStatusUpdate, hint: 'Saved. Some items could not be checked in this environment (see not_checked); nothing needs fixing.' }
+    : projectStatusUpdate;
   return {
     committed: true,
     check,
-    ...(verifiedLevel < 3 && !_l1Ceiling ? {
-      incomplete: l3Issues.length ? l3Issues : ['level 3 did not pass'],
+    ...(verifiedLevel < 3 && !_l1Ceiling && l3Issues.length ? {
+      incomplete: l3Issues,
       see_what_is_missing: `read_file(path="${buffer.path}", trace=true)`,
     } : {}),
+    ...(l3Unchecked.length ? { not_checked: l3Unchecked } : {}),
     path: buffer.path,
     bytes_written: finalText.length,
     edits_applied: editsApplied,
     verified_at_level: verifiedLevel,
     ...(storageResult && storageResult.stored ? { stored_version: storageResult.version_number ?? null } : {}),
-    ...(projectStatusUpdate ? { project_status_update: projectStatusUpdate } : {}),
+    ...(statusUpdate ? { project_status_update: statusUpdate } : {}),
   };
 }
 
@@ -2587,17 +2756,13 @@ function clearReadMarks(path) {
   _readMarks.delete(path);
 }
 
-// A target address is covered if it was displayed directly, or if any marked
-// ancestor displayed it (reading a container shows all its children's code).
+// A target address is covered only if it was displayed directly. Reading a
+// container shows its opening line(s) and a child map, never the children's
+// code, so a read parent does NOT unlock its children: each must be read itself.
 function isRead(path, address) {
   const set = _readMarks.get(path);
   if (!set) return false;
-  const a = String(address).trim();
-  if (set.has(a)) return true;
-  for (const m of set) {
-    if (a.startsWith(m + '.')) return true;
-  }
-  return false;
+  return set.has(String(address).trim());
 }
 
 // Build the rejection: show the code the caller was about to modify, so a
@@ -2611,6 +2776,187 @@ function unreadTargetError(buffer, address, verb) {
     error: `unread target: segment ${address} has not been displayed in the current buffer state — read it first (segment: "${address}"), then ${verb}`,
     target: seg ? { address: String(address), id: seg.id, kind: seg.kind, name: seg.name, preview } : { address: String(address), exists: false },
   };
+}
+
+// ============================================================================
+// VALIDATION QUEUE
+// ============================================================================
+// Levels, stored in files.verified_at_level (the single source of truth):
+//   1 = not validated yet, or failed syntax / native compiler check (the reason
+//       is stored); a fresh write_file file starts here
+//   2 = passed L1 + L2 (syntax, native compiler / checker, config checker)
+//   3 = level 2 and its project links resolve (no real L3 problems; packages
+//       that are not installed here and SQL against a database chosen at
+//       runtime count as "not checked", not as problems)
+// A scan links the files; this queue then validates every code file that has
+// no level yet, ONE file at a time, smallest first, with the same checks a
+// save runs, and stores the result in the architect so trace and the maps read
+// it instead of checking again. No memory cap yet: per-file time is stored in
+// file_checks so the cost (C compiles especially) can be measured and tuned.
+// Per sandbox (key: lib/work_pool.js workKey): its validation queue is running,
+// and a new run was asked for while it ran (picked up before it stops).
+const _validationRunning = new Set();
+const _validationAgain = new Set();
+// Lets the large-file indexer wait, so a sandbox never runs two heavy jobs at
+// once. Per sandbox: the key of the current call unless one is given.
+export function isValidationRunning(key) {
+  return _validationRunning.has(key || globalThis.__sandboxCtx?.getStore?.()?.slotDir || process.env.MASTER_ARCHITECT_DB || 'default');
+}
+
+function ensureFileChecks(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS file_checks (
+    abs_path    TEXT PRIMARY KEY,
+    level       INTEGER NOT NULL,
+    problems    TEXT,
+    not_checked TEXT,
+    ms          INTEGER,
+    checked_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+}
+
+// Split L3 messages into real problems and items that could not be checked here.
+function splitL3Messages(msgs) {
+  const issues = [];
+  let externalNotInstalled = 0, dbUnknown = 0;
+  const list = (msgs || []).filter((m) => !/^L[12]\b/.test(m) && !/OK\b|resolve correctly|no DB references/.test(m)
+    && !/^Note: file CAN still be committed/.test(m));
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    const imp = m.match(/^L3 import resolution: \d+ import\(s\) lead nowhere: ([\s\S]*)$/);
+    if (imp) {
+      const items = imp[1].split(/, (?=')/);
+      const local = items.filter((it) => /^'[./]/.test(it) || !/not installed/.test(it));
+      externalNotInstalled += items.length - local.length;
+      if (local.length) issues.push(`L3 import resolution: ${local.length} local import(s) lead nowhere: ${local.join(', ')}`);
+      continue;
+    }
+    if (/^L3 \w+ check: \d+ of \d+ failed verification:?$/.test(m)) continue;
+    if (/no database inferred|database file does not exist at dynamic:/.test(m)) {
+      dbUnknown += 1;
+      if (/^\s+SQL:/.test(list[i + 1] || '')) i += 1;
+      continue;
+    }
+    issues.push(m);
+  }
+  const unchecked = [];
+  if (externalNotInstalled) unchecked.push(`${externalNotInstalled} external package import(s) not installed here`);
+  if (dbUnknown) unchecked.push(`${dbUnknown} SQL quer${dbUnknown === 1 ? 'y' : 'ies'} against a database chosen at runtime`);
+  return { issues, unchecked };
+}
+
+function recordFileLevel(db, absPath, level, problems, unchecked, ms) {
+  if (level > 0) {
+    db.prepare(`UPDATE files SET verified_at_level = ?, verification_status = ?, verified_at = datetime('now')
+                WHERE abs_path = ?`).run(level, level >= 2 ? 'verified' : 'unverified', absPath);
+  }
+  db.prepare(`INSERT INTO file_checks (abs_path, level, problems, not_checked, ms) VALUES (?, ?, ?, ?, ?)
+              ON CONFLICT(abs_path) DO UPDATE SET level = excluded.level, problems = excluded.problems,
+                not_checked = excluded.not_checked, ms = excluded.ms, checked_at = datetime('now')`)
+    .run(absPath, level, problems.length ? JSON.stringify(problems) : null,
+         unchecked.length ? JSON.stringify(unchecked) : null, ms);
+}
+
+// The checks of ONE file (L1 -> L2 -> L3), exactly as a save runs them. Called
+// inside a validation child process (validate_child.js), never in the server.
+// Returns { level, problems, unchecked }.
+export async function validateOneFile(absPath, lang) {
+  let level = 1, problems = [], unchecked = [];
+  if (!lang) return { level: 0, problems, unchecked };
+  try {
+    const content = await fs.readFile(absPath, 'utf8');
+    const l2 = await verifyL2(absPath, content, lang);
+    if (!l2.ok) {
+      problems = (l2.messages || []).filter((m) => !/: OK\b|no linter configured|no native check/.test(m)).slice(0, 3);
+    } else {
+      level = 2;
+      const l3 = await verifyL3(absPath, content, lang);
+      const split = splitL3Messages(l3.messages);
+      unchecked = split.unchecked;
+      if (l3.ok || split.issues.length === 0) level = 3;
+      else problems = split.issues.slice(0, 5);
+    }
+  } catch (e) {
+    problems = [`check failed: ${e.message}`];
+  }
+  return { level, problems, unchecked };
+}
+
+// Runs validateOneFile in its own short-lived process: whatever the checks
+// allocate (tree-sitter trees are native memory the server would otherwise
+// keep) goes back to the operating system when it exits. The server only
+// keeps the small result.
+function validateInChild(absPath, lang, architectDb) {
+  return new Promise(async (resolve) => {
+    const { execFile } = await import('node:child_process');
+    const childScript = path.join(_READ_FILE_DIR, 'validate_child.js');
+    execFile(process.execPath, ['--expose-gc', childScript, absPath, lang],
+      {
+        env: { ...process.env, MASTER_ARCHITECT_DB: architectDb, VALIDATE_CHILD: '1' },
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: 60 * 60 * 1000,
+      },
+      (err, stdout) => {
+        const line = String(stdout || '').trim().split('\n').pop();
+        try { return resolve(JSON.parse(line)); } catch { /* no usable result */ }
+        const why = err
+          ? (err.killed || err.signal ? `the check process was stopped (${err.signal || 'time limit'})` : String(err.message).split('\n')[0])
+          : 'the check returned no result';
+        resolve({ level: 1, problems: [`check failed: ${why}`], unchecked: [] });
+      });
+  });
+}
+
+export async function runValidationQueue() {
+  // One queue per sandbox; each file takes a permit from the shared pool
+  // (lib/work_pool.js: at most WORK_POOL_SIZE heavy jobs server-wide, never
+  // two at once in one sandbox). A call while this sandbox's queue runs is
+  // remembered and picked up before the queue stops, so no file is missed.
+  const { withWorker, workKey } = await import('./lib/work_pool.js');
+  const key = workKey();
+  if (_validationRunning.has(key)) { _validationAgain.add(key); return; }
+  _validationRunning.add(key);
+  // Sandbox: tell the watchdog this slot has work running, so it is not
+  // expired as idle while files are being checked.
+  const busySlot = globalThis.__sandboxCtx?.getStore?.()?.slotDir || null;
+  globalThis.__sandboxBusy?.begin(busySlot);
+  try {
+    const { getDb, dbPath } = await import('./lib/db.js');
+    const db = getDb();
+    const architectDb = globalThis.__sandboxCtx?.getStore?.()?.architectDb || dbPath();
+    ensureFileChecks(db);
+    const hasLargeQueue = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'large_index_queue'").get();
+    const nextJob = db.prepare(`SELECT f.abs_path FROM files f
+      WHERE f.category = 'supported' AND f.present_on_disk = 1 AND f.verified_at_level IS NULL
+        AND f.abs_path NOT IN (SELECT abs_path FROM file_checks)
+        ${hasLargeQueue ? "AND f.abs_path NOT IN (SELECT abs_path FROM large_index_queue WHERE status IN ('queued', 'indexing'))" : ''}
+      ORDER BY f.byte_size, f.abs_path LIMIT 1`);
+    for (;;) {
+      _validationAgain.delete(key);
+      const job = nextJob.get();
+      if (!job) {
+        if (_validationAgain.has(key)) continue;   // asked again meanwhile: look once more
+        break;
+      }
+      const t0 = Date.now();
+      const lang = detectLanguage(job.abs_path);
+      const r = lang
+        ? await withWorker(key, () => validateInChild(job.abs_path, lang, architectDb))
+        : { level: 0, problems: [], unchecked: [] };
+      try {
+        recordFileLevel(db, job.abs_path, r.level ?? 1, r.problems || [], r.unchecked || [], Date.now() - t0);
+      } catch (e) {
+        console.error(`[validate] could not store the result for ${job.abs_path}: ${e.message}`);
+        break;   // never loop on the same file
+      }
+      await new Promise((res) => setTimeout(res, 20));
+    }
+  } catch (e) {
+    console.error(`[validate] ${e.message}`);
+  } finally {
+    globalThis.__sandboxBusy?.end(busySlot);
+    _validationRunning.delete(key);
+    _validationAgain.delete(key);
+  }
 }
 // =============================================================================
 // MCP TOOL EXPORT

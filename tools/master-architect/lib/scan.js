@@ -24,7 +24,7 @@ import {
   detectLanguage, isIgnoredDir, isIgnoredFile, getParser, isVenvInternal, venvRootFor, sandboxCeiling,
 } from './registry.js';
 import { getDb, estimateTokens, initialVerificationStatus, PARSER_VERSION } from './db.js';
-import { parseTree } from './segmenter.js';
+import { parseTree, parseTreeAsync } from './segmenter.js';
 import { parseWithRootNode as jsParseWithRootNode } from './parsers/javascript.js';
 import { parseWithRootNode as pyParseWithRootNode } from './parsers/python.js';
 import { parseWithRootNode as goParseWithRootNode } from './parsers/go.js';
@@ -369,7 +369,7 @@ export async function analyzeContent(absPath, content) {
   const sharedFn = SHARED_PARSERS[det.language];
   let analysis;
   if (sharedFn) {
-    const { rootNode } = parseTree(content, det.language, absPath);   // absPath: dialect grammar (.cu .metal .m ...)
+    const { rootNode } = await parseTreeAsync(content, det.language, absPath);   // absPath: dialect grammar (.cu .metal .m ...)
     analysis = sharedFn(rootNode, content);
   } else {
     analysis = parser.parseFile(content);
@@ -490,6 +490,16 @@ function letterFor(n) {
 // ─── File-level helpers ──────────────────────────────────────────────────
 
 function readSafe(filePath) {
+  // A supported (parseable) file above LARGE_FILE_BYTES is never loaded whole:
+  // it is queued for the step-wise indexer (see LARGE FILE INDEXER) and the
+  // caller gets "no content", so the scan files its row without parsing it.
+  try {
+    const size = fs.statSync(filePath).size;
+    if (size > LARGE_FILE_BYTES && detectLanguage(filePath).kind === 'supported') {
+      enqueueLargeFile(filePath, size);
+      return null;
+    }
+  } catch { /* fall through to the normal read */ }
   try { return fs.readFileSync(filePath, 'utf8'); } catch { return null; }
 }
 function statSafe(filePath) {
@@ -570,6 +580,25 @@ function uniqueProjectName(db, desired, excludeId = null) {
     if (!taken(candidate)) return candidate;
   }
 }
+
+// Parse memory between files. node-tree-sitter frees a discarded tree only
+// after control returns to the event loop, and V8 does not count that native
+// memory, so a scan loop that never yields keeps every file's tree alive
+// (llama.cpp, 2762 files: 5.3 GB). Before each file: one event-loop turn, and
+// a collection whenever the process has grown by GC_STEP_BYTES since the last.
+const GC_STEP_BYTES = 256 * 1024 * 1024;
+let _rssAtLastGc = 0;
+const _turn = () => new Promise((resolve) => setImmediate(resolve));
+export async function releaseParseMemory() {
+  if (typeof global.gc === 'function' && process.memoryUsage.rss() - _rssAtLastGc > GC_STEP_BYTES) {
+    global.gc();
+    await _turn();          // deferred tree finalizers run here
+    global.gc();
+    _rssAtLastGc = process.memoryUsage.rss();
+  }
+  await _turn();
+}
+
 
 
 export async function scanProject(rootPath, projectName, opts = {}) {
@@ -779,6 +808,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
     const pendingResolution = new Map();   // fileId → { imports: [...], databases: [...], parserName, fromAbsFile }
 
     for (const f of files) {
+      await releaseParseMemory();   // free the previous file's tree (see releaseParseMemory)
       summary.files_total += 1;
       const cls = classifyForDb(f.detection);
       if (!cls) { summary.files_skipped += 1; continue; }
@@ -869,7 +899,7 @@ export async function scanProject(rootPath, projectName, opts = {}) {
           let analysis;
           const sharedFn = SHARED_PARSERS[f.detection.language];
           if (sharedFn) {
-            const { rootNode } = parseTree(content, f.detection.language, f.absPath);   // dialect grammar by extension
+            const { rootNode } = await parseTreeAsync(content, f.detection.language, f.absPath);   // dialect grammar by extension; async: masking tries freed between re-parses
             analysis = sharedFn(rootNode, content);
           } else {
             analysis = parser.parseFile(content);
@@ -1099,3 +1129,260 @@ export async function scanProject(rootPath, projectName, opts = {}) {
     releaseScanLock(userId);
   }
 }
+// ============================================================================
+// LARGE FILE INDEXER
+// ============================================================================
+// Supported files above LARGE_FILE_BYTES are never loaded whole during a scan:
+// readSafe queues them and returns null, so the scan still files their row and
+// coordinate but does not parse them. All small files are therefore done first.
+// One background worker (server-wide, ONE file at a time, smallest first, only
+// while no scan is running) then streams each queued file in windows of about
+// WINDOW_LINES lines: parse the window, write its segments to the DB, drop it,
+// force a GC, pause, next window. Memory stays at one window. Lines that no
+// declaration covers (e.g. the inside of a giant data table) are stored as
+// "lines a-b" block segments, so every line of the file ends up in a segment.
+// Progress lives in the DB; a restart resumes the queue (a file that was
+// mid-way starts again from its first line).
+const LARGE_FILE_BYTES = 1024 * 1024;
+const WINDOW_LINES = 2000;
+const WINDOW_MAX_LINES = 3000;
+const WINDOW_PAUSE_MS = 50;
+const _indexerRunning = new Set();   // per sandbox (lib/work_pool.js workKey)
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A scan is running in this sandbox (scan locks are keyed "<slot folder>|user"
+// in the sandbox, see lockKey); outside the sandbox: any scan.
+const _scanRunningHere = () => {
+  const slot = globalThis.__sandboxCtx?.getStore?.()?.slotDir;
+  if (!slot) return _activeScans.size > 0;
+  for (const k of _activeScans.keys()) if (String(k).startsWith(`${slot}|`)) return true;
+  return false;
+};
+
+function ensureLargeQueue(db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS large_index_queue (
+    abs_path   TEXT PRIMARY KEY,
+    byte_size  INTEGER NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'queued',
+    step       INTEGER NOT NULL DEFAULT 0,
+    steps      INTEGER,
+    error      TEXT,
+    queued_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+}
+
+function enqueueLargeFile(absPath, byteSize) {
+  try {
+    const db = getDb();
+    ensureLargeQueue(db);
+    db.prepare(`INSERT INTO large_index_queue (abs_path, byte_size, status, step, steps, error)
+                VALUES (?, ?, 'queued', 0, NULL, NULL)
+                ON CONFLICT(abs_path) DO UPDATE SET byte_size = excluded.byte_size, status = 'queued',
+                  step = 0, steps = NULL, error = NULL, updated_at = datetime('now')`)
+      .run(absPath, byteSize);
+  } catch (e) {
+    console.error(`[large-index] enqueue failed for ${absPath}: ${e.message}`);
+  }
+  setTimeout(() => { drainLargeQueue().catch((e) => console.error(`[large-index] ${e.message}`)); }, 1000).unref();
+}
+
+// Status for read_file: null when the file can be opened normally, otherwise
+// { status, message } saying it is queued, being indexed, or failed to index.
+export function largeFileStatus(absPath) {
+  try {
+    const db = getDb();
+    ensureLargeQueue(db);
+    const row = db.prepare('SELECT abs_path, byte_size, status, step, steps, error FROM large_index_queue WHERE abs_path = ?').get(absPath);
+    if (!row || row.status === 'done') return null;
+    const mb = (row.byte_size / 1048576).toFixed(1);
+    if (row.status === 'indexing') {
+      const of = row.steps ? ` of about ${row.steps}` : '';
+      return { status: 'indexing', message: `This file (${mb} MB) is being indexed in steps (step ${row.step}${of}). Large files are indexed one at a time to keep memory low; try again later.` };
+    }
+    if (row.status === 'error') {
+      return { status: 'index_error', message: `This file (${mb} MB) could not be indexed: ${row.error}. It is not opened, to protect the server's memory.` };
+    }
+    const ahead = db.prepare(`SELECT COUNT(*) AS n FROM large_index_queue
+      WHERE status = 'indexing' OR (status = 'queued' AND (byte_size < ? OR (byte_size = ? AND abs_path < ?)))`)
+      .get(row.byte_size, row.byte_size, row.abs_path).n;
+    return { status: 'queued', message: `This file (${mb} MB) is queued for indexing (position ${ahead + 1}). Large files are indexed one at a time, after all small files; try again later.` };
+  } catch {
+    return null;
+  }
+}
+
+async function drainLargeQueue() {
+  // One indexer per sandbox; indexing a large file takes a permit from the
+  // shared pool (lib/work_pool.js), the same one validation uses, so a sandbox
+  // never runs two heavy jobs at once and the server never more than the pool.
+  const { withWorker, workKey } = await import('./work_pool.js');
+  const key = workKey();
+  if (_indexerRunning.has(key)) return;
+  _indexerRunning.add(key);
+  // Sandbox: tell the watchdog this slot has work running (also while the
+  // indexer waits for the validation queue), so it is not expired as idle.
+  const busySlot = globalThis.__sandboxCtx?.getStore?.()?.slotDir || null;
+  globalThis.__sandboxBusy?.begin(busySlot);
+  // The validation queue (lives in read_file.js, loaded lazily to avoid a
+  // circular import) validates this sandbox's small files first; each large
+  // file is indexed only while that queue is idle, and validated right after.
+  const validator = async () => { try { return await import('../read_file.js'); } catch { return null; } };
+  try {
+    const db = getDb();
+    ensureLargeQueue(db);
+    await _sleep(3000);   // let a just-finished scan start its validation first
+    for (;;) {
+      if (_scanRunningHere()) { await _sleep(2000); continue; }
+      const v = await validator();
+      if (v && typeof v.isValidationRunning === 'function' && v.isValidationRunning(key)) { await _sleep(2000); continue; }
+      const job = db.prepare("SELECT abs_path, byte_size FROM large_index_queue WHERE status = 'queued' ORDER BY byte_size, abs_path LIMIT 1").get();
+      if (!job) break;
+      try {
+        await withWorker(key, () => indexLargeFile(db, job.abs_path, job.byte_size));
+        db.prepare("UPDATE large_index_queue SET status = 'done', updated_at = datetime('now') WHERE abs_path = ?").run(job.abs_path);
+        if (v && typeof v.runValidationQueue === 'function') await v.runValidationQueue();   // validate it now
+      } catch (e) {
+        if (e && e.requeued) continue;   // a rescan re-queued it mid-way: pick it up again later
+        console.error(`[large-index] ${job.abs_path}: ${e.message}`);
+        db.prepare("UPDATE large_index_queue SET status = 'error', error = ?, updated_at = datetime('now') WHERE abs_path = ?").run(String(e.message || e), job.abs_path);
+      }
+    }
+  } finally {
+    globalThis.__sandboxBusy?.end(busySlot);
+    _indexerRunning.delete(key);
+  }
+}
+
+async function indexLargeFile(db, absPath, byteSize) {
+  const fileRow = db.prepare('SELECT id, project_id, address FROM files WHERE abs_path = ?').get(absPath);
+  if (!fileRow) throw new Error('the file is not registered in any project (rescan the project)');
+  if (!fs.existsSync(absPath)) throw new Error('the file no longer exists');
+  const det = detectLanguage(absPath);
+  const parser = det && det.kind === 'supported' ? await getParser(det.language, det.parserFile) : null;
+  if (!parser) throw new Error(`no parser available for ${det?.language || 'this file type'}`);
+  const shared = SHARED_PARSERS[det.language];
+  const { createInterface } = await import('node:readline');
+
+  const setStep = db.prepare("UPDATE large_index_queue SET step = ?, steps = ?, updated_at = datetime('now') WHERE abs_path = ?");
+  const getQStatus = db.prepare('SELECT status FROM large_index_queue WHERE abs_path = ?');
+  db.prepare("UPDATE large_index_queue SET status = 'indexing', step = 0, steps = NULL, error = NULL, updated_at = datetime('now') WHERE abs_path = ?").run(absPath);
+
+  // Rebuild this file's structure from scratch.
+  db.prepare('DELETE FROM modules WHERE file_id = ?').run(fileRow.id);
+  db.prepare('DELETE FROM imports WHERE file_id = ?').run(fileRow.id);
+  db.prepare("UPDATE files SET parse_status = 'pending' WHERE id = ?").run(fileRow.id);
+
+  const insertModule = db.prepare('INSERT INTO modules (file_id, address, name, kind, line_start, line_end) VALUES (?, ?, ?, ?, ?, ?)');
+  const insertMethod = db.prepare('INSERT INTO methods (module_id, address, name, kind, line_start, line_end) VALUES (?, ?, ?, ?, ?, ?)');
+  const hash = createHash('sha256');
+  const imports = [];
+  let modCount = 0, lineNo = 0, step = 0, steps = null;
+
+  const addModule = (name, kind, start, end, methods) => {
+    modCount += 1;
+    const addr = `${fileRow.address}.${modCount}`;
+    const mid = insertModule.run(fileRow.id, addr, name, kind, start, end).lastInsertRowid;
+    (methods || []).forEach((m, i) => insertMethod.run(mid, `${addr}.${i + 1}`, m.name, m.kind, m.line_start, m.line_end));
+  };
+
+  const flush = async (lines, startLine, bytes) => {
+    if (!lines.length) return;
+    // A scan holds the memory budget: wait until it has finished.
+    while (_scanRunningHere()) await _sleep(1000);
+    if (getQStatus.get(absPath)?.status !== 'indexing') { const e = new Error('re-queued'); e.requeued = true; throw e; }
+    let text = lines.join('\n');
+    const off = startLine - 1;
+    let analysis = null;
+    try {
+      if (shared) { const { rootNode } = await parseTreeAsync(text, det.language, absPath); analysis = shared(rootNode, text); }
+      else analysis = parser.parseFile(text);
+    } catch { analysis = null; }
+    const mods = (analysis && !analysis.parse_error && Array.isArray(analysis.modules) ? analysis.modules : [])
+      .filter((m) => Number.isFinite(m.line_start))
+      .sort((a, b) => a.line_start - b.line_start);
+    // Write declarations in line order; any uncovered non-blank lines between
+    // them become a block segment, so nothing in the window is left out.
+    const addBlock = (a, b) => {
+      if (b < a || !lines.slice(a - 1, b).some((l) => l.trim())) return;
+      addModule(`lines ${a + off}-${b + off}`, 'block', a + off, b + off, null);
+    };
+    let cursor = 1;
+    for (const mod of mods) {
+      const s = Math.max(mod.line_start, 1), e = Math.max(mod.line_end ?? s, s);
+      if (s > cursor) addBlock(cursor, s - 1);
+      addModule(mod.name, mod.kind, s + off, e + off,
+        (mod.methods || []).map((m) => ({ name: m.name, kind: m.kind, line_start: (m.line_start ?? s) + off, line_end: (m.line_end ?? m.line_start ?? s) + off })));
+      cursor = Math.max(cursor, e + 1);
+    }
+    if (cursor <= lines.length) addBlock(cursor, lines.length);
+    for (const imp of (analysis && analysis.imports) || []) {
+      imports.push({ import_path: imp.import_path, line: imp.line != null ? imp.line + off : null });
+    }
+    text = null; analysis = null;
+    step += 1;
+    if (steps === null) steps = Math.max(1, Math.ceil(byteSize / Math.max(bytes, 1)));
+    setStep.run(step, Math.max(steps, step), absPath);
+    if (typeof global.gc === 'function') global.gc();
+    await _sleep(WINDOW_PAUSE_MS);
+  };
+
+  const rl = createInterface({ input: fs.createReadStream(absPath, { encoding: 'utf8' }), crlfDelay: Infinity });
+  let buf = [], startLine = 1, bytes = 0;
+  try {
+    for await (const line of rl) {
+      lineNo += 1;
+      hash.update(line + '\n');
+      buf.push(line);
+      bytes += line.length + 1;
+      // Cut at a top-level-looking boundary once the window is big enough.
+      if (buf.length >= WINDOW_MAX_LINES ||
+          (buf.length >= WINDOW_LINES && (/^\s*$/.test(line) || /^[}\])][;,]?\s*$/.test(line)))) {
+        await flush(buf, startLine, bytes);
+        startLine += buf.length;
+        buf = []; bytes = 0;
+      }
+    }
+    await flush(buf, startLine, bytes);
+    buf = [];
+  } finally {
+    rl.close();
+  }
+
+  // Imports: same resolution rules as the scan's second pass.
+  const root = db.prepare('SELECT root_path FROM projects WHERE id = ?').get(fileRow.project_id)?.root_path || path.dirname(absPath);
+  const insertImport = db.prepare('INSERT INTO imports (file_id, import_path, resolved_file_id, is_external, line, edge_kind) VALUES (?, ?, ?, ?, ?, ?)');
+  const fileByPath = db.prepare('SELECT id FROM files WHERE abs_path = ? LIMIT 1');
+  for (const imp of imports) {
+    if (!imp.import_path) continue;
+    const looksLocal = imp.import_path.startsWith('.') || imp.import_path.startsWith('/');
+    let resolvedId = null;
+    try {
+      const rp = parser.resolveImport ? parser.resolveImport(imp.import_path, absPath, fs, path, root) : null;
+      if (rp) resolvedId = fileByPath.get(rp)?.id ?? null;
+    } catch { /* unresolved */ }
+    let local = looksLocal || !!resolvedId;
+    if (!local && parser.isLocalModule) { try { local = !!parser.isLocalModule(imp.import_path, absPath, fs, path, root); } catch { /* external */ } }
+    insertImport.run(fileRow.id, imp.import_path, resolvedId, local ? 0 : 1, imp.line ?? null, 'import');
+  }
+
+  db.prepare("UPDATE files SET parse_status = 'parsed', line_count = ?, content_hash = ?, parser_version = ? WHERE id = ?")
+    .run(lineNo, hash.digest('hex'), PARSER_VERSION, fileRow.id);
+  if (typeof global.gc === 'function') global.gc();
+}
+
+// On server start: resume whatever was queued, restarting any file that was
+// mid-way when the server stopped. Never inside a validation child process
+// (validate_child.js loads this module only to run the checks of one file).
+if (!process.env.VALIDATE_CHILD) {
+  setTimeout(() => {
+    try {
+      const db = getDb();
+      ensureLargeQueue(db);
+      db.prepare("UPDATE large_index_queue SET status = 'queued', step = 0 WHERE status = 'indexing'").run();
+      drainLargeQueue().catch((e) => console.error(`[large-index] ${e.message}`));
+    } catch (e) {
+      console.error(`[large-index] resume failed: ${e.message}`);
+    }
+  }, 5000).unref();
+}
+

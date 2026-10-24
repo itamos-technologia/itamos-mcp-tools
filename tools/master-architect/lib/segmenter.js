@@ -35,7 +35,7 @@ import Swift from 'tree-sitter-swift';
 import Kotlin from 'tree-sitter-kotlin';
 import { detectConfigFlavor, segmentConfig } from './config_segmenter.js';
 import { grammarParser } from './dialect_grammars.js';
-import { parseCFamily } from './macro_mask.js';
+import { parseCFamily, parseCFamilyAsync } from './macro_mask.js';
 const C_FAMILY_LANGS = new Set(['c', 'cpp']);   // .c .h .cpp .hpp .cu .cuh .hip .metal .m .mm
 
 const TypeScript = TypeScriptModule.typescript;
@@ -372,7 +372,7 @@ function extractName(node) {
     }
   }
   if (t === 'doctype') return '<!DOCTYPE>';
-  if (t === 'comment') return '(comment)';
+  if (t === 'comment') return commentTitle([node]);
   if (t === 'text') {
     const txt = node.text.trim();
     if (!txt) return '(blank)';
@@ -532,22 +532,34 @@ function walkSegments(rootNode, source) {
 
   function flushPendingAsCommentBlock() {
     if (pending.length === 0) return;
-    const firstC = pending[0];
-    const lastC = pending[pending.length - 1];
-    if (cursor < firstC.startIndex) {
-      emitGap(cursor, firstC.startIndex);
-      cursor = firstC.startIndex;
+    // Split the comments into runs of prose, code switched off by the tool and
+    // code commented out by hand; each run becomes its own segment (kind
+    // 'comment_block' or 'deactivated').
+    const flags = classifyComments(pending);
+    const key = (k) => deactivationKey(pending[k], flags[k]);
+    let start = 0;
+    while (start < pending.length) {
+      let end = start + 1;
+      while (end < pending.length && key(end) === key(start)) end++;
+      const run = pending.slice(start, end);
+      const firstC = run[0];
+      const lastC = run[run.length - 1];
+      if (cursor < firstC.startIndex) {
+        emitGap(cursor, firstC.startIndex);
+        cursor = firstC.startIndex;
+      }
+      out.push({
+        id: freshId(),
+        kind: flags[start] ? 'deactivated' : 'comment_block',
+        name: flags[start] ? offTitle(run) : commentTitle(run),
+        startByte: firstC.startIndex,
+        endByte: lastC.endIndex,
+        startLine: firstC.startPosition.row + 1,
+        endLine: lastC.endPosition.row + 1,
+      });
+      cursor = lastC.endIndex;
+      start = end;
     }
-    out.push({
-      id: freshId(),
-      kind: 'comment_block',
-      name: pending.length === 1 ? '(comment)' : `(${pending.length} comments)`,
-      startByte: firstC.startIndex,
-      endByte: lastC.endIndex,
-      startLine: firstC.startPosition.row + 1,
-      endLine: lastC.endPosition.row + 1,
-    });
-    cursor = lastC.endIndex;
     pending = [];
   }
 
@@ -593,6 +605,17 @@ function walkSegments(rootNode, source) {
         // Push them back in order
         for (const l of leaders) pending.push(l);
         leaders = [];
+      }
+    }
+    // Switched-off code never merges into the declaration below it: everything
+    // up to and including the last deactivated leader goes back to pending and
+    // stays visible as its own segment. Prose directly above the declaration
+    // (after that point) still attaches to it as its doc comment.
+    if (leaders.length > 0) {
+      const lastOff = classifyComments(leaders).lastIndexOf(true);
+      if (lastOff >= 0) {
+        for (const l of leaders.slice(0, lastOff + 1)) pending.push(l);
+        leaders = leaders.slice(lastOff + 1);
       }
     }
 
@@ -649,7 +672,15 @@ function walkSegments(rootNode, source) {
         const baseByte = raw.startIndex;
         const baseRow = raw.startPosition.row;
         const jsTree = jsParser.parse(raw.text);
-        const jsSegs = walkSegments(jsTree.rootNode, raw.text);
+        // Comments inside the script are JavaScript: test-parse them as such.
+        const outerCommentParser = _commentParser;
+        _commentParser = jsParser;
+        let jsSegs;
+        try {
+          jsSegs = walkSegments(jsTree.rootNode, raw.text);
+        } finally {
+          _commentParser = outerCommentParser;
+        }
         const shift = (arr) => {
           for (const s of arr) {
             s.startByte += baseByte;
@@ -677,8 +708,12 @@ function walkSegments(rootNode, source) {
       'method_definition', 'arrow_function',
     ].includes(c.type);
     if (isFnLike && !seg.children) {
+      // Functions split from 25 lines (was LARGE_FN_THRESHOLD = 40, which stays
+      // for wrappers and C-family containers below): a ~40-line function was one
+      // block, so a small fix meant resending all of it.
+      const FN_SPLIT_THRESHOLD = 25;
       const lineSpan = (c.endPosition.row - c.startPosition.row) + 1;
-      if (lineSpan > LARGE_FN_THRESHOLD) {
+      if (lineSpan > FN_SPLIT_THRESHOLD) {
         const body = c.childForFieldName('body') || c.childForFieldName('block');
         if (body) seg.children = walkClassBody(body, source);
       }
@@ -876,22 +911,34 @@ function walkClassBody(bodyNode, source) {
 
   function flushPendingAsCommentBlock() {
     if (pending.length === 0) return;
-    const firstC = pending[0];
-    const lastC = pending[pending.length - 1];
-    if (cursor < firstC.startIndex) {
-      emitGap(cursor, firstC.startIndex);
-      cursor = firstC.startIndex;
+    // Split the comments into runs of prose, code switched off by the tool and
+    // code commented out by hand; each run becomes its own segment (kind
+    // 'comment_block' or 'deactivated').
+    const flags = classifyComments(pending);
+    const key = (k) => deactivationKey(pending[k], flags[k]);
+    let start = 0;
+    while (start < pending.length) {
+      let end = start + 1;
+      while (end < pending.length && key(end) === key(start)) end++;
+      const run = pending.slice(start, end);
+      const firstC = run[0];
+      const lastC = run[run.length - 1];
+      if (cursor < firstC.startIndex) {
+        emitGap(cursor, firstC.startIndex);
+        cursor = firstC.startIndex;
+      }
+      out.push({
+        id: freshId(),
+        kind: flags[start] ? 'deactivated' : 'comment_block',
+        name: flags[start] ? offTitle(run) : commentTitle(run),
+        startByte: firstC.startIndex,
+        endByte: lastC.endIndex,
+        startLine: firstC.startPosition.row + 1,
+        endLine: lastC.endPosition.row + 1,
+      });
+      cursor = lastC.endIndex;
+      start = end;
     }
-    out.push({
-      id: freshId(),
-      kind: 'comment_block',
-      name: pending.length === 1 ? '(comment)' : `(${pending.length} comments)`,
-      startByte: firstC.startIndex,
-      endByte: lastC.endIndex,
-      startLine: firstC.startPosition.row + 1,
-      endLine: lastC.endPosition.row + 1,
-    });
-    cursor = lastC.endIndex;
     pending = [];
   }
 
@@ -935,6 +982,15 @@ function walkClassBody(bodyNode, source) {
         leaders = [];
       }
     }
+    // Switched-off code never merges into the declaration below it (same rule
+    // as walkSegments): it stays visible as its own segment.
+    if (leaders.length > 0) {
+      const lastOff = classifyComments(leaders).lastIndexOf(true);
+      if (lastOff >= 0) {
+        for (const l of leaders.slice(0, lastOff + 1)) pending.push(l);
+        leaders = leaders.slice(lastOff + 1);
+      }
+    }
 
     flushPendingAsCommentBlock();
 
@@ -957,8 +1013,12 @@ function walkClassBody(bodyNode, source) {
       endLine: (c.endPosition.column === 0 && c.endPosition.row > c.startPosition.row)
         ? c.endPosition.row : c.endPosition.row + 1,
     };
-    // Large methods inside class bodies → recurse into their bodies too
-    const LARGE_METHOD_THRESHOLD = 40;
+    // Large methods inside class bodies → recurse into their bodies too.
+    // 25 lines (was 40): a ~40-line function stayed one block, so a small fix
+    // meant resending the whole function. Wrapper blocks (if/for/while/with/try)
+    // split from 15 lines so a loop body can be edited statement by statement.
+    const LARGE_METHOD_THRESHOLD = 25;
+    const WRAPPER_THRESHOLD = 15;
     const isMethodLike = [
       'function_declaration', 'function_definition', 'method_declaration',
       'method_definition', 'arrow_function',
@@ -993,21 +1053,23 @@ function walkClassBody(bodyNode, source) {
     // Large wrapper statements (guard if, loops, try, switch, decl wrappers)
     // -> sub-segment their block body so a file wholly wrapped in a single
     // `if(!loaded){...}` / loop / try doesn't collapse to one giant segment.
-    // 40-line threshold keeps small wrappers atomic.
+    // WRAPPER_THRESHOLD (15 lines) keeps small wrappers atomic.
     // C family: blocks are compound_statement, C++ adds for_range_loop.
+    // Python (and Go/Rust/Java): bodies are `block`; Python adds with_statement.
     if (!innerSeg.children) {
       const WRAPPER_TYPES = new Set([
         'if_statement', 'for_statement', 'for_in_statement', 'while_statement',
         'do_statement', 'try_statement', 'switch_statement',
         'lexical_declaration', 'variable_declaration', 'for_range_loop',
+        'with_statement',
       ]);
       if (WRAPPER_TYPES.has(c.type)) {
         const wLineSpan = (c.endPosition.row - c.startPosition.row) + 1;
-        if (wLineSpan > LARGE_METHOD_THRESHOLD) {
+        if (wLineSpan > WRAPPER_THRESHOLD) {
           const meaningfulW = (blk) => (blk.namedChildren || []).filter(k => k.type !== 'comment').length;
           const collectBlocksW = (node, depth, acc) => {
             if (!node || depth > 10) return acc;
-            if (node.type === 'statement_block' || node.type === 'compound_statement') acc.push(node);
+            if (node.type === 'statement_block' || node.type === 'compound_statement' || node.type === 'block') acc.push(node);
             for (const k of (node.namedChildren || [])) collectBlocksW(k, depth + 1, acc);
             return acc;
           };
@@ -1263,9 +1325,19 @@ async function segmentFile(filePath, content, language, aiTitle) {
     // Throw so the caller surfaces a clear error rather than silently mangling the file.
     throw new Error(`No tree-sitter parser available for language: ${language}. Read-only access via raw file path instead.`);
   }
-  // C family: macro-aware parse (lib/macro_mask.js); offsets are those of the original text
-  const tree = C_FAMILY_LANGS.has(language) ? parseCFamily(parser, content).tree : parser.parse(content);
-  const flat = walkSegments(tree.rootNode, content);
+  // C family: macro-aware parse (lib/macro_mask.js); offsets are those of the original text.
+  // Async: discarded trees from the masking tries are freed between re-parses.
+  const tree = C_FAMILY_LANGS.has(language) ? (await parseCFamilyAsync(parser, content)).tree : parser.parse(content);
+  // The walk test-parses comment text in this file's language to tell
+  // switched-off code from prose (see isDeactivatedText).
+  const prevCommentParser = _commentParser;
+  _commentParser = parser;
+  let flat;
+  try {
+    flat = walkSegments(tree.rootNode, content);
+  } finally {
+    _commentParser = prevCommentParser;
+  }
   const segs = promoteBannerSections(flat, content);
   return { segments: segs, hasParseErrors: tree.rootNode.hasError };
 }
@@ -1292,11 +1364,28 @@ function parseTree(content, language, filePath) {
   return { tree, rootNode: tree.rootNode, hasParseErrors: tree.rootNode.hasError };
 }
 
+// Async twin of parseTree for loops over many files (scan): the C-family macro
+// masking runs through parseCFamilyAsync, so the trees of its tries are freed
+// between re-parses instead of piling up inside one large file.
+async function parseTreeAsync(content, language, filePath) {
+  if (['plaintext', 'markdown', 'json', 'yaml', 'toml', 'ini', 'env'].includes(language)) {
+    return { tree: null, rootNode: null, hasParseErrors: false, plaintext: true };
+  }
+  const parser = grammarParser(filePath, language) || getParser(language);
+  if (!parser) {
+    throw new Error(`No tree-sitter parser available for language: ${language}.`);
+  }
+  const tree = C_FAMILY_LANGS.has(language) ? (await parseCFamilyAsync(parser, content)).tree : parser.parse(content);
+  return { tree, rootNode: tree.rootNode, hasParseErrors: tree.rootNode.hasError };
+}
+
+
 function resetSegIds() { _segId = 0; }
 
 export {
   segmentFile,
   parseTree,
+  parseTreeAsync,
   segmentPlainText,
   walkSegments,
   walkClassBody,
@@ -1308,3 +1397,116 @@ export {
   freshId,
   resetSegIds,
 };
+// Name a comment segment by what it says, so search can find it again
+// (commented-out code keeps its identifier: "// clearEditBuffer();").
+// Comment markers are stripped, decoration-only lines ("// =====") are
+// skipped, and long text is shortened. A comment without any text keeps the
+// old generic name.
+function commentTitle(nodes) {
+  const list = (nodes || []).filter(Boolean);
+  let first = '';
+  for (const n of list) {
+    for (const raw of String(n.text || '').split('\n')) {
+      const line = raw.trim()
+        .replace(/^(\/\/+|\/\*+|\*+(?!\/)|#+|--+|<!--|;+|"""|''')\s?/, '')
+        .replace(/(\*+\/|-->|"""|''')\s*$/, '')
+        .trim();
+      if (/[A-Za-z0-9]/.test(line)) { first = line; break; }
+    }
+    if (first) break;
+  }
+  if (!first) return list.length > 1 ? `(${list.length} comments)` : '(comment)';
+  const short = first.length > 60 ? `${first.slice(0, 57)}...` : first;
+  return list.length > 1 ? `// ${short} (+${list.length - 1} more)` : `// ${short}`;
+}
+// ── Deactivated code vs comments ────────────────────────────────────────────
+// A comment either describes code (shown as a comment) or IS code that was
+// switched off (shown as deactivated, kind 'deactivated', named "[off] ...").
+// Switched-off code is recognised two ways:
+//   - the [off] marker the tool writes when it deactivates code: exact;
+//   - code a person commented out by hand: the comment text, without its
+//     markers, parses cleanly in the file's own language and contains code
+//     punctuation. Doc comments (/** */, docstrings) never count.
+// The parser of the file being segmented is set by segmentFile around the walk
+// (and swapped for the JS parser while an inline <script> is walked).
+let _commentParser = null;
+const OFF_LINE = /^\s*(\/\/+|#+|--+|;+|\/\*+|\*)\s*\[off\]/;
+
+function stripCommentMarkers(text) {
+  return String(text).split('\n').map((raw) => raw
+    .replace(/^\s*(\/\/+|#+|--+|;+)\s?/, '')
+    .replace(/^\s*\/\*+\s?/, '')
+    .replace(/\s*\*+\/\s*$/, '')
+    .replace(/^\s*\*(?!\/)\s?/, '')
+    .replace(/^\[off\]\s?/, '')).join('\n');
+}
+
+function isDeactivatedText(text) {
+  const t = String(text);
+  const lines = t.split('\n').filter((l) => l.trim());
+  if (lines.length && lines.every((l) => OFF_LINE.test(l))) return true;
+  if (/^\s*\/\*\*/.test(t) || /^\s*("""|''')/.test(t)) return false;
+  if (!_commentParser) return false;
+  const code = stripCommentMarkers(t).trim();
+  if (!code || !/[;(){}=\[\]]/.test(code)) return false;
+  try {
+    const root = _commentParser.parse(code).rootNode;
+    const hasError = typeof root.hasError === 'function' ? root.hasError() : root.hasError;
+    if (hasError || root.namedChildCount === 0) return false;
+    return !root.namedChildren.every((n) => n.type === 'comment');
+  } catch {
+    return false;
+  }
+}
+
+// A comment node whose every non-blank line carries the tool's [off] marker.
+function isOffMarked(node) {
+  const lines = String(node.text).split('\n').filter((l) => l.trim());
+  return lines.length > 0 && lines.every((l) => OFF_LINE.test(l));
+}
+
+// One flag per comment node: true = switched-off code. Lines the tool marked
+// [off] count as they are. For the rest (written by hand), the longest run
+// that parses as code is taken first, since multi-line statements only parse
+// as a whole; whatever is left over is prose. A hand run never crosses into
+// [off] lines, so code switched off by the tool and code commented out by hand
+// stay separate (see deactivationKey).
+function classifyComments(nodes) {
+  const flags = nodes.map((n) => isOffMarked(n));
+  const joined = (from, to) => nodes.slice(from, to).map((n) => n.text).join('\n');
+  let i = 0;
+  while (i < nodes.length) {
+    if (flags[i]) { i += 1; continue; }
+    let limit = i;
+    while (limit < nodes.length && !isOffMarked(nodes[limit]) && limit - i < 50) limit += 1;
+    let found = 0;
+    for (let j = limit; j > i; j--) {
+      if (isDeactivatedText(joined(i, j))) { found = j; break; }
+    }
+    if (found) {
+      for (let k = i; k < found; k++) flags[k] = true;
+      i = found;
+    } else {
+      i += 1;
+    }
+  }
+  return flags;
+}
+
+// Grouping key for building segments: prose, tool-deactivated, hand-deactivated.
+// A segment never mixes two keys, so one activate never switches on code that
+// was turned off separately.
+function deactivationKey(node, flag) {
+  if (!flag) return 'text';
+  return isOffMarked(node) ? 'off' : 'hand';
+}
+
+// Name of a deactivated segment: [off] plus its first line of code.
+function offTitle(nodes) {
+  const first = stripCommentMarkers(nodes.map((n) => n.text).join('\n'))
+    .split('\n').map((l) => l.trim()).find((l) => l.length > 0) || '';
+  const short = first.length > 60 ? `${first.slice(0, 57)}...` : first;
+  return nodes.length > 1 ? `[off] ${short} (+${nodes.length - 1} more)` : `[off] ${short}`;
+}
+
+

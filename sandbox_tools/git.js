@@ -55,6 +55,11 @@ function startCloneJob(sandboxDir, url, dest, label, scanLabel, ctx) {
           if (info.ok) {
             scanNote = `Scanned into project '${info.project_name}' (${info.files_total} files). `
               + `Next: read_file(path="${scanLabel}") shows its structure.`;
+            // The scan linked the files; now validate them in the background,
+            // one file at a time (levels L1/L2/L3 stored in the architect).
+            import('../tools/master-architect/read_file.js')
+              .then((m) => m.runValidationQueue && m.runValidationQueue())
+              .catch((e) => console.error(`[validate] could not start: ${e.message}`));
           } else {
             scanNote = `The scan did not finish; read_file(path="${scanLabel}") scans it.`;
           }

@@ -253,24 +253,43 @@ function cacheKey(parser, text) {
 
 // parser: a tree-sitter Parser with a C-family grammar set. Returns
 // { tree, masked: [{start, end, text, group, kind}], errorsBefore, errorsAfter }
-export function parseCFamily(parser, text) {
+//
+// The masking work is one generator (maskWork) with two drivers:
+//  - parseCFamily (sync): runs it straight through, as before;
+//  - parseCFamilyAsync: pauses one event-loop turn before every re-parse.
+// Why the pause: every try re-parses the WHOLE file into a new native tree,
+// and node-tree-sitter frees a discarded tree only after control returns to
+// the event loop (its finalizer is deferred). A straight loop therefore keeps
+// every tree it ever built: measured +700 MB per parse on a 26 MB file, 14+ GB
+// before the end. With the pause, rejected trees are freed before the next
+// parse, so only the current tree, the best try and the new one exist.
+// Validation and segmenting are async and use parseCFamilyAsync.
+const LARGE_TEXT = 1024 * 1024;   // above this a full re-parse costs seconds
+
+function* maskWork(parser, text) {
   const key = cacheKey(parser, text);
   const hit = _cache.get(key);
   if (hit) {
     const tree = parser.parse(hit.ranges.length ? blank(text, hit.ranges) : text);
     return { tree, masked: hit.masked, errorsBefore: hit.errorsBefore, errorsAfter: hit.errorsAfter };
   }
+  // Memory rule: at most one syntax tree is alive at any time. A try only
+  // keeps its error count and masked text; its tree is dropped right away,
+  // and the tree for the accepted text is parsed again when it is needed
+  // (start of the next round, and once at the end).
   let tree = parser.parse(text);
   const errorsBefore = countParseErrors(tree);
   let errors = errorsBefore;
   const kept = [];                     // accepted candidates (with the variant used)
+  let cur = text;
   if (errors) {
     const starts = lineStarts(text);
-    let cur = text;
     for (let round = 0; round < MAX_ROUNDS && errors > 0; round++) {
+      if (!tree) { yield; tree = parser.parse(cur); }
       const tried = new Set();         // `${start}|${variant}`, this round
       const groups = new Map();
       const rows = [...errorRows(tree, cur, starts)].sort((a, b) => a - b);
+      tree = null;                     // rows are taken; release the tree before the tries
       if (round === 0) {
         // class-head macros anywhere: class GTEST_API_ TestResult {  /  struct TORCH_API X : Y
         const re = /^[ \t]*(?:template\s*<[^\n]*>\s*)?(?:class|struct|union)\s+([A-Z_][A-Z0-9_]{2,})\s+[A-Za-z_]/gm;
@@ -324,18 +343,26 @@ export function parseCFamily(parser, text) {
           if (!use.length) continue;
           for (const c of use) tried.add(`${c.full[0][0]}|${variant}`);
           const next = blank(cur, use.flatMap(c => c[variant]));
-          const t2 = parser.parse(next);
+          yield;                                     // free discarded trees first
+          let t2 = parser.parse(next);
           const e2 = countParseErrors(t2);
+          t2 = null;                                 // keep only the count
           if (DBG) console.error(`   try ${use[0].group} ${variant} x${use.length}: ${errors} -> ${e2}`);
-          if (e2 < errors && (!best || e2 < best.e2)) best = { use, variant, next, t2, e2 };
+          if (e2 < errors && (!best || e2 < best.e2)) best = { use, variant, next, e2 };
           if (e2 === 0) break;
         }
         if (best) {
           for (const c of best.use) kept.push({ c, variant: best.variant });
-          cur = best.next; tree = best.t2; errors = best.e2; improved = true;
+          cur = best.next; errors = best.e2; improved = true;
         }
+        best = null;
         if (!errors) break;
       }
+      // Large files: when no single group helped, stop here. The combined
+      // fallbacks below are three more whole-file parses (seconds each on a
+      // big file) and, on generated code, do not resolve anything; the
+      // compiler check that follows decides the result anyway.
+      if (!improved && errors && text.length > LARGE_TEXT) break;
       if (!improved && errors) {
         // nothing helped alone: all of them together, then all macro calls together
         const all = [...groups.values()].flatMap(m => [...m.values()]);
@@ -349,8 +376,10 @@ export function parseCFamily(parser, text) {
         for (const set of tries) {
           if (set.length === keptFull.length) continue;
           const next = blank(text, set.flatMap(({ c, variant }) => c[variant]));
-          const t2 = parser.parse(next);
+          yield;                                     // free discarded trees first
+          let t2 = parser.parse(next);
           const e2 = countParseErrors(t2);
+          t2 = null;                                 // keep only the count
           if (DBG) console.error(`   fallback x${set.length}: ${errors} -> ${e2}`);
           if (e2 < errors) {
             kept.length = 0;
@@ -359,7 +388,7 @@ export function parseCFamily(parser, text) {
               const key = `${k.c.full[0][0]}|${k.variant}`;
               if (!seen.has(key)) { seen.add(key); kept.push(k); }
             }
-            cur = next; tree = t2; errors = e2; improved = true;
+            cur = next; errors = e2; improved = true;
             break;
           }
         }
@@ -367,6 +396,7 @@ export function parseCFamily(parser, text) {
       if (!improved) break;
     }
   }
+  if (!tree) { yield; tree = parser.parse(cur); }  // the one tree handed back
   const ranges = kept.flatMap(({ c, variant }) => c[variant]);
   const masked = kept.flatMap(({ c, variant }) => c[variant].map(([s, e]) =>
     ({ start: s, end: e, text: text.slice(s, e), group: c.group, kind: variant === 'name' ? 'name' : c.kind })))
@@ -374,4 +404,27 @@ export function parseCFamily(parser, text) {
   _cache.set(key, { ranges, masked, errorsBefore, errorsAfter: errors });
   if (_cache.size > CACHE_SIZE) _cache.delete(_cache.keys().next().value);
   return { tree, masked, errorsBefore, errorsAfter: errors };
+}
+
+export function parseCFamily(parser, text) {
+  const work = maskWork(parser, text);
+  for (;;) {
+    const step = work.next();
+    if (step.done) return step.value;
+  }
+}
+
+export async function parseCFamilyAsync(parser, text) {
+  const work = maskWork(parser, text);
+  const turn = () => new Promise((resolve) => setImmediate(resolve));
+  for (;;) {
+    const step = work.next();
+    if (step.done) return step.value;
+    // Collect, give the deferred tree finalizers an event-loop turn to free
+    // the native memory, then once more for anything released by them.
+    if (typeof global.gc === 'function') global.gc();
+    await turn();
+    if (typeof global.gc === 'function') global.gc();
+    await turn();
+  }
 }

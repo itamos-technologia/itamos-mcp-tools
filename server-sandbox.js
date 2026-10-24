@@ -38,6 +38,28 @@ import { mountOAuth } from './oauth.js';
 // DB, edit history, edit/read buffers, scan lock, caches) is selected from this
 // store, so concurrent users in different slots can never touch each other's.
 globalThis.__sandboxCtx = new AsyncLocalStorage();
+
+// Background work per slot (clone + scan, validation queue, large-file
+// indexer). The watchdog never expires a slot while it has work running: a
+// slot is inactive only when no tool call came in for INACTIVE_TTL AND nothing
+// runs for it. Engine code marks work with begin(slotDir) / end(slotDir)
+// (always in a finally), keyed by the slot folder from __sandboxCtx.
+const _busySlots = new Map();   // resolved slot folder → running jobs
+globalThis.__sandboxBusy = {
+  begin(dir) {
+    if (!dir) return;
+    const k = path.resolve(dir);
+    _busySlots.set(k, (_busySlots.get(k) || 0) + 1);
+  },
+  end(dir) {
+    if (!dir) return;
+    const k = path.resolve(dir);
+    const n = (_busySlots.get(k) || 0) - 1;
+    if (n > 0) _busySlots.set(k, n); else _busySlots.delete(k);
+  },
+  count(dir) { return dir ? (_busySlots.get(path.resolve(dir)) || 0) : 0; },
+};
+
 // Tools register cleanup hooks here; wipeSlot() runs them so a reused slot never
 // inherits open DB handles, buffers or read marks from its previous user.
 globalThis.__sandboxForgetHooks = globalThis.__sandboxForgetHooks || [];
@@ -220,7 +242,27 @@ async function wipeSlot(n) {
 
 async function cleanupExpired() {
   const now = Date.now();
-  for (const [who, { slot, lastActive }] of sessions) {
+  for (const [who, s] of sessions) {
+    const { slot, lastActive } = s;
+    // Background work (clone/scan, validation, large-file indexing) counts as
+    // activity: a slot is never expired while it has work running, and the
+    // idle countdown restarts from the moment that work is seen finished.
+    const jobs = globalThis.__sandboxBusy.count(slotPath(slot));
+    if (jobs > 0) {
+      if (!s.keptForJobs && now - lastActive > INACTIVE_TTL) {
+        console.log(`[Watchdog] Keeping ${slotName(slot)} (${label(who)}): idle, but ${jobs} background job(s) running`);
+        s.keptForJobs = true;
+      }
+      s.busy = true;
+      continue;
+    }
+    if (s.busy) {
+      // work just finished: the slot gets the full idle time from now
+      s.busy = false;
+      s.keptForJobs = false;
+      s.lastActive = now;
+      continue;
+    }
     if (now - lastActive > INACTIVE_TTL) {
       console.log(`[Watchdog] Expiring ${slotName(slot)} (${label(who)})`);
       sessions.delete(who);
