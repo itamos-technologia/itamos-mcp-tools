@@ -20,6 +20,7 @@
 
 import tool from '../tools/master-architect/read_file.js';
 import { resolveProjectTarget, resolveCoordinate } from '../tools/master-architect/lib/project_view.js';
+import { withEditFlow } from './lib/edit_flow.js';   // two-call editing: read → edit token → one edit
 
 // ── Project coordinates for edits ───────────────────────────────────────────
 // Reads accept a project plus a coordinate (path="wce", segment="e.h.25").
@@ -493,4 +494,6 @@ const sandboxReadFile = {
   },
 };
 
-export default sandboxReadFile;
+// What the server registers: the same tool behind the two-call edit flow
+// (lib/edit_flow.js), which also supplies the description and schema.
+export default withEditFlow(sandboxReadFile);

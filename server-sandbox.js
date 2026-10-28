@@ -343,46 +343,50 @@ async function loadTools(server, who) {
       const tool = mod.default;
       if (!tool?.name || typeof tool.handler !== 'function') continue;
       loadedTools.set(tool.name, tool);
-      server.tool(
-        tool.name,
-        tool.description || '',
-        tool.schema || {},
-        async (args) => {
-          const slot = requestSlot(who);
-          if (!slot.dir) {
-            return { isError: true, content: [{ type: 'text', text: queueMessage(slot.position) }] };
-          }
-          const sandboxDir = slot.dir;
-          // Resolve relative paths to absolute sandbox paths for original tools
-          const resolvedArgs = { ...args };
-          if (resolvedArgs.path !== undefined) {
-            resolvedArgs.path = jailPath(sandboxDir, resolvedArgs.path);
-          }
-          const runCtx = {
-            slotDir: sandboxDir,
-            architectDb: path.join(sandboxDir, '.architect.db'),
-            stateDir: path.join(sandboxDir, '.read_file_state'),
-          };
-          // touch keeps the sandbox alive while a background job runs;
-          // scanRepo lets git.js map a fresh clone with master_architect.
-          const ctx = {
-            sandboxDir,
-            jailPath: (p) => jailPath(sandboxDir, p),
-            execFileAsync,
-            touch: () => touchSession(who),
-          };
-          ctx.scanRepo = (dir) => scanRepo(dir, ctx, runCtx);
-          const result = await globalThis.__sandboxCtx.run(runCtx, () => tool.handler(resolvedArgs, ctx));
-          // One-time note (sandbox ready after the queue, or a new sandbox
-          // after expiry) goes in front of the first result it can join.
-          const note = notices.get(who);
-          if (note && Array.isArray(result?.content)) {
-            notices.delete(who);
-            return { ...result, content: [{ type: 'text', text: note }, ...result.content] };
-          }
-          return result;
-        },
-      );
+      const callback = async (args) => {
+        const slot = requestSlot(who);
+        if (!slot.dir) {
+          return { isError: true, content: [{ type: 'text', text: queueMessage(slot.position) }] };
+        }
+        const sandboxDir = slot.dir;
+        // Resolve relative paths to absolute sandbox paths for original tools
+        const resolvedArgs = { ...args };
+        if (resolvedArgs.path !== undefined) {
+          resolvedArgs.path = jailPath(sandboxDir, resolvedArgs.path);
+        }
+        const runCtx = {
+          slotDir: sandboxDir,
+          architectDb: path.join(sandboxDir, '.architect.db'),
+          stateDir: path.join(sandboxDir, '.read_file_state'),
+        };
+        // touch keeps the sandbox alive while a background job runs;
+        // scanRepo lets git.js map a fresh clone with master_architect.
+        const ctx = {
+          sandboxDir,
+          jailPath: (p) => jailPath(sandboxDir, p),
+          execFileAsync,
+          touch: () => touchSession(who),
+        };
+        ctx.scanRepo = (dir) => scanRepo(dir, ctx, runCtx);
+        const result = await globalThis.__sandboxCtx.run(runCtx, () => tool.handler(resolvedArgs, ctx));
+        // One-time note (sandbox ready after the queue, or a new sandbox
+        // after expiry) goes in front of the first result it can join.
+        const note = notices.get(who);
+        if (note && Array.isArray(result?.content)) {
+          notices.delete(who);
+          return { ...result, content: [{ type: 'text', text: note }, ...result.content] };
+        }
+        return result;
+      };
+      // A tool may hand over a whole schema object (inputSchema), used exactly
+      // as given: read_file's is passthrough, so retired parameters still reach
+      // it and get a clear error instead of being dropped, while the tool list
+      // shows only the parameters it declares. Plain shapes register as before.
+      if (tool.inputSchema) {
+        server.registerTool(tool.name, { description: tool.description || '', inputSchema: tool.inputSchema }, callback);
+      } else {
+        server.tool(tool.name, tool.description || '', tool.schema || {}, callback);
+      }
     } catch (e) {
       console.warn(`[Loader] Skip ${file}: ${e.message}`);
     }

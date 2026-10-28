@@ -2020,13 +2020,45 @@ function opInsert(buffer, betweenA, betweenB, content) {
     if (!parentSeg.children) parentSeg.children = [];
     parentSeg.children.splice(insertAt, 0, newSeg);
     // Spacing: existing gaps stay byte-identical (same rule as reorderBetweenGaps).
-    // The new child gets a copy of the gap that follows it (the one between its
-    // two neighbours), so it is spaced and indented exactly like its siblings.
+    // The new child gets a copy of the spacing its siblings use (chosen below),
+    // so it is spaced and indented like them.
     const isGapSeg = (s) => !!s && (s.kind === 'whitespace' || s.kind === 'gap');
-    const sepGap = parentSeg.children.slice(insertAt + 1).find(isGapSeg)
-      || parentSeg.children.slice(0, insertAt).reverse().find(isGapSeg);
+    // Spacing to copy: the gap most siblings have in front of them, so the new
+    // child follows the block's normal rhythm. Copying only the nearest gap
+    // inherited an author's one-off blank line (at the end of a block the
+    // nearest gap is the one before). Candidates are the gaps in front of a real
+    // child, never the closing gap before the parent's end, which sits one level
+    // shallower. Ties go to the tightest spacing. With no candidate at all, fall
+    // back to the nearest gap as before.
+    const sepGap = (() => {
+      const kids = parentSeg.children;
+      const counts = new Map();
+      kids.forEach((s, i) => {
+        if (!isGapSeg(s)) return;
+        const next = kids.slice(i + 1).find((k) => k !== newSeg && !isGapSeg(k));
+        if (!next) return;
+        const text = buffer.segmentText.get(s.id) || '';
+        const c = counts.get(text) || { gap: s, n: 0 };
+        c.n += 1;
+        counts.set(text, c);
+      });
+      const newlines = (t) => (t.match(/\n/g) || []).length;
+      let best = null;
+      for (const [text, c] of counts) {
+        if (!best || c.n > best.n || (c.n === best.n && newlines(text) < newlines(best.text))) best = { gap: c.gap, n: c.n, text };
+      }
+      return best ? best.gap
+        : (kids.slice(insertAt + 1).find(isGapSeg) || kids.slice(0, insertAt).reverse().find(isGapSeg));
+    })();
     const sepText = sepGap ? (buffer.segmentText.get(sepGap.id) || '\n') : '\n';
-    if (!content.startsWith(sepText)) content = sepText + content;
+    if (!content.startsWith(sepText)) {
+      // Leading empty lines in the content ask for blank lines above it: keep
+      // them as clean blank lines (no stray indent) in front of the copied
+      // spacing, which brings the indent for the first code line itself.
+      const lead = (content.match(/^(?:[ \t]*\n)+/) || [''])[0];
+      const blanks = (lead.match(/\n/g) || []).length;
+      content = '\n'.repeat(blanks) + sepText + content.slice(lead.length).replace(/^[ \t]+/, '');
+    }
     buffer.segmentText.set(newSeg.id, content);
 
     
