@@ -743,6 +743,36 @@ function _pair() {
   return p;
 }
 
+// Stable segment IDs. The segmenter numbers segments from one global counter
+// (freshId), and every read re-segments the file from disk, so the same,
+// unchanged segment got a new id on every read (seg_40253 listed, seg_40713
+// returned). Here each id is derived from what the segment IS: file path,
+// parent id, kind, name and its first line of code, plus an occurrence counter
+// for exact duplicates among siblings. Re-reading an unchanged file gives the
+// same ids; editing one segment changes only that segment's id (if its first
+// line changed) and never renumbers the others.
+function stabilizeSegmentIds(segments, filePath, content) {
+  const walk = (list, parentId) => {
+    if (!Array.isArray(list)) return;
+    const seen = new Map();
+    for (const seg of list) {
+      if (!seg || typeof seg !== 'object') continue;
+      let first = '';
+      if (typeof seg.startByte === 'number' && typeof seg.endByte === 'number') {
+        const head = content.slice(seg.startByte, Math.min(seg.endByte, seg.startByte + 240));
+        first = head.split('\n', 1)[0].trim();
+      }
+      const base = `${parentId}\u0000${seg.kind || ''}\u0000${seg.name || ''}\u0000${first}`;
+      const n = (seen.get(base) || 0) + 1;
+      seen.set(base, n);
+      seg.id = 'seg_' + crypto.createHash('sha1').update(`${filePath}\u0000${base}\u0000${n}`).digest('hex').slice(0, 10);
+      walk(seg.children, seg.id);
+    }
+  };
+  walk(segments, 'root');
+  return segments;
+}
+
 async function loadFresh(filePath, readonly) {
   // A large file that is queued, being indexed, or failed to index is never
   // loaded: report its status instead (see LARGE FILE INDEXER in lib/scan.js).
@@ -769,6 +799,7 @@ async function loadFresh(filePath, readonly) {
   dbWipePath(filePath);
   if (content === null) content = await fs.readFile(filePath, 'utf8');
   const { segments, hasParseErrors } = await workerSegmentFile(filePath, content, lang, aiTitleSegments);
+  stabilizeSegmentIds(segments, filePath, content);
   const buf = new Buffer(filePath, lang, segments, content, readonly);
   buf.hasParseErrors = hasParseErrors;
   return buf;
@@ -1476,15 +1507,13 @@ async function opSkeleton(buffer, { noLog = false, search = null, fullSkeleton =
   if (search || (!fullSkeleton && _projTokens > SKELETON_TOKEN_THRESHOLD)) {
     if (search) {
       const q = String(search).toLowerCase();
-      // Walk the WHOLE tree tracking the STABLE dotted address (1-based index
-      // path through segments->children, counting ALL segments incl. whitespace
-      // because findSegment indexes the raw arrays). seg_ ids regenerate every
-      // parse so they can't be returned as handles; dotted addresses are
-      // positional and stable. Skip whitespace/gap from the RESULTS (not from
-      // the index counting).
+      // Walk the WHOLE tree tracking the dotted address (1-based index path
+      // through segments->children, counting ALL segments incl. whitespace
+      // because findSegment indexes the raw arrays). Skip whitespace/gap from
+      // the RESULTS (not from the index counting).
       const hits = [];
-      let visPos = 0;  // pre-order position among visible segments (for grouping)
-      const walk = (list, prefix) => {
+      const spans = [];   // every visible segment: address, line range, depth
+      const walk = (list, prefix, depth) => {
         list.forEach((seg, i) => {
           const addr = prefix ? `${prefix}.${i + 1}` : `${i + 1}`;
           const isHidden = HIDDEN_KINDS.has(seg.kind);
@@ -1494,20 +1523,46 @@ async function opSkeleton(buffer, { noLog = false, search = null, fullSkeleton =
             if (nm.includes(q) || kd.includes(q)) {
               hits.push(`${addr}  ${segLabel(seg)}  (${seg.startLine}-${seg.endLine})`);
             }
-            visPos++;
+            spans.push({ addr, start: seg.startLine, end: seg.endLine, depth });
           }
-          if (seg.children && seg.children.length > 0) walk(seg.children, addr);
+          if (seg.children && seg.children.length > 0) walk(seg.children, addr, depth + 1);
         });
       };
-      walk(buffer.segments, '');
+      walk(buffer.segments, '', 0);
+      // Content search: every code line containing the term, with the address
+      // of the deepest segment that holds it — so a model can jump straight to
+      // the spot (an error message, a call, a field) instead of reading the
+      // file segment by segment.
+      const CONTENT_LIMIT = 25;
+      const contentHits = [];
+      let contentTotal = 0;
+      const fileLines = total.split('\n');
+      for (let ln = 1; ln <= fileLines.length; ln++) {
+        const text = fileLines[ln - 1];
+        if (!text.toLowerCase().includes(q)) continue;
+        contentTotal++;
+        if (contentHits.length >= CONTENT_LIMIT) continue;
+        let best = null;
+        for (const s of spans) {
+          if (s.start <= ln && ln <= s.end && (!best || s.depth > best.depth)) best = s;
+        }
+        const code = text.trim();
+        contentHits.push({
+          address: best ? best.addr : null,
+          line: ln,
+          code: code.length > 160 ? code.slice(0, 157) + '...' : code,
+        });
+      }
       const out = {
         path: buffer.path,
         language: buffer.language,
         search,
         matches: hits,
-        next: hits.length
-          ? 'Read one: segment="<address>" with this file\'s path, or from the project: segment="<file coordinate>.<address>". full_skeleton=true shows the whole file map.'
-          : 'No segment names matched. Try another word, or full_skeleton=true for the whole map.',
+        content_matches: contentHits,
+        ...(contentTotal > contentHits.length ? { content_matches_total: contentTotal } : {}),
+        next: (hits.length || contentHits.length)
+          ? 'Read a match: segment="<address>" (several at once: a list, e.g. ["31.21.1.3","31.21.1.13"]). matches are segment names; content_matches are code lines that contain the term.'
+          : 'Nothing matched in names or code. Try another word, or full_skeleton=true for the whole map.',
       };
       if (!noLog) { try { const _r=Math.ceil(total.length/4), _a=Math.ceil(JSON.stringify(out).length/4); logCost("read_file", _r, _a); } catch{} }
       return out;
@@ -1648,11 +1703,19 @@ function opReadSegment(buffer, address) {
   // drill down. Deliberately NOT named "tree": markRead walks a tree and would
   // mark children as read although their code was never shown.
   const HIDDEN = new Set(['whitespace', 'gap']);
+  // Each child also carries `code`: its first line of code. Bare names like
+  // "(expr)", "c" or "(if_statement)" gave a model nothing to choose by, so it
+  // read every child; with the first line it can see where to go.
+  const _fileLines = buffer.assembleText().split('\n');
+  const firstCode = (c) => {
+    const t = (_fileLines[c.startLine - 1] || '').trim();
+    return t.length > 120 ? t.slice(0, 117) + '...' : t;
+  };
   const childMap = (s, addr) => (s.children || [])
     .map((c, i) => ({ c, n: i + 1 }))
     .filter(({ c }) => !HIDDEN.has(c.kind))
     .map(({ c, n }) => {
-      const node = { address: `${addr}.${n}`, id: c.id, kind: c.kind, name: c.name, lines: `${c.startLine}-${c.endLine}` };
+      const node = { address: `${addr}.${n}`, id: c.id, kind: c.kind, name: c.name, code: firstCode(c), lines: `${c.startLine}-${c.endLine}` };
       const sub = (c.children || []).filter((k) => !HIDDEN.has(k.kind)).length;
       if (sub) node.children = sub;
       return node;
@@ -1668,8 +1731,43 @@ function opReadSegment(buffer, address) {
   };
   if (seg.children && seg.children.length > 0) {
     result.container = true;
-    result.children = childMap(seg, address);
-    result.note = `Container: 'text' is only its opening line(s), not its body. Read a child (segment="${address}.<n>") to see its code. Replace on this address changes only those opening line(s).`;
+    // Small containers are shown whole. Splitting a 39-line function into 20+
+    // one-line reads cost far more calls than its tokens: the model could not
+    // see the code, so it opened every piece. Up to SMALL_LINES / SMALL_CHARS
+    // the full code comes back with each segment's first line labelled by its
+    // address, and every part counts as read (it was shown), so any part can
+    // be edited straight away. Bigger containers keep the child list.
+    const SMALL_LINES = 60, SMALL_CHARS = 6000;
+    const body = _fileLines.slice(seg.startLine - 1, seg.endLine);
+    if (body.length <= SMALL_LINES && body.join('\n').length <= SMALL_CHARS) {
+      const desc = [];
+      const walkD = (s, addr, depth) => (s.children || []).forEach((c, i) => {
+        if (HIDDEN.has(c.kind)) return;
+        const a = `${addr}.${i + 1}`;
+        desc.push({ a, c, depth });
+        walkD(c, a, depth + 1);
+      });
+      walkD(seg, address, 1);
+      // Label each line with the deepest segment that starts on it.
+      const starts = new Map();
+      for (const d of desc) {
+        const prev = starts.get(d.c.startLine);
+        if (!prev || d.depth > prev.depth) starts.set(d.c.startLine, d);
+      }
+      result.labelled_code = body.map((ln, i) => {
+        const d = starts.get(seg.startLine + i);
+        if (d) return `[${d.a}] ${ln}`;
+        return i === 0 ? `[${address}] ${ln}` : ln;
+      }).join('\n');
+      delete result.text;
+      // Not enumerable: markRead walks it to unlock every shown part, but it
+      // stays out of the JSON answer (the labels already carry the addresses).
+      Object.defineProperty(result, 'tree', { value: desc.map((d) => ({ address: d.a })), enumerable: false });
+      result.note = `Shown whole (small block). Each [address] marks where that part starts; unlabelled lines belong to the part above. Every part is now readable and editable by its address. Replace on "${address}" itself changes only its first line(s).`;
+    } else {
+      result.children = childMap(seg, address);
+      result.note = `Container: 'text' is only its opening line(s), not its body. Read a child (segment="${address}.<n>") to see its code; several at once with a list. Replace on this address changes only those opening line(s).`;
+    }
   }
   return result;
 }
@@ -2522,7 +2620,10 @@ async function opCommit(buffer) {
     let segs = buffer.segments;
     try {
       const reseg = await workerSegmentFile(buffer.path, finalText, buffer.language, aiTitleSegments);
-      if (reseg && reseg.segments && reseg.segments.length) segs = reseg.segments;
+      if (reseg && reseg.segments && reseg.segments.length) {
+        // Same stable ids as every read gives for these bytes.
+        segs = stabilizeSegmentIds(reseg.segments, buffer.path, finalText);
+      }
     } catch (e) { console.error(`[read_file] commit re-segment failed, falling back to buffer view: ${e.message}`); }
     const segSummary = segs.map((s, i) => ({ n: i + 1, ...segmentToSummary(s) }));
     storageResult = storeFileContent(buffer.path, finalText, JSON.stringify(segSummary), {

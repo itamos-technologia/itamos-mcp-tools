@@ -71,6 +71,12 @@ async function translate(args, ctx) {
         const coord = String(args.segment);
         return { args, filePrefix: coord.slice(0, coord.length - c.segment.length - 1) };
       }
+      // The file itself (its map, or a search inside it): addresses in the
+      // answer (e.g. content_matches) are file-local, so prefix them with the
+      // file's coordinate too.
+      if (c && c.kind === 'file' && !c.segment) {
+        return { args, filePrefix: String(args.segment) };
+      }
     }
     return { args };
   }
@@ -119,6 +125,11 @@ function toProjectCoords(value, prefix) {
   if (!value || typeof value !== 'object') return value;
   const out = {};
   for (const [k, v] of Object.entries(value)) {
+    if (k === 'labelled_code' && typeof v === 'string') {
+      // A small block shown whole labels each part "[31.21.1.13] code".
+      out[k] = v.replace(/^\[(\d+(?:\.\d+)*)\]/gm, (_, a) => `[${prefix}.${a}]`);
+      continue;
+    }
     out[k] = (ADDRESS_KEYS.has(k) && typeof v === 'string' && /^\d+(\.\d+)*$/.test(v))
       ? `${prefix}.${v}`
       : toProjectCoords(v, prefix);
@@ -284,6 +295,10 @@ publicSchema.deactivate = z.string().optional()
   .describe('Switch off a code segment (address you have read). It stays in the file as "[off]" lines and shows as deactivated.');
 publicSchema.activate = z.string().optional()
   .describe('Switch a deactivated segment back on (address you have read). Only deactivated code can be activated, never a normal comment.');
+publicSchema.segment = z.union([z.string(), z.array(z.string()).min(1).max(20)]).optional()
+  .describe('In a file: a segment number ("31" or "31.17"). In a project: a coordinate, a file ("d.a.f") or a file plus segment ("d.a.f.31.17"). Several at once: a list (up to 20), e.g. ["e.h.31.21.1.3","e.h.31.21.1.13"]. Reading a segment unlocks it for editing.');
+publicSchema.search = z.string().optional()
+  .describe('On a project: files and folders whose path matches. On a file (path=<file>, or path=<project> with segment=<file coordinate>): segments whose name matches, plus content_matches — code lines containing the word, each with the address of the segment that holds it. Use it to jump to an error message, a call or a field instead of reading segment by segment.');
 
 // ── Undo: the project's last saved changes ──────────────────────────────────
 // Every successful save is logged (file, version before, version after,
@@ -401,8 +416,12 @@ const DESCRIPTION = 'Read anything, and edit it safely. read_file() lists your p
   'path=<project name or folder>: its structure only, no code: folders and files with coordinates ' +
   '(letters = location, e.g. "d.a.f"); over ~3000 tokens it asks for search. A folder not scanned yet is scanned first. ' +
   'path=<project> with segment="<file coordinate>" gives that file map (one line per segment); ' +
-  'segment="<file coordinate>.<segment>" (e.g. "d.a.f.31.17") gives that segment. A segment that contains others ' +
-  'shows only its opening line and a list of its children: read a child to see its code. ' +
+  'segment="<file coordinate>.<segment>" (e.g. "d.a.f.31.17") gives that segment. ' +
+  'Find the spot first: search="<word>" on a file returns the code lines containing it, each with its segment address ' +
+  '(an error message, a call, a field), so you can jump there instead of reading segment by segment. ' +
+  'A small block (up to ~60 lines) is shown whole, each part labelled [address]; a bigger one shows its opening line ' +
+  'and a list of its children with their first line of code: read the child you need. ' +
+  'Read several segments in one call with a list: segment=["d.a.f.31.3","d.a.f.31.13"]. ' +
   'In maps, "// ..." is a comment and "[off] ..." is deactivated (switched-off) code. ' +
   'path=<file> works the same with plain segment numbers. ' +
   'Editing: use the same path and coordinate you read with, and only change segments you have read since the last change. ' +
@@ -413,11 +432,29 @@ const DESCRIPTION = 'Read anything, and edit it safely. read_file() lists your p
   'undo=true reverts the project\'s last saved change, undo=<1-10> that many. ' +
   'trace=true: what a file connects to, or a project data-flow map.';
 
-export default {
+const sandboxReadFile = {
   ...tool,
   description: DESCRIPTION,
   schema: publicSchema,
   async handler(args, ctx) {
+    // Several segments in one read: a list (or a comma-separated string) of
+    // addresses. Each one goes through the normal single read below, so
+    // project coordinates and file paths work as usual, and every shown
+    // segment is unlocked for editing; the answers come back together.
+    if (args && !isEditCall(args) && args.segment !== undefined) {
+      const list = Array.isArray(args.segment) ? args.segment
+        : (typeof args.segment === 'string' && args.segment.includes(',') ? args.segment.split(',') : null);
+      if (list) {
+        const addrs = list.map((s) => String(s).trim()).filter(Boolean).slice(0, 20);
+        const segments = [];
+        for (const a of addrs) {
+          const r = await sandboxReadFile.handler({ ...args, segment: a }, ctx);
+          const text = r?.content?.[0]?.text;
+          try { segments.push(JSON.parse(text)); } catch { segments.push({ address: a, result: text }); }
+        }
+        return shimWrap({ segments });
+      }
+    }
     // deactivate / activate are the engine's comment_out / uncomment.
     if (args && (args.deactivate !== undefined || args.activate !== undefined)) {
       args = { ...args };
@@ -455,3 +492,5 @@ export default {
     }
   },
 };
+
+export default sandboxReadFile;
